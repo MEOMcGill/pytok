@@ -470,7 +470,13 @@ class ZendriverTikTokApi:
 
     def generate_js_fetch(self, method: str, url: str, headers: dict) -> str:
         """Generate a JS fetch IIFE for zendriver evaluate."""
-        headers_js = json.dumps(headers)
+        # fetch() rejects a null headers value or non-string header values, so
+        # coerce to a clean string->string dict (headers may be None for some
+        # sessions, e.g. when loaded from a logged-in Chrome profile).
+        clean_headers = {
+            str(k): str(v) for k, v in (headers or {}).items() if v is not None
+        }
+        headers_js = json.dumps(clean_headers)
         return (
             f"(async () => {{"
             f"  const resp = await fetch('{url}', {{ method: '{method}', headers: {headers_js} }});"
