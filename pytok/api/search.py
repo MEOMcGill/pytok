@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
-import time
-from typing import TYPE_CHECKING, Iterator, Type
-from urllib.parse import urlencode
-import re
+import urllib.parse
+from typing import TYPE_CHECKING, Iterator
+
+from zendriver import cdp
 
 from .user import User
-from .hashtag import Hashtag
 from .video import Video
 from .base import Base
 from ..exceptions import *
@@ -15,161 +15,209 @@ from ..exceptions import *
 if TYPE_CHECKING:
     from ..tiktok import PyTok
 
-import requests
+# web_search_code mirrors what the TikTok web app sends with search requests
+_WEB_SEARCH_CODE = '{"tiktok":{"client_params_x":{"search_engine":{"ies_mt_user_live_video_card_use_libra":1,"mt_search_general_user_live_card":1}},"search_server":{}}}'
+
 
 class Search(Base):
-    """Contains static methods about searching."""
+    """Contains methods for searching TikTok."""
 
     parent: PyTok
 
     def __init__(self, search_term):
         self.search_term = search_term
 
-    def videos(self, count=28, offset=0, **kwargs) -> Iterator[Video]:
+    async def videos(self, count=28, offset=0, **kwargs) -> Iterator[Video]:
         """
         Searches for Videos
 
         - Parameters:
-            - search_term (str): The phrase you want to search for.
             - count (int): The amount of videos you want returned.
             - offset (int): The offset of videos from your data you want returned.
 
         Example Usage
         ```py
-        for video in api.search.videos('therock'):
+        async for video in api.search('therock').videos():
             # do something
         ```
         """
-        return self.search_type(
-            "item", count=count, offset=offset, **kwargs
-        )
+        async for result in self.search_type("item", count=count, offset=offset, **kwargs):
+            yield result
 
-    def users(self, count=28, offset=0, **kwargs) -> Iterator[User]:
+    async def users(self, count=28, offset=0, **kwargs) -> Iterator[User]:
         """
-        Searches for users using an alternate endpoint than Search.users
+        Searches for users.
 
         - Parameters:
-            - search_term (str): The phrase you want to search for.
-            - count (int): The amount of videos you want returned.
+            - count (int): The amount of users you want returned.
+            - offset (int): The offset of users from your data you want returned.
 
         Example Usage
         ```py
-        for user in api.search.users_alternate('therock'):
+        async for user in api.search('therock').users():
             # do something
         ```
         """
-        return self.search_type(
-            "user", count=count, offset=offset, **kwargs
-        )
+        async for result in self.search_type("user", count=count, offset=offset, **kwargs):
+            yield result
 
     async def search_type(self, obj_type, count=28, offset=0, **kwargs) -> Iterator:
         """
-        Searches for users using an alternate endpoint than Search.users
+        Searches for a specific type of object. Use .videos() & .users() instead.
 
         - Parameters:
-            - search_term (str): The phrase you want to search for.
-            - count (int): The amount of videos you want returned.
+            - count (int): The amount of objects you want returned.
+            - offset (int): The offset of objects you want returned.
             - obj_type (str): user | item
-
-        Just use .video & .users
-        ```
         """
-
-        if obj_type == "user":
-            subdomain = "www"
-            subpath = "user"
-        elif obj_type == "item":
-            subdomain = "www"
-            subpath = "video"
-        else:
+        if obj_type not in ("user", "item"):
             raise TypeError("invalid obj_type")
 
-        page = self.parent._page
+        try:
+            async for result in self._search_type_api(obj_type, count=count, offset=offset, **kwargs):
+                yield result
+        except ApiFailedException as ex:
+            self.parent.logger.warning(
+                f"TikTok-Api search ({obj_type}) failed: {ex}. Falling back to scraping method."
+            )
+            async for result in self._search_type_scraping(obj_type, count=count, offset=offset, **kwargs):
+                yield result
 
-        url = f"https://{subdomain}.tiktok.com/search/{subpath}?q={self.search_term}"
-        await page.goto(url)
-
-        is_visible = await page.locator('[data-e2e="search_video-item"]').is_visible()
-        is_visible2 = await page.locator('[data-e2e="search_video-item-list"]').is_visible()
-        is_visible3 = await page.locator('[id="column-item-video-container-0"]').is_visible()
-
-        await self.wait_for_content_or_captcha('[id="column-item-video-container-0"]')
-
-        processed_urls = []
+    async def _search_type_api(self, obj_type, count=28, offset=0, **kwargs) -> Iterator:
         amount_yielded = 0
-        pull_method = 'browser'
-        
-        path = f"api/search/{obj_type}"
+        cursor = offset
 
         while amount_yielded < count:
+            params = {
+                "keyword": self.search_term,
+                "cursor": cursor,
+                "from_page": "search",
+                "web_search_code": _WEB_SEARCH_CODE,
+            }
+
+            try:
+                res = await self.parent.tiktok_api.make_request(
+                    url=f"https://www.tiktok.com/api/search/{obj_type}/full/",
+                    params=params,
+                )
+            except Exception as e:
+                raise ApiFailedException(f"TikTok-Api make_request failed: {e}")
+
+            if res is None:
+                raise ApiFailedException("TikTok-Api returned None response")
+
+            if res.get('type') == 'verify':
+                raise ApiFailedException("TikTok API is asking for verification")
+
+            for result in self._yield_results(obj_type, res):
+                yield result
+                amount_yielded += 1
+                if amount_yielded >= count:
+                    return
+
+            if not res.get("has_more", 0):
+                self.parent.logger.info(
+                    "TikTok is not sending results beyond this point."
+                )
+                return
+
+            cursor = res.get("cursor", cursor)
+            await self.parent.request_delay()
+
+    async def _search_type_scraping(self, obj_type, count=28, offset=0, **kwargs) -> Iterator:
+        page = self.parent._page
+
+        subpath = "user" if obj_type == "user" else "video"
+        url = f"https://www.tiktok.com/search/{subpath}?q={urllib.parse.quote(self.search_term)}"
+        self.parent.logger.debug(f"Loading page: {url}")
+        await page.send(cdp.page.navigate(url))
+        async with asyncio.timeout(30):
+            await page.wait_for_ready_state(until='complete', timeout=31)
+        await asyncio.sleep(3)
+
+        await self.parent.process_pending_responses()
+        await self.check_and_wait_for_captcha()
+        await self.check_and_close_signin()
+
+        amount_yielded = 0
+        seen_ids = set()
+        has_more = True
+        scroll_attempts = 0
+        max_scroll_attempts = 30
+        empty_rounds = 0
+        max_empty_rounds = 3
+
+        while amount_yielded < count and has_more and scroll_attempts < max_scroll_attempts:
             await self.check_and_wait_for_captcha()
-            await self.parent.request_delay()
-            await self.slight_scroll_up()
-            await self.parent.request_delay()
-            await self.scroll_down(30000, speed=12)
 
-            if pull_method == 'browser':
-                search_responses = self.get_responses(path)
-                search_responses = [response for response in search_responses if response.url not in processed_urls]
-                for response in search_responses:
-                    processed_urls.append(response.url)
-                    body = await self.get_response_body(response)
-                    if not body:
-                        continue
-                    res = json.loads(body)
-                    if res.get('type') == 'verify':
-                        # this is the captcha denied response
-                        continue
+            # Scroll first so the lazily-loaded search request fires, then give
+            # its response body time to be captured before reading it.
+            yielded_before = amount_yielded
+            await page.evaluate('window.scrollBy(0, window.innerHeight * 4)')
+            await asyncio.sleep(3)
+            await self.check_and_resolve_refresh_button()
 
-                    # When I move to 3.10+ support make this a match switch.
-                    if obj_type == "user":
-                        for result in res.get("user_list", []):
-                            yield User(data=result)
-                            amount_yielded += 1
-
-                    if obj_type == "item":
-                        for result in res.get("item_list", []):
-                            yield Video(data=result)
-                            amount_yielded += 1
-
-                    if res.get("has_more", 0) == 0:
-                        Search.parent.logger.info(
-                            "TikTok is not sending videos beyond this point."
-                        )
-                        return
-
-                # try:
-                #     load_more_button = await self.wait_for_content_or_captcha('search-load-more')
-                # except TimeoutError:
-                #     return
-
-                # await load_more_button.click()
-
-            
-            elif pull_method == 'requests':
-                cursor = res["cursor"]
-                next_url = re.sub("offset=([0-9]+)", f"offset={cursor}", request.url)
-                cookies = self.parent._context.cookies()
-                cookies = {cookie['name']: cookie['value'] for cookie in cookies}
-                r = requests.get(next_url, headers=request.headers, cookies=cookies)
-                res = r.json()
-
+            responses = await self.parent.process_pending_responses("api/search/")
+            for resp in responses:
+                body = resp.get('body', '')
+                if not body:
+                    continue
+                try:
+                    res = json.loads(body) if isinstance(body, str) else body
+                except json.JSONDecodeError:
+                    continue
                 if res.get('type') == 'verify':
-                    pull_method = 'browser'
+                    # this is the captcha denied response
                     continue
 
-                if obj_type == "user":
-                    for result in res.get("user_list", []):
-                        yield User(data=result)
-                        amount_yielded += 1
+                for result, result_id in self._yield_results(obj_type, res, with_id=True):
+                    if result_id and result_id in seen_ids:
+                        continue
+                    if result_id:
+                        seen_ids.add(result_id)
+                    yield result
+                    amount_yielded += 1
+                    if amount_yielded >= count:
+                        return
 
-                if obj_type == "item":
-                    for result in res.get("item_list", []):
-                        yield Video(data=result)
-                        amount_yielded += 1
-
-                if res.get("has_more", 0) == 0:
+                if not res.get("has_more", 0):
                     self.parent.logger.info(
-                        "TikTok is not sending videos beyond this point."
+                        "TikTok is not sending results beyond this point."
+                    )
+                    has_more = False
+
+            if not has_more:
+                break
+
+            # Give up early if scrolling stops producing new results rather than
+            # scrolling all the way to the hard limit.
+            if amount_yielded == yielded_before:
+                empty_rounds += 1
+                if empty_rounds >= max_empty_rounds:
+                    self.parent.logger.info(
+                        "No new search results after repeated scrolls, stopping."
                     )
                     return
+            else:
+                empty_rounds = 0
+
+            await self.parent.request_delay()
+            scroll_attempts += 1
+
+    def _yield_results(self, obj_type, res, with_id=False):
+        """Build User/Video objects from a search response payload."""
+        if obj_type == "user":
+            for result in res.get("user_list", []):
+                info = result.get("user_info", {})
+                obj = self.parent.user(
+                    username=info.get("unique_id"),
+                    user_id=info.get("user_id") or info.get("uid"),
+                    sec_uid=info.get("sec_uid"),
+                )
+                result_id = info.get("user_id") or info.get("uid")
+                yield (obj, result_id) if with_id else obj
+        else:
+            for result in res.get("item_list", []):
+                obj = self.parent.video(data=result)
+                result_id = result.get("id")
+                yield (obj, result_id) if with_id else obj

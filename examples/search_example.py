@@ -7,7 +7,7 @@ import os
 from pytok.tiktok import PyTok
 
 
-async def scrape_hashtag(hashtag_name, count, output, chrome_profile, username, password, headless):
+async def scrape_search(search_term, search_type, count, output, chrome_profile, username, password, headless):
     pytok_kwargs = {"headless": headless}
     if chrome_profile:
         # A Chrome user-data dir that is already signed in to TikTok. Reusing it
@@ -15,40 +15,43 @@ async def scrape_hashtag(hashtag_name, count, output, chrome_profile, username, 
         pytok_kwargs["user_data_dir"] = os.path.expanduser(chrome_profile)
 
     async with PyTok(**pytok_kwargs) as api:
-        # Hashtag video listing requires a logged-in session: TikTok's
-        # challenge/item_list endpoint returns empty responses for anonymous
-        # sessions, and the web hashtag feed is login-walled.
+        # User search works without logging in, but video search requires a
+        # logged-in session: TikTok's search/item endpoint returns empty
+        # responses for anonymous sessions, and the web search feed is
+        # login-walled.
         if chrome_profile:
             # The profile already carries a logged-in session; with no
             # credentials login() just verifies and refreshes the API tokens.
             await api.login()
         elif username and password:
             await api.login(username=username, password=password)
-        else:
+        elif search_type == "video":
             logging.warning(
                 "No --chrome-profile or credentials supplied. TikTok requires "
-                "login to list hashtag videos, so this will likely return nothing."
+                "login to search videos, so this will likely return nothing."
             )
 
-        hashtag = api.hashtag(name=hashtag_name)
+        search = api.search(search_term)
+        source = search.users(count=count) if search_type == "user" else search.videos(count=count)
 
-        videos = []
-        async for video in hashtag.videos(count=count):
-            video_info = await video.info()
-            videos.append(video_info)
+        results = []
+        async for result in source:
+            results.append(await result.info())
 
         with open(output, "w") as out_file:
-            json.dump(videos, out_file)
+            json.dump(results, out_file)
 
-        logging.info("Saved %d videos for #%s to %s", len(videos), hashtag_name, output)
+        logging.info("Saved %d %s results for '%s' to %s", len(results), search_type, search_term, output)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Scrape videos for a TikTok hashtag (requires a logged-in session)."
+        description="Search TikTok for videos or users (video search requires a logged-in session)."
     )
-    parser.add_argument("--hashtag", default="fyp", help="Hashtag name, without the leading '#'.")
-    parser.add_argument("--count", type=int, default=100, help="Maximum number of videos to fetch.")
+    parser.add_argument("--term", default="therock", help="The phrase to search for.")
+    parser.add_argument("--type", default="video", choices=["video", "user"],
+                        help="Search for videos or users.")
+    parser.add_argument("--count", type=int, default=100, help="Maximum number of results to fetch.")
     parser.add_argument("--output", default="out.json", help="Path to write the JSON results to.")
     parser.add_argument(
         "--chrome-profile",
@@ -77,8 +80,8 @@ def main():
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
 
-    asyncio.run(scrape_hashtag(
-        args.hashtag, args.count, args.output,
+    asyncio.run(scrape_search(
+        args.term, args.type, args.count, args.output,
         args.chrome_profile, args.username, args.password, args.headless,
     ))
 
