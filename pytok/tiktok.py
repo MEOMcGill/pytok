@@ -10,7 +10,11 @@ import zendriver as zd
 from zendriver import cdp
 import random
 
+from ._cdp_patches import apply_cdp_patches
 from .tiktok_api import ZendriverTikTokApi
+
+# Patch zendriver's CDP bindings for Chrome 149+ before any browser is started.
+apply_cdp_patches()
 
 from .api.sound import Sound
 from .api.user import User
