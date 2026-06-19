@@ -47,6 +47,14 @@ class ZendriverTikTokApi:
     Manages sessions (tabs) within a zendriver browser owned by PyTok.
     """
 
+    # webmssdk.js defines window.byted_acrawler.frontierSign (X-Bogus signing).
+    # The URL is normally discovered from the live DOM so the version stays
+    # current; this hardcoded version is a stale-prone last resort only.
+    _SIGNING_SDK_URL_FALLBACK = (
+        "https://sf16-website-login.neutral.ttwstatic.com/obj/"
+        "tiktok_web_login_static/webmssdk/1.0.0.374/webmssdk.js"
+    )
+
     def __init__(self, logging_level: int = logging.WARN, logger_name: str = None):
         self.sessions = []
         self._session_recovery_enabled = True
@@ -55,6 +63,9 @@ class ZendriverTikTokApi:
         self._auto_cleanup_dead_sessions = True
         self._owns_browser = False
         self.browser = None
+        # Cached webmssdk.js source, captured from a healthy session and
+        # re-injected to self-heal sessions where the signer failed to load.
+        self._signing_sdk_src = None
 
         if logger_name is None:
             logger_name = "ZendriverTikTokApi"
@@ -555,16 +566,70 @@ class ZendriverTikTokApi:
     # X-Bogus / signing
     # ------------------------------------------------------------------
 
-    async def generate_x_bogus(self, url: str, **kwargs):
-        try:
-            _, session = await self._get_valid_session_index(**kwargs)
-        except Exception:
-            _, session = self._get_session(**kwargs)
+    async def _discover_signing_sdk_url(self, session):
+        """Find webmssdk.js's URL from the page DOM (keeps the version current)."""
+        return await session.tab.evaluate(
+            "(document.querySelector('script[src*=\"webmssdk/\"]') || {}).src || null"
+        )
 
+    async def _capture_signing_sdk(self, session):
+        """Fetch and cache webmssdk.js from a healthy session (once).
+
+        Captured from TikTok itself rather than vendored, so the signer stays
+        version-matched. Reused to re-inject the signer into sessions where the
+        SDK failed to load. Best-effort: failures are logged and ignored.
+        """
+        if self._signing_sdk_src is not None:
+            return
+        try:
+            sdk_url = await self._discover_signing_sdk_url(session) \
+                or self._SIGNING_SDK_URL_FALLBACK
+            src = await session.tab.evaluate(
+                f"fetch({json.dumps(sdk_url)}).then(r => r.text())",
+                await_promise=True,
+            )
+            if src and len(src) > 1000:
+                self._signing_sdk_src = src
+                self.logger.debug(
+                    f"Captured signing SDK ({len(src)} bytes) from {sdk_url}"
+                )
+        except Exception as e:
+            self.logger.debug(f"Failed to capture signing SDK: {e}")
+
+    async def _inject_signing_sdk(self, session) -> bool:
+        """Re-inject the cached signer into a session via indirect eval.
+
+        webmssdk only defines window.byted_acrawler when executed in global
+        scope via indirect eval; a <script> tag or document-start injection
+        does not work. Returns True if byted_acrawler is available afterwards.
+        """
+        if self._signing_sdk_src is None:
+            return False
+        try:
+            # Stash on window first to avoid escaping a ~227KB source string
+            # into an evaluate expression.
+            await self._evaluate(
+                session.tab,
+                "window.__pytok_sdk__ = " + json.dumps(self._signing_sdk_src) + "; void 0",
+            )
+            await self._evaluate(session.tab, "(0,eval)(window.__pytok_sdk__)")
+            present = await self._evaluate(
+                session.tab, "window.byted_acrawler !== undefined"
+            )
+            if present:
+                self.logger.info("Re-injected signing SDK into session via eval")
+            return bool(present)
+        except Exception as e:
+            self.logger.debug(f"Failed to inject signing SDK: {e}")
+            return False
+
+    async def _reload_until_signer(self, session):
+        """Legacy fallback: reload TikTok pages until byted_acrawler appears.
+
+        Used only when no cached SDK is available to inject.
+        """
         max_attempts = 5
-        attempts = 0
-        while attempts < max_attempts:
-            attempts += 1
+        for attempt in range(1, max_attempts + 1):
             try:
                 timeout_time = random.randint(5000, 20000)
                 await self._poll_for_condition(
@@ -572,9 +637,9 @@ class ZendriverTikTokApi:
                     "window.byted_acrawler !== undefined",
                     timeout=timeout_time / 1000,
                 )
-                break
+                return
             except asyncio.TimeoutError:
-                if attempts == max_attempts:
+                if attempt == max_attempts:
                     raise asyncio.TimeoutError(
                         f"Failed to load tiktok after {max_attempts} attempts, "
                         "consider using a proxy"
@@ -591,6 +656,37 @@ class ZendriverTikTokApi:
                 self.logger.error(f"Session died during x-bogus generation: {e}")
                 await self._mark_session_invalid(session)
                 raise
+
+    async def _ensure_signer_loaded(self, session):
+        """Ensure window.byted_acrawler is available, self-healing if not.
+
+        Fast path: the SDK is already present from the page load. If it is
+        missing, inject the cached SDK source via eval rather than blindly
+        reloading. Only when no cached SDK exists do we fall back to the
+        legacy reload-retry loop.
+        """
+        try:
+            await self._poll_for_condition(
+                session.tab, "window.byted_acrawler !== undefined", timeout=10
+            )
+            await self._capture_signing_sdk(session)
+            return
+        except asyncio.TimeoutError:
+            pass
+
+        if await self._inject_signing_sdk(session):
+            return
+
+        await self._reload_until_signer(session)
+        await self._capture_signing_sdk(session)
+
+    async def generate_x_bogus(self, url: str, **kwargs):
+        try:
+            _, session = await self._get_valid_session_index(**kwargs)
+        except Exception:
+            _, session = self._get_session(**kwargs)
+
+        await self._ensure_signer_loaded(session)
 
         try:
             result = await session.tab.evaluate(
