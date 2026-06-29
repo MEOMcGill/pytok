@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 from typing import TYPE_CHECKING, ClassVar, Iterator, Optional
-from urllib.parse import urlparse
 
 from zendriver import cdp
 
@@ -213,15 +211,28 @@ class User(Base):
 
         - Parameters:
             - count (int): The amount of videos you want returned.
+            - get_bytes (bool): If True, download each video's MP4 as it is yielded and store
+              it on the yielded Video as ``video.video_bytes`` (None if the download failed).
             - cursor (int): The unix epoch to get uploaded videos since.
 
         Example Usage
         ```py
         user = api.user(username='therock')
-        for video in user.videos(count=100):
-            # do something
+        async for video in user.videos(count=100, get_bytes=True):
+            with open(f"{video.id}.mp4", "wb") as f:
+                f.write(video.video_bytes)
         ```
         """
+        async for video in self._iter_videos(count=count, batch_size=batch_size, **kwargs):
+            if get_bytes:
+                try:
+                    video.video_bytes = await video.bytes()
+                except Exception as ex:
+                    self.parent.logger.warning(f"get_bytes: failed to download bytes for video {video.id}: {ex}")
+                    video.video_bytes = None
+            yield video
+
+    async def _iter_videos(self, count=None, batch_size=100, **kwargs) -> Iterator[Video]:
         if self.as_dict and self.as_dict.get('videoCount', 1) == 0:
             return
 
@@ -231,7 +242,7 @@ class User(Base):
         if self._used_api_for_info:
             cursor = 0
         else:
-            videos, finished, cursor = await self._get_initial_videos(count, get_bytes)
+            videos, finished, cursor = await self._get_initial_videos(count)
             self.parent.logger.info(f"Got {len(videos)} initial videos, finished={finished}, cursor={cursor}")
             for video in videos:
                 yield video
@@ -248,15 +259,15 @@ class User(Base):
 
         remaining = None if count is None else count - amount_yielded
         try:
-            async for video in self._get_videos_api(count=remaining, cursor=0, get_bytes=get_bytes, **kwargs):
+            async for video in self._get_videos_api(count=remaining, cursor=0, **kwargs):
                 yield video
         except ApiFailedException as ex:
             self.parent.logger.warning(f"API method failed with exception: {ex}. Falling back to scraping method.")
-            async for video in self._get_videos_scraping(remaining, get_bytes):
+            async for video in self._get_videos_scraping(remaining):
                 yield video
 
 
-    async def _get_videos_api(self, count=None, cursor=0, get_bytes=False, **kwargs) -> Iterator[Video]:
+    async def _get_videos_api(self, count=None, cursor=0, **kwargs) -> Iterator[Video]:
         # Use TikTok-Api's make_request method instead of manual requests
         self.parent.logger.debug(f"Starting _get_videos_api with cursor={cursor}, count={count}")
         amount_yielded = 0
@@ -323,7 +334,7 @@ class User(Base):
             await self.parent.request_delay()
         
 
-    async def _get_videos_scraping(self, count, get_bytes):
+    async def _get_videos_scraping(self, count):
         page = self.parent._page
 
         url = f"https://www.tiktok.com/@{self.username}"
@@ -406,56 +417,7 @@ class User(Base):
         async for video in self._get_videos_scroll(count, seen_ids, yielded):
             yield video
 
-    async def _load_each_video(self, videos):
-        page = self.parent._page
-
-        # Get description elements with identifiable links using zendriver
-        try:
-            desc_elements = await page.select_all("[data-e2e=user-post-item-desc]")
-        except Exception:
-            desc_elements = []
-
-        video_elements = []
-        for video in videos:
-            found = False
-            for desc_element in desc_elements:
-                try:
-                    inner_html = await desc_element.get_html()
-                    match = re.search(r'href="https:\/\/www\.tiktok\.com\/@[^\/]+\/video\/([0-9]+)"', inner_html)
-                    if not match:
-                        continue
-                    video_id = match.group(1)
-                    if video['id'] == video_id:
-                        # Find the video element by link
-                        video_element = await page.select(f'a[href*="{video["id"]}"]')
-                        if video_element:
-                            video_elements.append((video, video_element))
-                            found = True
-                            break
-                except Exception:
-                    continue
-
-            if not found:
-                self.parent.logger.debug(f"Could not find video element for video {video.get('id', 'unknown')}")
-
-        for video, element in video_elements:
-            try:
-                await element.scroll_into_view()
-                await element.mouse_move()
-            except Exception:
-                pass
-
-            try:
-                play_path = urlparse(video['video']['playAddr']).path
-            except KeyError:
-                print(f"Missing JSON attributes for video: {video['id']}")
-                continue
-
-            # Wait for video request to be captured
-            await asyncio.sleep(1)
-            await self.parent.request_delay()
-
-    async def _get_initial_videos(self, count, get_bytes):
+    async def _get_initial_videos(self, count):
         self.parent.logger.debug("Getting initial videos from page responses")
         all_videos = []
         finished = False
