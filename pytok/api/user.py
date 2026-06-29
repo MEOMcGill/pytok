@@ -239,23 +239,28 @@ class User(Base):
         # If user info was obtained via TikTok-Api, use API for videos directly
         # If user info was scraped (page already loaded), get initial videos from page first
         amount_yielded = 0
-        if self._used_api_for_info:
-            cursor = 0
-        else:
-            videos, finished, cursor = await self._get_initial_videos(count)
-            self.parent.logger.info(f"Got {len(videos)} initial videos, finished={finished}, cursor={cursor}")
-            for video in videos:
-                yield video
-                amount_yielded += 1
-                if count and amount_yielded >= count:
-                    self.parent.logger.info(f"Reached count limit after {amount_yielded} initial videos")
+        if not self._used_api_for_info:
+            # Try to harvest the videos already on the loaded page. If that fails to find any
+            # (ApiFailedException), fall through to the API/scraping path below. LoginException
+            # and NoContentException are meaningful and intentionally propagate.
+            try:
+                videos, finished, cursor = await self._get_initial_videos(count)
+            except ApiFailedException as ex:
+                self.parent.logger.warning(f"Initial video page harvest failed: {ex}. Falling back to API/scraping method.")
+            else:
+                self.parent.logger.info(f"Got {len(videos)} initial videos, finished={finished}, cursor={cursor}")
+                for video in videos:
+                    yield video
+                    amount_yielded += 1
+                    if count and amount_yielded >= count:
+                        self.parent.logger.info(f"Reached count limit after {amount_yielded} initial videos")
+                        return
+
+                if finished:
+                    self.parent.logger.info(f"Finished after initial videos")
                     return
 
-            if finished:
-                self.parent.logger.info(f"Finished after initial videos")
-                return
-
-            self.parent.logger.info(f"Continuing with _get_videos_api to get more videos")
+                self.parent.logger.info(f"Continuing with _get_videos_api to get more videos")
 
         remaining = None if count is None else count - amount_yielded
         try:
