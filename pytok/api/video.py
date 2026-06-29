@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from datetime import datetime
 import logging
 import json
@@ -348,7 +349,7 @@ class Video(Base):
             async for video in self._related_videos(counter, count=count):
                 yield video
 
-    async def bytes(self, timeout=10) -> bytes:
+    async def bytes(self, timeout=60) -> bytes:
         """
         Returns the bytes of a TikTok Video.
 
@@ -361,48 +362,73 @@ class Video(Base):
             output.write(video_bytes)
         ```
         """
-        bytes_play_url = self.as_dict['video'].get('playAddr', None)
-        bytes_download_url = self.as_dict['video'].get('downloadAddr', None)
-        bytes_urls = [bytes_download_url, bytes_play_url]
-        bytes_urls = [url for url in bytes_urls if url is not None and len(url) > 0]
-        if len(bytes_urls) == 0:
+        # playAddr is the highest-bitrate variant; prefer it for quality, fall back to download.
+        bytes_urls = [
+            self.as_dict['video'].get('playAddr'),
+            self.as_dict['video'].get('downloadAddr'),
+        ]
+        bytes_urls = [url for url in bytes_urls if url]
+        if not bytes_urls:
             raise exceptions.NotAvailableException("Post does not have a video")
-        paths = [url_parsers.urlparse(bytes_url).path for bytes_url in bytes_urls]
-        resps = [resp for play_path in paths for resp in self.get_responses(play_path)]
-        for res in resps:
-            if 'body' in res and res['body']:
-                return res['body']
-        # if we don't have the bytes in the response, we need to get it from the server
-        logging.debug("Video bytes not found in cached responses, making direct requests to fetch bytes")
 
-        # send the request ourselves
+        # If the bytes were already captured on the wire (e.g. during playback), use them.
+        paths = [url_parsers.urlparse(url).path for url in bytes_urls]
+        cached = self._find_cached_bytes(paths)
+        if cached is not None and self._looks_like_video(cached):
+            return cached
+
+        # Otherwise fetch the signed CDN URL ourselves. The CDN authorizes by session cookie,
+        # so the request must carry credentials — a cookieless cross-origin fetch 403s. We run
+        # it as an in-page fetch() from the tiktok.com page so Chrome attaches the cookies.
+        # See pytok memory: video-cdn-cors-block.
         req_exceptions = []
         for bytes_url in bytes_urls:
             try:
-                return await asyncio.wait_for(self._request_bytes(bytes_url), timeout=timeout)
+                data = await asyncio.wait_for(self._browser_fetch_bytes(bytes_url), timeout=timeout)
             except Exception as ex:
                 req_exceptions.append(ex)
                 continue
+            if self._looks_like_video(data):
+                return data
+            req_exceptions.append(Exception(f"{bytes_url[:60]}... did not return an MP4"))
         raise Exception(f"Failed to get video bytes, exceptions: {req_exceptions}")
 
-    async def _request_bytes(self, bytes_url, headers={}, cookies={}) -> bytes:
-        _, session = self.parent.tiktok_api._get_session()
-        headers = session.headers
-        headers['sec-ch-ua'] = '"HeadlessChrome";v="123", "Not:A-Brand";v="8", "Chromium";v="123"'
-        headers['referer'] = 'https://www.tiktok.com/'
-        headers['accept-encoding'] = 'identity;q=1, *;q=0'
-        headers['sec-ch-ua-mobile'] = '?0'
-        headers['user-agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.6312.4 Safari/537.36'
-        headers['range'] = 'bytes=0-'
-        headers['sec-ch-ua-platform'] = '"Windows"'
+    def _find_cached_bytes(self, paths) -> Optional[bytes]:
+        """Return video bytes from the CDP response cache if present, else None."""
+        for path in paths:
+            for res in self.get_responses(path):
+                if res.get('body'):
+                    return res['body']
+        return None
 
-        cookies = await self.parent.tiktok_api.get_session_cookies(session)
+    @staticmethod
+    def _looks_like_video(body) -> bool:
+        """True if body is a complete progressive MP4 (starts with an ISO 'ftyp' box).
+        Other large CDN blobs (DASH fragments, separate audio, range probes) lack this."""
+        return isinstance(body, (bytes, bytearray)) and body[4:8] == b'ftyp'
 
-        r = requests.get(bytes_url, headers=headers, cookies=cookies)
-        r.raise_for_status()
-        if r.content is not None or len(r.content) > 0:
-            return r.content
-        raise Exception("Failed to get video bytes")
+    async def _browser_fetch_bytes(self, bytes_url) -> bytes:
+        """Fetch the video via an in-page fetch() so the request goes through Chrome's network
+        stack with the session cookies (credentials:'include'), then ship the bytes back
+        base64-encoded. The CDN authorizes by cookie, so credentials are required."""
+        js = (
+            "(async () => { try {"
+            f"  const resp = await fetch({json.dumps(bytes_url)}, {{ method: 'GET', credentials: 'include' }});"
+            "  if (!resp.ok) return JSON.stringify({ok: false, status: resp.status});"
+            "  const bytes = new Uint8Array(await resp.arrayBuffer());"
+            "  let binary = ''; const chunk = 0x8000;"
+            "  for (let i = 0; i < bytes.length; i += chunk) {"
+            "    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk)); }"
+            "  return JSON.stringify({ok: true, b64: btoa(binary)});"
+            "} catch (e) { return JSON.stringify({ok: false, error: String(e)}); } })()"
+        )
+        result = await self.parent.tiktok_api._evaluate(self.parent._page, js, await_promise=True)
+        if not result:
+            raise Exception("In-browser byte fetch returned no result")
+        data = json.loads(result)
+        if not data.get("ok"):
+            raise Exception(f"In-browser byte fetch failed: status={data.get('status')} {data.get('error', '')}")
+        return base64.b64decode(data["b64"])
 
     async def _get_comments_and_req(self, count):
         # get request

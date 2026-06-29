@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -10,7 +11,11 @@ import zendriver as zd
 from zendriver import cdp
 import random
 
+from ._cdp_patches import apply_cdp_patches
 from .tiktok_api import ZendriverTikTokApi
+
+# Patch zendriver's CDP bindings for Chrome 149+ before any browser is started.
+apply_cdp_patches()
 
 from .api.sound import Sound
 from .api.user import User
@@ -193,7 +198,14 @@ class PyTok:
             info = self._pending_requests.pop(request_id)
             try:
                 result = await self._page.send(cdp.network.get_response_body(request_id))
-                body = result[0] if isinstance(result, tuple) else result.body
+                if isinstance(result, tuple):
+                    body, base64_encoded = result[0], result[1]
+                else:
+                    body, base64_encoded = result.body, getattr(result, 'base64_encoded', False)
+                # CDP base64-encodes binary bodies (e.g. video MP4 bytes); decode to raw bytes
+                # so callers get usable data. Text bodies (JSON API responses) stay as str.
+                if body and base64_encoded:
+                    body = base64.b64decode(body)
                 if body:
                     self._collected_responses.append({
                         'url': info['url'],
