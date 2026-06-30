@@ -9,6 +9,7 @@ from urllib import parse as url_parsers
 from typing import TYPE_CHECKING, ClassVar, Optional
 
 import brotli
+import httpx
 import requests
 
 if TYPE_CHECKING:
@@ -378,19 +379,25 @@ class Video(Base):
             return cached
 
         # Otherwise fetch the signed CDN URL ourselves. The CDN authorizes by session cookie,
-        # so the request must carry credentials — a cookieless cross-origin fetch 403s. We run
-        # it as an in-page fetch() from the tiktok.com page so Chrome attaches the cookies.
-        # See pytok memory: video-cdn-cors-block.
+        # so the request must carry credentials — a cookieless fetch 403s. See pytok memory:
+        # video-cdn-cors-block.
+        #
+        # Prefer a direct httpx download carrying the browser's session cookies: it's much
+        # faster for large files than the in-browser fetch, which has to base64-encode the
+        # whole video and ship it back over the CDP websocket. Fall back to the in-browser
+        # fetch() only if the direct request is rejected (e.g. the CDN ever tightens checks).
         req_exceptions = []
-        for bytes_url in bytes_urls:
-            try:
-                data = await asyncio.wait_for(self._browser_fetch_bytes(bytes_url), timeout=timeout)
-            except Exception as ex:
-                req_exceptions.append(ex)
-                continue
-            if self._looks_like_video(data):
-                return data
-            req_exceptions.append(Exception(f"{bytes_url[:60]}... did not return an MP4"))
+        for fetcher_name, fetcher in (("httpx", self._httpx_fetch_bytes),
+                                      ("browser", self._browser_fetch_bytes)):
+            for bytes_url in bytes_urls:
+                try:
+                    data = await asyncio.wait_for(fetcher(bytes_url), timeout=timeout)
+                except Exception as ex:
+                    req_exceptions.append(f"{fetcher_name}: {ex}")
+                    continue
+                if self._looks_like_video(data):
+                    return data
+                req_exceptions.append(f"{fetcher_name}: {bytes_url[:60]}... did not return an MP4")
         raise Exception(f"Failed to get video bytes, exceptions: {req_exceptions}")
 
     def _find_cached_bytes(self, paths) -> Optional[bytes]:
@@ -406,6 +413,23 @@ class Video(Base):
         """True if body is a complete progressive MP4 (starts with an ISO 'ftyp' box).
         Other large CDN blobs (DASH fragments, separate audio, range probes) lack this."""
         return isinstance(body, (bytes, bytearray)) and body[4:8] == b'ftyp'
+
+    async def _httpx_fetch_bytes(self, bytes_url) -> bytes:
+        """Download the signed CDN URL directly with httpx, carrying the browser's session
+        cookies (the CDN authorizes by cookie) and the browser session's headers. Avoids the
+        base64-over-CDP round trip of the in-browser fetch, so it's much faster for large files
+        and can run concurrently with browser activity."""
+        from zendriver import cdp
+        cookie_result = await self.parent._page.send(cdp.network.get_cookies([bytes_url]))
+        cookies = {cookie.name: cookie.value for cookie in cookie_result}
+        _, session = self.parent.tiktok_api._get_session()
+        headers = dict(session.headers)
+        headers['Referer'] = 'https://www.tiktok.com/'
+        async with httpx.AsyncClient(follow_redirects=True, timeout=60) as client:
+            resp = await client.get(bytes_url, headers=headers, cookies=cookies)
+        if resp.status_code not in (200, 206):
+            raise Exception(f"httpx fetch returned status {resp.status_code}")
+        return resp.content
 
     async def _browser_fetch_bytes(self, bytes_url) -> bytes:
         """Fetch the video via an in-page fetch() so the request goes through Chrome's network

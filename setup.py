@@ -31,6 +31,7 @@ setuptools.setup(
     install_requires=[
         "zendriver",
         "requests",
+        "httpx",
         "brotli",
         "opencv-python",
         "numpy",
