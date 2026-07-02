@@ -96,6 +96,7 @@ class PyTok:
             num_sessions: int = 1,
             user_data_dir: Optional[str] = None,
             browser_args: Optional[list] = None,
+            page_load_timeout: Optional[int] = 30,
     ):
         """The PyTok class. Used to interact with TikTok.
 
@@ -116,6 +117,11 @@ class PyTok:
 
         * browser_args: Additional Chrome command-line arguments, optional
             Merged with default stealth args. Pass empty list [] to disable defaults.
+
+        * page_load_timeout: Seconds to wait for the initial tiktok.com navigation to
+            reach readyState 'complete', optional. Cold Chrome starts against a large
+            persistent profile plus a slow TikTok homepage can exceed the old 10s; raise
+            this if setup keeps timing out.
         """
         # assert headless is False, "Running in headless currently does not work reliably."
 
@@ -125,6 +131,7 @@ class PyTok:
         self._log_captcha_solves = log_captcha_solves
         self._num_sessions = num_sessions
         self._user_data_dir = user_data_dir
+        self._page_load_timeout = page_load_timeout
         # Merge browser args: use defaults unless explicitly disabled with empty list
         if browser_args is None:
             self._browser_args = self._DEFAULT_BROWSER_ARGS.copy()
@@ -258,8 +265,15 @@ class PyTok:
 
         # Navigate to TikTok (use CDP navigate + wait_for_ready_state to avoid hanging on slow resources)
         await self._page.send(cdp.page.navigate('https://www.tiktok.com'))
-        async with asyncio.timeout(10):
-            await self._page.wait_for_ready_state(until='complete', timeout=11)
+        try:
+            async with asyncio.timeout(self._page_load_timeout):
+                await self._page.wait_for_ready_state(until='complete', timeout=self._page_load_timeout + 1)
+        except (asyncio.TimeoutError, TimeoutError) as ex:
+            # bare TimeoutError stringifies to '', which is useless in logs — re-raise with context
+            raise TimeoutError(
+                f"tiktok.com did not reach readyState 'complete' within {self._page_load_timeout}s "
+                f"(pass a larger page_load_timeout if the site is just loading slowly)"
+            ) from ex
         await asyncio.sleep(3)
 
         # Get user agent from zendriver page
