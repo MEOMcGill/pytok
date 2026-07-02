@@ -205,7 +205,7 @@ class User(Base):
         self.__extract_from_data()
         return user
 
-    async def videos(self, get_bytes=False, count=None, batch_size=100, **kwargs) -> Iterator[Video]:
+    async def videos(self, get_bytes=False, count=None, batch_size=100, prefer_scraping=False, **kwargs) -> Iterator[Video]:
         """
         Returns an iterator yielding Video objects.
 
@@ -213,6 +213,11 @@ class User(Base):
             - count (int): The amount of videos you want returned.
             - get_bytes (bool): If True, download each video's MP4 as it is yielded and store
               it on the yielded Video as ``video.video_bytes`` (None if the download failed).
+            - prefer_scraping (bool): If True, get videos by scraping the browser page rather
+              than the make_request API. The API returns playAddr URLs whose CDN edge signature
+              the browser cannot authenticate, so they 403 in ``video.bytes()``; scraping yields
+              the browser's own item_list URLs, which download cleanly. Use this when you intend
+              to call ``bytes()`` on the results.
             - cursor (int): The unix epoch to get uploaded videos since.
 
         Example Usage
@@ -223,7 +228,7 @@ class User(Base):
                 f.write(video.video_bytes)
         ```
         """
-        async for video in self._iter_videos(count=count, batch_size=batch_size, **kwargs):
+        async for video in self._iter_videos(count=count, batch_size=batch_size, prefer_scraping=prefer_scraping, **kwargs):
             if get_bytes:
                 try:
                     video.video_bytes = await video.bytes()
@@ -232,7 +237,7 @@ class User(Base):
                     video.video_bytes = None
             yield video
 
-    async def _iter_videos(self, count=None, batch_size=100, **kwargs) -> Iterator[Video]:
+    async def _iter_videos(self, count=None, batch_size=100, prefer_scraping=False, **kwargs) -> Iterator[Video]:
         if self.as_dict and self.as_dict.get('videoCount', 1) == 0:
             return
 
@@ -263,6 +268,12 @@ class User(Base):
                 self.parent.logger.info(f"Continuing with _get_videos_api to get more videos")
 
         remaining = None if count is None else count - amount_yielded
+        if prefer_scraping:
+            # make_request returns playAddr URLs the browser can't authenticate against the
+            # video CDN (they 403 in bytes()); go straight to scraping for browser-sourced URLs.
+            async for video in self._get_videos_scraping(remaining):
+                yield video
+            return
         try:
             async for video in self._get_videos_api(count=remaining, cursor=0, **kwargs):
                 yield video
@@ -280,7 +291,7 @@ class User(Base):
         while (count is None or amount_yielded < count):
             params = {
                 'secUid': self.sec_uid,
-                'count': 35,
+                'count': 16,  # match the frontend, which paginates item_list at 16
                 'cursor': cursor,
                 'coverFormat': 2,  # Browser sends this parameter
             }

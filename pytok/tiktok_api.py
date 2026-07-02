@@ -125,6 +125,20 @@ class ZendriverTikTokApi:
         browser_version = await session.tab.evaluate("navigator.appVersion")
         os_name = platform.lower().split()[0] if platform else "windows"
 
+        # Reflect the real login state in the params. The live frontend sends
+        # user_is_login=true whenever a session cookie is present; hardcoding
+        # "false" on a logged-in profile is an inconsistency TikTok can flag.
+        cookies = await self.get_session_cookies(session)
+        is_logged_in = any(
+            cookies.get(name) for name in ("sessionid", "sessionid_ss", "sid_tt")
+        )
+
+        # The frontend sends priority_region = the user's geo country, which it
+        # takes from the store-country-code cookie (e.g. "ca" -> "CA"). region
+        # stays the content region ("US"). Fall back to region if unset.
+        store_country = cookies.get("store-country-code")
+        priority_region = store_country.upper() if store_country else "US"
+
         session.params = {
             "WebIdLastTime": web_id_last_time,
             "aid": "1988",
@@ -137,23 +151,26 @@ class ZendriverTikTokApi:
             "browser_version": browser_version,
             "channel": "tiktok_web",
             "cookie_enabled": "true",
-            "data_collection_enabled": "false",
+            "data_collection_enabled": "true",
             "device_id": device_id,
             "device_platform": "web_pc",
             "focus_state": "true",
-            "from_page": "user",
             "history_len": history_len,
             "is_fullscreen": "false",
             "is_page_visible": "true",
             "language": language,
             "odinId": odin_id,
             "os": os_name,
+            "priority_region": priority_region,
             "region": "US",
             "screen_height": screen_height,
             "screen_width": screen_width,
             "tz_name": timezone,
-            "user_is_login": "false",
-            "video_encoding": "mp4",
+            "user_is_login": "true" if is_logged_in else "false",
+            # "dash" matches the live frontend. Verified it does not change the
+            # item_list response: playAddr is still a progressive mp4 URL, so
+            # video.bytes() downloads work identically to "mp4".
+            "video_encoding": "dash",
             "webcast_language": language,
         }
 
