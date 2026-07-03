@@ -97,6 +97,10 @@ class PyTok:
             user_data_dir: Optional[str] = None,
             browser_args: Optional[list] = None,
             page_load_timeout: Optional[int] = 30,
+            account=None,
+            accounts_pool=None,
+            release_on_shutdown: bool = True,
+            force_relogin: bool = False,
     ):
         """The PyTok class. Used to interact with TikTok.
 
@@ -122,8 +126,41 @@ class PyTok:
             reach readyState 'complete', optional. Cold Chrome starts against a large
             persistent profile plus a slow TikTok homepage can exceed the old 10s; raise
             this if setup keeps timing out.
+
+        * account: An accounts.Account to run this session as, optional. When set,
+            its persistent Chrome profile dir is used (unless user_data_dir is given
+            explicitly) and __aenter__ verifies the profile is logged into that
+            account (repairing from the cookie backup or a login flow if not).
+
+        * accounts_pool: The accounts.AccountsPool the account came from, optional.
+            When set, cookies/identity are persisted back to it and the account is
+            released on shutdown. Usually you obtain both via PyTok.from_pool(...).
+
+        * release_on_shutdown: If True (default), shutdown releases the account
+            back to the pool (in_use=false). A WorkerPool sets this False so it
+            can own the account across many tasks and rebuild a crashed session
+            on the same account without a release/re-acquire race; the worker
+            releases the account itself when it is finally done with it.
         """
         # assert headless is False, "Running in headless currently does not work reliably."
+
+        self._account = account
+        self._accounts_pool = accounts_pool
+        self._release_on_shutdown = release_on_shutdown
+        # When True, verification clears the profile's session first and forces a
+        # fresh credentialed login — used to recover an account whose cookies look
+        # valid but whose session TikTok has invalidated server-side.
+        self._force_relogin = force_relogin
+        # Set True only once the live logged-in uid is confirmed to match the
+        # account. Gates cookie snapshots so a stale/unverified session can never
+        # overwrite a good cookie backup.
+        self._identity_confirmed = False
+        # An attached account supplies its persistent profile dir unless the caller
+        # overrode user_data_dir explicitly.
+        if account is not None and user_data_dir is None:
+            user_data_dir = account.profile_dir
+            if user_data_dir:
+                os.makedirs(user_data_dir, exist_ok=True)
 
         self._headless = headless
         self._request_delay = request_delay
@@ -320,8 +357,55 @@ class PyTok:
         # TODO: test whether injecting visibility overrides into sessions helps
         # await self._inject_visibility_into_sessions()
 
+        # If running as a pool account, verify the profile is logged into the
+        # expected identity (repairing from the cookie backup / login if needed)
+        # before any scraping happens.
+        if self._account is not None:
+            try:
+                await self._verify_account()
+                # Re-derive API session tokens now that we may have injected
+                # cookies or logged in.
+                await self._refresh_api_tokens()
+            except Exception:
+                # Entry failed: __aexit__ won't run, so tear down here (which
+                # also releases the account back to the pool) before re-raising.
+                self._is_context_manager = True
+                await self.shutdown()
+                raise
+
         self._is_context_manager = True
         return self
+
+    @classmethod
+    async def from_pool(cls, accounts_pool, username: Optional[str] = None, **kwargs):
+        """Acquire an account from the pool and build a PyTok bound to it.
+
+        Marks the account in_use; it is released on shutdown / context exit.
+
+        ```python
+        pool = AccountsPool()
+        async with await PyTok.from_pool(pool) as api:
+            async for video in api.user(username="therock").videos():
+                ...
+        ```
+
+        Args:
+            accounts_pool: an accounts.AccountsPool.
+            username: acquire this specific account; otherwise the least-recently
+                used available one. Raises NoAccountError if none is available.
+        """
+        from .accounts import NoAccountError
+
+        if username is not None:
+            account = await accounts_pool.get_account(username)
+        else:
+            account = await accounts_pool.get_available()
+        if account is None:
+            raise NoAccountError(
+                f"No account available"
+                + (f" for username {username}" if username else "")
+            )
+        return cls(account=account, accounts_pool=accounts_pool, **kwargs)
 
     async def _inject_visibility_into_sessions(self):
         """Inject visibility API overrides into all TikTok-Api sessions.
@@ -363,6 +447,27 @@ class PyTok:
             return m.group(1)
 
     async def shutdown(self) -> None:
+        # Persist the latest cookies and release the account back to the pool
+        # before tearing down the browser (needs the live tab, so do it first).
+        if getattr(self, "_account", None) is not None:
+            try:
+                await self._sync_cookies_to_pool()
+            except Exception:
+                pass
+            if getattr(self, "_accounts_pool", None) is not None:
+                try:
+                    await self._accounts_pool.update_last_used(self._account.username)
+                    if self._release_on_shutdown:
+                        await self._accounts_pool.release_account(self._account.username)
+                except Exception:
+                    pass
+        # When a persistent profile is in use, force Chrome to write cookies to
+        # disk before teardown (must happen after _sync_cookies_to_pool, which
+        # needs the live tab). Otherwise the profile never persists a session
+        # injected/refreshed this run and re-injects from the DB backup on every
+        # launch instead of coming up "from profile".
+        if getattr(self, "_user_data_dir", None):
+            await self._flush_cookies_to_disk()
         try:
             # Drop the API client's session reference (does not touch the main tab)
             await self.tiktok_api.close_sessions()
@@ -373,6 +478,24 @@ class PyTok:
             zendriver_browser = getattr(self, "_zendriver_browser", None)
             if zendriver_browser:
                 await zendriver_browser.stop()
+        except Exception:
+            pass
+
+    async def _flush_cookies_to_disk(self, grace: float = 1.5) -> None:
+        """Force Chrome to persist cookies to the profile's on-disk store.
+
+        Chrome's SQLite cookie store commits on a lazy (~30s) timer; a graceful
+        Browser.close triggers an immediate flush, but the write needs a brief
+        grace period to land before zendriver terminates the process (its stop()
+        sends Browser.close then kills the process too fast for the flush).
+        """
+        browser = getattr(self, "_zendriver_browser", None)
+        conn = getattr(browser, "connection", None) if browser else None
+        if not conn or getattr(conn, "closed", True):
+            return
+        try:
+            await conn.send(cdp.browser.close())
+            await asyncio.sleep(grace)
         except Exception:
             pass
 
@@ -706,3 +829,253 @@ class PyTok:
         # TikTok sets these cookies when logged in
         login_cookies = {'sessionid', 'sid_tt', 'sessionid_ss'}
         return bool(cookie_names & login_cookies)
+
+    #
+    # ACCOUNT IDENTITY & VERIFICATION
+    #
+
+    @staticmethod
+    def _extract_identity_fields(user: dict) -> Optional[dict]:
+        """Pull uid/secUid/uniqueId out of an app-context user object, tolerating
+        key-name variation across TikTok webapp versions."""
+        if not isinstance(user, dict):
+            return None
+        uid = user.get('uid') or user.get('userId') or user.get('id')
+        sec_uid = user.get('secUid') or user.get('sec_uid')
+        unique_id = user.get('uniqueId') or user.get('unique_id')
+        nickname = user.get('nickName') or user.get('nickname')
+        if uid or sec_uid or unique_id:
+            return {
+                'user_id': str(uid) if uid else None,
+                'sec_uid': sec_uid,
+                'unique_id': unique_id,
+                'nickname': nickname,
+            }
+        return None
+
+    async def _get_logged_in_identity(self, navigate: bool = False) -> Optional[dict]:
+        """Read the currently logged-in account's on-platform identity from the
+        page's app-context rehydration JSON.
+
+        Returns {'user_id', 'sec_uid', 'unique_id', 'nickname'} for the logged-in
+        account, or None if the page shows no logged-in user. This is the
+        ground-truth identity check — cookies / a profile dir only prove that
+        *someone* is logged in, not *who*.
+        """
+        from .helpers import extract_tag_contents
+
+        if navigate:
+            await self._page.send(cdp.page.navigate('https://www.tiktok.com'))
+            async with asyncio.timeout(self._page_load_timeout):
+                await self._page.wait_for_ready_state(
+                    until='complete', timeout=self._page_load_timeout + 1
+                )
+            await asyncio.sleep(2)
+
+        try:
+            html = await self._page.get_content()
+            data = json.loads(extract_tag_contents(html))
+        except Exception as e:
+            self.logger.debug(f"Identity check: could not parse rehydration JSON: {e}")
+            return None
+
+        scope = data.get('__DEFAULT_SCOPE__', {}) if isinstance(data, dict) else {}
+        app_context = scope.get('webapp.app-context', {}) or {}
+        identity = self._extract_identity_fields(app_context.get('user') or {})
+        if identity:
+            return identity
+
+        # No logged-in user found where we expect it. Log the app-context keys so
+        # we can tighten this against a real logged-in session if the shape moved.
+        self.logger.debug(
+            f"Identity check: no user in app-context (keys: {list(app_context.keys())})"
+        )
+        return None
+
+    async def _snapshot_cookies(self) -> list:
+        """Read all cookies from the browser as plain dicts for DB backup."""
+        result = await self._page.send(cdp.network.get_cookies())
+        cookies = []
+        for c in result:
+            cookies.append({
+                'name': c.name,
+                'value': c.value,
+                'domain': c.domain,
+                'path': c.path,
+                'secure': bool(c.secure),
+                'httpOnly': bool(c.http_only),
+                'sameSite': c.same_site.value if getattr(c, 'same_site', None) else None,
+                'expires': c.expires if getattr(c, 'expires', None) else None,
+            })
+        return cookies
+
+    async def _inject_cookies(self, cookies: list) -> None:
+        """Inject stored cookie dicts into the browser via CDP."""
+        if not cookies:
+            return
+        same_site_map = {
+            'strict': cdp.network.CookieSameSite.STRICT,
+            'lax': cdp.network.CookieSameSite.LAX,
+            'none': cdp.network.CookieSameSite.NONE,
+            'no_restriction': cdp.network.CookieSameSite.NONE,
+        }
+        params = []
+        for c in cookies:
+            name, value = c.get('name'), c.get('value')
+            if name is None or value is None:
+                continue
+            # A stored `None`/'' sameSite means the cookie had NO SameSite
+            # attribute — that must be re-injected as *unset*, not as an explicit
+            # SameSite=None. Forcing SameSite=None breaks TikTok's session cookies:
+            # the injected sessionid then isn't honoured and app-context stays
+            # anonymous (verified against gmail's own known-good cookies).
+            raw_same_site = c.get('sameSite')
+            same_site = same_site_map.get(str(raw_same_site).lower()) if raw_same_site else None
+            domain = c.get('domain')
+            # CDP's expires is a TimeSinceEpoch (a float subclass with .to_json());
+            # a raw float would blow up serialization ('float' has no to_json).
+            raw_expires = c.get('expires')
+            expires = None
+            if isinstance(raw_expires, (int, float)) and raw_expires > 0:
+                expires = cdp.network.TimeSinceEpoch(raw_expires)
+            params.append(cdp.network.CookieParam(
+                name=name,
+                value=value,
+                # A domainless cookie needs a url to anchor to; supply one.
+                url=None if domain else 'https://www.tiktok.com',
+                domain=domain,
+                path=c.get('path', '/'),
+                secure=c.get('secure'),
+                http_only=c.get('httpOnly'),
+                same_site=same_site,
+                expires=expires,
+            ))
+        if params:
+            await self._page.send(cdp.network.set_cookies(params))
+
+    async def _verify_account(self) -> None:
+        """Verify the attached profile is logged into the expected account, and
+        repair from the cookie backup / login flow if not.
+
+        Runs during __aenter__ when an account is attached. The account's
+        `user_id` is the referee: we never scrape under the wrong identity.
+        """
+        account, pool = self._account, self._accounts_pool
+
+        async def _identity_matches() -> Optional[dict]:
+            ident = await self._get_logged_in_identity()
+            if not ident:
+                return None
+            if account.user_id and ident.get('user_id') and ident['user_id'] != account.user_id:
+                self.logger.warning(
+                    f"Profile for {account.username} is logged into a DIFFERENT account "
+                    f"(expected uid {account.user_id}, got {ident['user_id']}/{ident.get('unique_id')})"
+                )
+                return None
+            return ident
+
+        async def _capture_identity(ident: dict) -> None:
+            # First login for this account, or a refresh of a partial record.
+            if pool and (not account.user_id or not account.unique_id):
+                account.user_id = ident.get('user_id') or account.user_id
+                account.sec_uid = ident.get('sec_uid') or account.sec_uid
+                account.unique_id = ident.get('unique_id') or account.unique_id
+                await pool.set_identity(
+                    account.username, account.user_id, account.sec_uid, account.unique_id
+                )
+
+        async def _confirm(ident: dict) -> None:
+            await _capture_identity(ident)
+            self._identity_confirmed = True
+            await self._sync_cookies_to_pool()
+
+        if self._force_relogin:
+            # Recovery path: drop the (stale) session so login() can't short-circuit
+            # on invalid cookies, then go straight to a fresh credentialed login.
+            self.logger.info(f"force_relogin: clearing session for {account.username}")
+            try:
+                await self._page.send(cdp.network.clear_browser_cookies())
+            except Exception as e:
+                self.logger.debug(f"clear_browser_cookies failed: {e}")
+        else:
+            # 1) Profile as-is — is the right account already logged in?
+            if await self._is_logged_in():
+                ident = await _identity_matches()
+                if ident:
+                    self.logger.info(
+                        f"Verified account {account.display_name} "
+                        f"(uid={ident.get('user_id')}) from profile"
+                    )
+                    await _confirm(ident)
+                    return
+
+            # 2) Repair from the DB cookie backup, if we have one.
+            if account.cookies:
+                self.logger.info(f"Injecting cookie backup for {account.username}")
+                await self._inject_cookies(account.cookies)
+                ident = await self._identity_after_reload(_identity_matches)
+                if ident:
+                    self.logger.info(f"Repaired session for {account.display_name} from cookie backup")
+                    await _confirm(ident)
+                    return
+
+        # 3) Fall back to an interactive/credentialed login.
+        self.logger.info(f"No valid session for {account.username}; running login flow")
+        ok = await self.login(username=account.username, password=account.password)
+        if not ok:
+            if pool:
+                await pool.set_active(account.username, False, "Login failed during verification")
+            raise LoginException(f"Could not log in account {account.username}")
+
+        # login() short-circuits on the presence of session cookies, which can be
+        # stale server-side (logged in per cookies, but app-context has no user).
+        # Require a real, matching identity read before trusting the session.
+        ident = await self._get_logged_in_identity(navigate=True)
+        if not ident:
+            if pool:
+                await pool.set_active(
+                    account.username, False,
+                    "Session has cookies but no logged-in user (expired/invalid) — needs re-login",
+                )
+            raise LoginException(
+                f"Account {account.username} appears logged in by cookies but TikTok "
+                f"shows no user (session expired/invalid); clear its profile and re-login"
+            )
+        if account.user_id and ident.get('user_id') and ident['user_id'] != account.user_id:
+            raise LoginException(
+                f"Logged in as {ident.get('unique_id')} (uid {ident['user_id']}) "
+                f"but account {account.username} expects uid {account.user_id}"
+            )
+        await _confirm(ident)
+
+    async def _identity_after_reload(self, matcher) -> Optional[dict]:
+        """Reload tiktok.com (so injected cookies take effect) then run matcher."""
+        await self._page.send(cdp.page.navigate('https://www.tiktok.com'))
+        try:
+            async with asyncio.timeout(self._page_load_timeout):
+                await self._page.wait_for_ready_state(
+                    until='complete', timeout=self._page_load_timeout + 1
+                )
+        except (asyncio.TimeoutError, TimeoutError):
+            pass
+        await asyncio.sleep(2)
+        return await matcher()
+
+    async def _sync_cookies_to_pool(self) -> None:
+        """Snapshot the live browser cookies back to the account's DB backup.
+
+        Only runs once the session's identity has been confirmed — otherwise a
+        stale/unverified session (valid-looking cookies, no real login) could
+        overwrite and degrade a good cookie backup.
+        """
+        if not (self._account and self._accounts_pool and self._identity_confirmed):
+            return
+        try:
+            cookies = await self._snapshot_cookies()
+            login_cookies = {'sessionid', 'sid_tt', 'sessionid_ss'}
+            if any(c['name'] in login_cookies for c in cookies):
+                self._account.cookies = cookies
+                await self._accounts_pool.update_cookies(self._account.username, cookies)
+                await self._accounts_pool.set_active(self._account.username, True, None)
+        except Exception as e:
+            self.logger.debug(f"Failed to sync cookies to pool: {e}")

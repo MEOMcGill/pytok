@@ -34,3 +34,11 @@ src
 .vscode
 .env
 tests/data
+
+# Accounts pool: the SQLite DB holds plaintext credentials + cookie backups, and
+# the per-account Chrome profile dirs hold live sessions. These live in
+# ~/.pytok by default (outside the repo); guard against a stray copy or a
+# $PYTOK_HOME pointed at the tree ever being committed.
+*.db
+.pytok/
+profiles/

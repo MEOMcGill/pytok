@@ -38,6 +38,9 @@ setuptools.setup(
         "tqdm",
         "pandas",
         "polars",
+        "aiosqlite",
+        "click",
+        "tabulate",
     ],
     classifiers=[
         "Development Status :: 4 - Beta",
