@@ -194,6 +194,19 @@ class PyTok:
             return
         self._pending_requests[request_id]['ready'] = True
 
+    def _on_request_will_be_sent(self, event: cdp.network.RequestWillBeSent, connection=None):
+        """Capture the first outgoing request's headers from the main tab.
+
+        These are the browser's real request headers (user-agent, sec-ch-ua,
+        accept-language, ...). The API client reuses them for signed fetches and
+        the httpx/requests byte-download paths.
+        """
+        if not isinstance(event, cdp.network.RequestWillBeSent):
+            return
+        if self._captured_request_headers is None:
+            raw = event.request.headers
+            self._captured_request_headers = dict(raw) if raw else {}
+
     async def process_pending_responses(self, url_pattern=None):
         """Fetch bodies for ready requests and return those matching the URL pattern."""
         # Fetch bodies for all ready requests
@@ -263,6 +276,12 @@ class PyTok:
         self._page.add_handler(cdp.network.ResponseReceived, self._on_response)
         self._page.add_handler(cdp.network.LoadingFinished, self._on_loading_finished)
 
+        # Capture the real request headers off the main tab's first navigation.
+        # The API client reuses these for its signed fetches and for the
+        # httpx/requests byte-download paths (which need a full browser UA).
+        self._captured_request_headers = None
+        self._page.add_handler(cdp.network.RequestWillBeSent, self._on_request_will_be_sent)
+
         # Navigate to TikTok (use CDP navigate + wait_for_ready_state to avoid hanging on slow resources)
         await self._page.send(cdp.page.navigate('https://www.tiktok.com'))
         try:
@@ -276,17 +295,26 @@ class PyTok:
             ) from ex
         await asyncio.sleep(3)
 
+        # Done capturing headers; stop listening so later navigations don't churn.
+        self._page.remove_handlers(cdp.network.RequestWillBeSent)
+
         # Get user agent from zendriver page
         self._user_agent = await self._page.evaluate("navigator.userAgent")
 
-        # Create TikTok-Api sessions using the shared zendriver browser.
-        # Pass the existing page tab so no new tabs need to be opened
-        # (new tabs steal OS-level window focus).
+        if self._num_sessions and self._num_sessions > 1:
+            self.logger.warning(
+                "num_sessions > 1 is no longer supported: the API client now shares "
+                "PyTok's single main tab. Using one session."
+            )
+
+        # Bind the API client to this same main tab. Signing, fetches, network
+        # capture and DOM scraping all run in this one foreground tab — no
+        # background session tabs to keep alive.
         await self.tiktok_api.create_sessions(
             zendriver_browser=self._zendriver_browser,
-            num_sessions=self._num_sessions,
-            starting_url='https://www.tiktok.com',
             existing_tab=self._page,
+            headers=self._captured_request_headers,
+            starting_url='https://www.tiktok.com',
         )
 
         # TODO: test whether injecting visibility overrides into sessions helps
@@ -336,12 +364,12 @@ class PyTok:
 
     async def shutdown(self) -> None:
         try:
-            # Close TikTok-Api session tabs first (they live in the shared browser)
+            # Drop the API client's session reference (does not touch the main tab)
             await self.tiktok_api.close_sessions()
         except Exception:
             pass
         try:
-            # Then stop the zendriver browser (which owns all tabs)
+            # Stop the zendriver browser, which owns and closes the main tab
             zendriver_browser = getattr(self, "_zendriver_browser", None)
             if zendriver_browser:
                 await zendriver_browser.stop()
@@ -352,23 +380,18 @@ class PyTok:
         await self.shutdown()
 
     async def refresh_sessions(self, refresh_zendriver: bool = True):
-        """Reset TikTok-Api sessions to get fresh tokens/cookies.
+        """Refresh the API session's tokens/cookies and params in place.
 
         Call this when you notice API requests starting to fail consistently.
-        This keeps the browser open but creates fresh TikTok-Api sessions
-        (new tabs) with new device_id/odin_id and cookies.
+        Since the API client shares PyTok's main tab, this re-navigates the tab
+        to refresh cookies and then re-derives the session's msToken and params.
+        No tabs are opened or closed.
 
         Args:
-            refresh_zendriver: If True, also navigate the main page back to
+            refresh_zendriver: If True, navigate the main page back to
                 TikTok.com to refresh cookies. Defaults to True.
         """
-        self.logger.info("Refreshing TikTok-Api sessions...")
-
-        # Close existing TikTok-Api session tabs
-        try:
-            await self.tiktok_api.close_sessions()
-        except Exception as e:
-            self.logger.debug(f"Error closing sessions: {e}")
+        self.logger.info("Refreshing TikTok-Api session...")
 
         # Optionally refresh cookies by navigating the main page
         if refresh_zendriver:
@@ -383,17 +406,10 @@ class PyTok:
         self._collected_responses = []
         self._pending_requests = {}
 
-        # Recreate TikTok-Api sessions with fresh tokens
-        await self.tiktok_api.create_sessions(
-            zendriver_browser=self._zendriver_browser,
-            num_sessions=self._num_sessions,
-            starting_url='https://www.tiktok.com',
-        )
+        # Re-derive msToken and params on the shared session (no tab churn)
+        await self.tiktok_api.refresh_session_params()
 
-        # TODO: test whether injecting visibility overrides into sessions helps
-        # await self._inject_visibility_into_sessions()
-
-        self.logger.info("Sessions refreshed successfully")
+        self.logger.info("Session refreshed successfully")
 
     async def get_ms_tokens(self, retries=3, delay=2):
         # Use CDP to get cookies from zendriver, with retry logic

@@ -12,7 +12,7 @@ import logging
 import random
 import time
 from typing import Any, Optional
-from urllib.parse import urlencode, quote, urlparse
+from urllib.parse import urlencode, quote
 
 from zendriver import cdp
 from zendriver.core.connection import ProtocolException
@@ -34,13 +34,6 @@ class TikTokSession:
 
 
 
-def _random_choice(choices):
-    """Pick a random element from choices, or return None if empty."""
-    if choices is None or len(choices) == 0:
-        return None
-    return random.choice(choices)
-
-
 class ZendriverTikTokApi:
     """TikTok API client backed by a shared zendriver browser.
 
@@ -60,9 +53,15 @@ class ZendriverTikTokApi:
         self._session_recovery_enabled = True
         self._session_creation_lock = asyncio.Lock()
         self._cleanup_called = False
-        self._auto_cleanup_dead_sessions = True
         self._owns_browser = False
         self.browser = None
+        # The single browser tab shared with PyTok. This client signs and fetches
+        # in the same foreground tab that PyTok uses for CDP network capture and
+        # DOM scraping, so there are no background session tabs to keep alive.
+        # PyTok owns this tab's lifecycle; we must never close it.
+        self._shared_tab = None
+        self._shared_headers = None
+        self._shared_base_url = "https://www.tiktok.com"
         # Cached webmssdk.js source, captured from a healthy session and
         # re-injected to self-heal sessions where the signer failed to load.
         self._signing_sdk_src = None
@@ -186,6 +185,23 @@ class ZendriverTikTokApi:
                 session.is_valid = False
                 return False
             _ = session.tab.url
+            # A tab can be "open" with a readable URL yet have no JS execution
+            # context (Chrome froze/discarded a backgrounded tab). That only
+            # shows up as "Cannot find default execution context" mid-fetch, so
+            # probe it here. If the context is gone, try to reactivate the tab
+            # before writing the session off.
+            try:
+                await session.tab.send(
+                    cdp.runtime.evaluate(expression="1", return_by_value=True)
+                )
+            except Exception:
+                await session.tab.send(
+                    cdp.emulation.set_focus_emulation_enabled(True)
+                )
+                await session.tab.send(cdp.page.set_web_lifecycle_state("active"))
+                await session.tab.send(
+                    cdp.runtime.evaluate(expression="1", return_by_value=True)
+                )
             return True
         except Exception as e:
             self.logger.warning(f"Session validation failed: {e}")
@@ -193,21 +209,10 @@ class ZendriverTikTokApi:
             return False
 
     async def _mark_session_invalid(self, session):
+        # The session lives on PyTok's shared main tab, which we don't own — so
+        # we never close it and never drop it from the pool (there's nothing to
+        # recreate). Just flag it; _recover_sessions reactivates the tab.
         session.is_valid = False
-        try:
-            if session.tab and not session.tab.closed:
-                await session.tab.close()
-        except Exception as e:
-            self.logger.debug(f"Error closing tab during invalidation: {e}")
-
-        if self._auto_cleanup_dead_sessions and session in self.sessions:
-            try:
-                self.sessions.remove(session)
-                self.logger.debug(
-                    f"Removed dead session from pool. Remaining: {len(self.sessions)}"
-                )
-            except ValueError:
-                pass
 
     async def _get_valid_session_index(self, **kwargs):
         """Get a valid session, with automatic recovery if needed.
@@ -277,214 +282,117 @@ class ZendriverTikTokApi:
     # Session creation
     # ------------------------------------------------------------------
 
-    async def _create_session(
-        self,
-        url: str = "https://www.tiktok.com",
-        ms_token: str | None = None,
-        sleep_after: int = 1,
-        cookies: dict[str, Any] | None = None,
-        timeout: int = 30000,
-    ):
-        """Create a TikTokSession using the shared zendriver browser."""
-        tab = None
-        try:
-            if ms_token is not None:
-                if cookies is None:
-                    cookies = {}
-                cookies["msToken"] = ms_token
+    async def _build_shared_session(self):
+        """Wrap the shared main tab in a single TikTokSession.
 
-            # Set cookies via CDP before navigating
-            if cookies is not None:
-                domain = urlparse(url).netloc
-                cookie_params = [
-                    cdp.network.CookieParam(
-                        name=k, value=v, domain=domain, path="/"
-                    )
-                    for k, v in cookies.items()
-                    if v is not None
-                ]
-                await self.browser.cookies.set_all(cookie_params)
-
-            # Open new tab in background (avoid stealing focus from main tab)
-            target_id = await self.browser.connection.send(
-                cdp.target.create_target(url, background=True)
+        Reads the current msToken from the browser cookie jar and derives the
+        session params from the live tab. Headers come from PyTok, which
+        captured them off the main tab's initial navigation.
+        """
+        session = TikTokSession(
+            tab=self._shared_tab,
+            ms_token=None,
+            headers=self._shared_headers,
+            base_url=self._shared_base_url,
+            is_valid=True,
+        )
+        cookies_dict = await self.get_session_cookies(session)
+        session.ms_token = cookies_dict.get("msToken")
+        if session.ms_token is None:
+            self.logger.info(
+                "Failed to get msToken from cookies; requests may fail. "
+                "Consider passing an ms_token."
             )
-            tab = next(
-                t for t in self.browser.targets
-                if t.type_ == "page" and t.target_id == target_id
-            )
-            tab.browser = self.browser
-            await asyncio.sleep(0.25)
-
-            if "tiktok" not in tab.url:
-                await tab.get("https://www.tiktok.com")
-
-            # Capture request headers via CDP
-            request_headers = None
-            headers_event = asyncio.Event()
-
-            def handle_request(event: cdp.network.RequestWillBeSent, connection=None):
-                nonlocal request_headers
-                if not isinstance(event, cdp.network.RequestWillBeSent):
-                    return
-                if request_headers is None:
-                    raw = event.request.headers
-                    request_headers = dict(raw) if raw else {}
-                    headers_event.set()
-
-            tab.add_handler(cdp.network.RequestWillBeSent, handle_request)
-
-            # Simulate mouse movement to avoid bot detection
-            x, y = random.randint(0, 50), random.randint(0, 50)
-            a, b = random.randint(1, 50), random.randint(100, 200)
-
-            await tab.send(cdp.input_.dispatch_mouse_event(
-                type_="mouseMoved", x=x, y=y
-            ))
-            await tab.wait_for_ready_state(
-                until="complete", timeout=max(timeout // 1000, 10)
-            )
-            await tab.send(cdp.input_.dispatch_mouse_event(
-                type_="mouseMoved", x=a, y=b
-            ))
-
-            # Wait briefly for headers
-            try:
-                await asyncio.wait_for(headers_event.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                pass
-
-            tab.remove_handlers(cdp.network.RequestWillBeSent)
-
-            session = TikTokSession(
-                tab=tab,
-                ms_token=ms_token,
-                headers=request_headers,
-                base_url=url,
-                is_valid=True,
-            )
-
-            if ms_token is None:
-                await asyncio.sleep(sleep_after)
-                cookies_dict = await self.get_session_cookies(session)
-                ms_token = cookies_dict.get("msToken")
-                session.ms_token = ms_token
-                if ms_token is None:
-                    self.logger.info(
-                        f"Failed to get msToken on session index {len(self.sessions)}, "
-                        "you should consider specifying ms_tokens"
-                    )
-
-            self.sessions.append(session)
-            await self._set_session_params(session)
-        except Exception as e:
-            self.logger.error(f"Failed to create session: {e}")
-            if tab is not None:
-                try:
-                    await tab.close()
-                except Exception:
-                    pass
-            raise
+        await self._set_session_params(session)
+        return session
 
     async def create_sessions(
         self,
         zendriver_browser,
-        num_sessions: int = 1,
-        ms_tokens: list[str] | None = None,
-        sleep_after: int = 1,
+        existing_tab,
+        headers: dict | None = None,
         starting_url: str = "https://www.tiktok.com",
-        cookies: list[dict[str, Any]] | None = None,
-        timeout: int = 30000,
         enable_session_recovery: bool = True,
         **kwargs,
     ):
-        """Create sessions using a shared zendriver browser.
+        """Bind the client to PyTok's shared main tab as a single session.
+
+        The client signs and fetches in the same foreground tab PyTok uses for
+        network capture and scraping. There are no background tabs, so nothing
+        needs keep-alive treatment against Chrome freezing.
 
         Args:
-            zendriver_browser: A zendriver Browser instance (required).
-            num_sessions: Number of sessions (tabs) to create.
-            ms_tokens: Optional list of msTokens.
-            sleep_after: Seconds to sleep after session creation.
-            starting_url: URL to start sessions on.
-            cookies: Optional list of cookie dicts.
-            timeout: Navigation timeout in milliseconds.
-            enable_session_recovery: Enable automatic session recovery.
+            zendriver_browser: The zendriver Browser instance (required).
+            existing_tab: PyTok's main page tab to share (required).
+            headers: Request headers PyTok captured from the main tab's initial
+                navigation; used for signed fetches and the httpx/requests paths.
+            starting_url: Base URL for the session.
+            enable_session_recovery: Enable reactivation of a stalled tab.
         """
         self._session_recovery_enabled = enable_session_recovery
         self.browser = zendriver_browser
+        self._shared_tab = existing_tab
+        self._shared_headers = dict(headers) if headers else {}
+        self._shared_base_url = starting_url
+        self._cleanup_called = False
 
-        # Store creation params for session recovery
-        self._creation_params = {
-            "ms_tokens": ms_tokens,
-            "sleep_after": sleep_after,
-            "starting_url": starting_url,
-            "cookies": cookies,
-            "timeout": timeout,
-        }
-
-        await asyncio.gather(
-            *(
-                self._create_session(
-                    ms_token=_random_choice(ms_tokens),
-                    url=starting_url,
-                    sleep_after=sleep_after,
-                    cookies=_random_choice(cookies),
-                    timeout=timeout,
-                )
-                for _ in range(num_sessions)
-            )
-        )
+        self.sessions = [await self._build_shared_session()]
 
     async def _recover_sessions(self):
-        """Recover from dead sessions by creating a new one."""
+        """Reactivate the shared tab rather than spawning a new one.
+
+        The single session lives on PyTok's main tab, which we don't own and
+        can't recreate. If it stalled (lost its JS execution context), pin it
+        active again and rebuild the session wrapper around it.
+        """
         async with self._session_creation_lock:
-            self.logger.info("Starting session recovery...")
-
-            # Remove invalid sessions
-            initial_count = len(self.sessions)
-            self.sessions = [
-                s for s in self.sessions if await self._is_session_valid(s)
-            ]
-            removed_count = initial_count - len(self.sessions)
-            if removed_count > 0:
-                self.logger.info(f"Removed {removed_count} dead session(s)")
-
-            # Create a replacement session using stored params
-            if self.browser is not None and hasattr(self, "_creation_params"):
-                p = self._creation_params
-                try:
-                    self.logger.info("Creating replacement session...")
-                    await self._create_session(
-                        url=p["starting_url"],
-                        ms_token=_random_choice(p["ms_tokens"]),
-                        sleep_after=p["sleep_after"],
-                        cookies=_random_choice(p["cookies"]),
-                        timeout=p["timeout"],
-                    )
-                    self.logger.info(
-                        f"Session recovery successful. Active sessions: {len(self.sessions)}"
-                    )
-                except Exception as e:
-                    self.logger.error(f"Failed to create replacement session: {e}")
+            if self._shared_tab is None:
+                return
+            self.logger.info("Reactivating shared session tab...")
+            try:
+                await self._shared_tab.send(
+                    cdp.emulation.set_focus_emulation_enabled(True)
+                )
+                await self._shared_tab.send(
+                    cdp.page.set_web_lifecycle_state("active")
+                )
+                await self._shared_tab.send(
+                    cdp.runtime.evaluate(expression="1", return_by_value=True)
+                )
+                self.sessions = [await self._build_shared_session()]
+                self.logger.info("Shared session reactivated")
+            except Exception as e:
+                self.logger.error(f"Failed to reactivate shared session: {e}")
 
     # ------------------------------------------------------------------
     # Session cleanup
     # ------------------------------------------------------------------
 
     async def close_sessions(self):
-        """Close all session tabs. Does NOT stop the browser (we don't own it)."""
-        self.logger.debug(f"Closing {len(self.sessions)} sessions...")
-
-        for session in self.sessions:
-            try:
-                if session.tab and not session.tab.closed:
-                    await session.tab.close()
-            except Exception as e:
-                self.logger.debug(f"Error closing tab: {e}")
-
+        """Drop the session reference. Does NOT close the shared main tab or the
+        browser — PyTok owns both and tears them down itself."""
         self.sessions.clear()
+        self._shared_tab = None
         self._cleanup_called = True
-        self.logger.debug("All sessions closed successfully")
+        self.logger.debug("Session reference cleared")
+
+    async def refresh_session_params(self):
+        """Re-derive params and msToken for the shared session in place.
+
+        Called after PyTok re-navigates the main tab to refresh cookies/tokens.
+        No tab is closed or recreated.
+        """
+        if not self.sessions:
+            if self._shared_tab is not None:
+                self.sessions = [await self._build_shared_session()]
+            return
+        for session in self.sessions:
+            cookies = await self.get_session_cookies(session)
+            ms_token = cookies.get("msToken")
+            if ms_token:
+                session.ms_token = ms_token
+            session.is_valid = True
+            await self._set_session_params(session)
 
     async def stop_playwright(self):
         """No-op - we don't own the browser."""
@@ -822,8 +730,30 @@ class ZendriverTikTokApi:
                         await asyncio.sleep(2**retry_count)
                     else:
                         await asyncio.sleep(1)
+            except (EmptyResponseException, InvalidJSONException) as e:
+                # Request-level failure (bot detection / rate limiting / bad JSON),
+                # NOT a dead session. The tab, cookies and msToken are still good;
+                # tearing the session down and recovering a fresh one makes bot
+                # detection *more* likely (a new msToken looks less trustworthy),
+                # and it empties the pool so the next handle can't resume the API
+                # path without a full recovery. So keep the session and retry on
+                # it; after exhausting retries, propagate the exception so the
+                # caller can fall back to scraping while this (still-valid) session
+                # remains available for the next handle.
+                if retry_count < retries:
+                    self.logger.info(
+                        f"Empty/invalid response ({type(e).__name__}), "
+                        f"retrying on same session ({retry_count}/{retries})"
+                    )
+                    if exponential_backoff:
+                        await asyncio.sleep(2 ** retry_count)
+                    else:
+                        await asyncio.sleep(1)
+                else:
+                    raise
             except Exception as e:
-                # Check if this is a session-level failure (tab died, etc.)
+                # Session-level failure (tab died, protocol error, etc.): the
+                # session is genuinely unusable, so invalidate it and recover.
                 self.logger.error(f"Error during request: {e}")
                 await self._mark_session_invalid(session)
 
@@ -867,7 +797,6 @@ class ZendriverTikTokApi:
             "invalid_sessions": invalid_sessions,
             "has_browser": self.browser is not None,
             "cleanup_called": self._cleanup_called,
-            "auto_cleanup_enabled": self._auto_cleanup_dead_sessions,
             "recovery_enabled": self._session_recovery_enabled,
         }
 
