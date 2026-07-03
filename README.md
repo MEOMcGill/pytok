@@ -40,7 +40,7 @@ Please note pulling data from TikTok takes a while! We recommend leaving the scr
 
 ## Accounts, login, and persistent sessions
 
-Some endpoints (hashtag video listings, video search) return nothing for anonymous sessions — TikTok login-walls them. PyTok manages this with an **accounts pool**: a SQLite-backed set of TikTok accounts, each with its own persistent Chrome profile and a cookie/identity backup. You register an account and log in **once** (interactively), and every session afterwards comes up already authenticated from that profile, repairing itself from the cookie backup if the profile's session is lost.
+PyTok supports scraping as a logged-in account, and managing multiple accounts, via an **accounts pool**: a SQLite-backed set of TikTok accounts, each with its own persistent Chrome profile and a cookie/identity backup. You register an account and log in **once** (interactively), and every session afterwards comes up already authenticated from that profile, repairing itself from the cookie backup if the profile's session is lost.
 
 The pool lives in `~/.pytok` by default (override with the `$PYTOK_HOME` env var). The database holds credentials and cookie backups in plaintext, so keep that directory private — it is deliberately kept outside the repo.
 
