@@ -17,6 +17,17 @@ class EmptyResponseException(TikTokException):
     """TikTok sent back an empty response."""
 
 
+class ResponseValidationException(EmptyResponseException):
+    """TikTok returned a well-formed (statusCode==0) response, but it failed the
+    caller's content validation (e.g. the expected fields are missing).
+
+    A subclass of EmptyResponseException so it is treated as a request-level
+    failure (the session is still good — bot-detection / a degraded API response,
+    not a dead tab): make_request keeps the session and retries, then the caller
+    falls back to frontend scraping, rather than invalidating the session and
+    tearing down the browser."""
+
+
 class SoundRemovedException(TikTokException):
     """This TikTok sound has no id from being removed by TikTok."""
 

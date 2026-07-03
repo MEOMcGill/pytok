@@ -17,7 +17,7 @@ from urllib.parse import urlencode, quote
 from zendriver import cdp
 from zendriver.core.connection import ProtocolException
 
-from .exceptions import InvalidJSONException, EmptyResponseException
+from .exceptions import InvalidJSONException, EmptyResponseException, ResponseValidationException
 
 
 @dataclasses.dataclass
@@ -716,7 +716,12 @@ class ZendriverTikTokApi:
                     if status_code != 0:
                         self.logger.error(f"Got an unexpected status code: {data}")
                     if status_code == 0 and invalid_response_callback(data):
-                        raise Exception("Response failed validation")
+                        # Well-formed response that lacks the fields we need. This is a
+                        # request-level failure (bot detection / degraded API response),
+                        # NOT a dead session — raise a request-level exception so we keep
+                        # the session, retry, then let the caller fall back to scraping,
+                        # instead of invalidating the session and rebuilding the browser.
+                        raise ResponseValidationException(result, "Response failed validation")
                     return data
                 except json.decoder.JSONDecodeError:
                     if retry_count == retries:
