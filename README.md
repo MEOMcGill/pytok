@@ -13,7 +13,7 @@ pip install git+https://github.com/networkdynamics/pytok.git@master
 
 ## Quick Start Guide
 
-Here's a quick bit of code to get the videos from a particular hashtag on TikTok. There's more examples in the [examples](https://github.com/networkdynamics/pytok/tree/master/examples) directory.
+Here's a quick bit of code to get the videos from a particular user on TikTok. There's more examples in the [examples](https://github.com/networkdynamics/pytok/tree/master/examples) directory.
 
 ```py
 import asyncio
@@ -28,7 +28,7 @@ async def main():
 
         videos = []
         async for video in user.videos():
-            video_data = video.info()
+            video_data = await video.info()
             print(video_data)
 
 if __name__ == "__main__":
@@ -37,6 +37,78 @@ if __name__ == "__main__":
 
 
 Please note pulling data from TikTok takes a while! We recommend leaving the scripts running on a server for a while for them to finish downloading everything. Feel free to play around with the delay constants to either speed up the process or avoid TikTok rate limiting, like so: `PyTok(request_delay=10)`
+
+## Accounts, login, and persistent sessions
+
+Some endpoints (hashtag video listings, video search) return nothing for anonymous sessions — TikTok login-walls them. PyTok manages this with an **accounts pool**: a SQLite-backed set of TikTok accounts, each with its own persistent Chrome profile and a cookie/identity backup. You register an account and log in **once** (interactively), and every session afterwards comes up already authenticated from that profile, repairing itself from the cookie backup if the profile's session is lost.
+
+The pool lives in `~/.pytok` by default (override with the `$PYTOK_HOME` env var). The database holds credentials and cookie backups in plaintext, so keep that directory private — it is deliberately kept outside the repo.
+
+Register an account and log in once with the CLI:
+
+```bash
+# Add the account (credentials are stored in ~/.pytok/accounts.db)
+python -m pytok.accounts.cli add --username you@email.com --password 'your-password'
+
+# Open a browser and log in. Complete any email/SMS/captcha verification in the
+# window; on success PyTok captures the account identity and a cookie backup.
+python -m pytok.accounts.cli login --username you@email.com
+
+# Inspect the pool
+python -m pytok.accounts.cli list -v
+```
+
+Then scrape as a logged-in account with `PyTok.from_pool`, which acquires an available account (or a specific one via `username=`) already signed in:
+
+```py
+import asyncio
+
+from pytok.tiktok import PyTok
+from pytok.accounts import AccountsPool
+
+async def main():
+    pool = AccountsPool()
+    async with await PyTok.from_pool(pool) as api:
+        hashtag = api.hashtag(name="fyp")
+        async for video in hashtag.videos(count=100):
+            print(await video.info())
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+Other useful CLI commands: `info <username>`, `stats`, `activate`/`deactivate`, `release` (recover an account left in-use by a crashed run), `unlock`, and `delete`. Run `python -m pytok.accounts.cli --help` for the full list.
+
+## Scraping concurrently across accounts
+
+`WorkerPool` runs many sessions at once — each worker owns one account and its own isolated Chrome profile, so N accounts means N concurrent scrapers. Tasks are plain async callables `async def task(api) -> result` distributed across a shared queue:
+
+```py
+import asyncio
+
+from pytok.accounts import AccountsPool, WorkerPool
+
+async def scrape_user(api, handle):
+    videos = []
+    async for video in api.user(username=handle).videos(count=100):
+        videos.append(await video.info())
+    return handle, videos
+
+async def main():
+    pool = AccountsPool()
+    async with WorkerPool(pool, max_workers=3) as wp:
+        results = await wp.run([
+            lambda api, h=h: scrape_user(api, h)
+            for h in ["therock", "khaby.lame", "charlidamelio"]
+        ])
+    for handle, videos in results:
+        print(f"@{handle}: {len(videos)} videos")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+`max_workers` is capped to the number of active accounts. Workers rotate/rest accounts and rebuild crashed sessions automatically. See [`examples/worker_pool_example.py`](https://github.com/networkdynamics/pytok/tree/master/examples/worker_pool_example.py).
 
 Please do not hesitate to make an issue in this repo to get our help with this!
 
