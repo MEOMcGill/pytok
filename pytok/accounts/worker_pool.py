@@ -38,6 +38,7 @@ class WorkerPool:
         max_workers: int = 4,
         tasks_per_rest: Optional[int] = None,
         max_retries: int = 3,
+        startup_stagger: float = 6.0,
         **pytok_kwargs,
     ):
         """
@@ -48,6 +49,10 @@ class WorkerPool:
             tasks_per_rest: rest+rotate a worker's account after this many tasks
                 (None = never force a rest).
             max_retries: per-task retry budget across rotated accounts.
+            startup_stagger: seconds between each worker's FIRST session build,
+                so N workers don't launch N Chrome browsers at the same instant
+                (worker-i waits i * startup_stagger before its first build).
+                Set 0 to disable.
             **pytok_kwargs: forwarded to each PyTok (headless, request_delay,
                 page_load_timeout, manual_captcha_solves, ...).
         """
@@ -55,6 +60,7 @@ class WorkerPool:
         self.max_workers = max_workers
         self.tasks_per_rest = tasks_per_rest
         self.max_retries = max_retries
+        self.startup_stagger = startup_stagger
         self.pytok_kwargs = pytok_kwargs
 
         self.workers: List[Worker] = []
@@ -84,6 +90,7 @@ class WorkerPool:
                     tasks_per_rest=self.tasks_per_rest,
                     max_retries=self.max_retries,
                     pytok_kwargs=self.pytok_kwargs,
+                    startup_delay=i * self.startup_stagger,
                 )
             except NoAccountError:
                 logger.warning(f"WorkerPool: only created {len(self.workers)}/{num} workers")

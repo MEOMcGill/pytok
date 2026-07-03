@@ -70,12 +70,23 @@ class Worker:
         tasks_per_rest: Optional[int] = DEFAULT_TASKS_PER_REST,
         max_retries: int = 3,
         pytok_kwargs: Optional[dict] = None,
+        startup_delay: float = 0.0,
     ):
         self.id = id
         self.pool = pool
         self.tasks_per_rest = tasks_per_rest
         self.max_retries = max_retries
         self.pytok_kwargs = pytok_kwargs or {}
+        # One-shot delay before this worker builds its FIRST session. The pool
+        # staggers workers (worker-0: 0s, worker-1: Ns, ...) so their browser
+        # startups don't overlap. Each worker has its OWN browser/tab/session
+        # (nothing is shared between workers), but launching two zendriver
+        # Chrome instances at the same instant intermittently leaves one
+        # PyTok's API client without a created session ("No sessions created"
+        # on the first request). Mitigation, not a proven root-cause fix; the
+        # in-place session rebuild in execute_task is what actually recovers it.
+        self.startup_delay = startup_delay
+        self._startup_delayed = False
 
         self.current_account: Optional[Account] = None
         self.tasks_done: int = 0
@@ -110,6 +121,15 @@ class Worker:
         up to max_build_attempts so a persistently-broken account can't spin the
         worker in an endless open/close loop."""
         from ..tiktok import PyTok
+
+        # Stagger the very first browser startup across workers so concurrent
+        # zendriver launches don't race each other's session setup.
+        if not self._startup_delayed:
+            self._startup_delayed = True
+            if self.startup_delay:
+                logger.info(f"Worker {self.id}: staggering first session build "
+                            f"by {self.startup_delay:.0f}s")
+                await asyncio.sleep(self.startup_delay)
 
         attempts = 0
         while self.api is None:
@@ -200,14 +220,20 @@ class Worker:
                 await self._close_session()
 
             except Exception as e:
-                # Unknown / browser crash. Drop the (probably dead) session and
-                # retry; rotate on the last attempt so we don't die on one account.
+                # Unknown error / browser crash / transient session-setup race
+                # (e.g. "No sessions created" when two browsers start at once).
+                # Drop the (probably dead) session and rebuild IN PLACE on the
+                # same account — these recover on a fresh session in seconds.
+                # We deliberately do NOT rotate+cooldown here: with a small pool
+                # (e.g. 2 accounts) rotating just locks this account for minutes
+                # and waits on the other busy one, turning a transient blip into
+                # a multi-minute stall. Genuine rate-limit/captcha/timeout still
+                # rotate via ROTATE_EXCEPTIONS above; a persistently unbuildable
+                # account is caught by _ensure_session's max_build_attempts.
                 last_exc = e
                 logger.error(f"Worker {self.id}: unexpected error on "
-                             f"{self._acct_name()}: {e!r}; rebuilding")
+                             f"{self._acct_name()}: {e!r}; rebuilding session in place")
                 await self._close_session()
-                if attempt == self.max_retries - 2:
-                    await self.rotate_account(REST_MINUTES)
 
         raise RuntimeError(
             f"Worker {self.id}: task failed after {self.max_retries} attempts"
