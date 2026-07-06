@@ -18,6 +18,22 @@ if TYPE_CHECKING:
 # web_search_code mirrors what the TikTok web app sends with search requests
 _WEB_SEARCH_CODE = '{"tiktok":{"client_params_x":{"search_engine":{"ies_mt_user_live_video_card_use_libra":1,"mt_search_general_user_live_card":1}},"search_server":{}}}'
 
+# TikTok's search results render inside an inner scroll container, not the
+# document body — so window.scrollBy does nothing. Scroll that container to
+# fire the lazily-loaded pagination requests. Fall back to the window in case
+# the layout changes.
+_SCROLL_SEARCH_GRID_JS = """
+(() => {
+  const el = document.querySelector('#grid-main') ||
+             document.querySelector('[class*=SearchGridLayoutContainer]');
+  if (el && el.scrollHeight > el.clientHeight) {
+    el.scrollTop = el.scrollHeight;
+    return;
+  }
+  window.scrollBy(0, window.innerHeight * 4);
+})()
+"""
+
 
 class Search(Base):
     """Contains methods for searching TikTok."""
@@ -86,12 +102,18 @@ class Search(Base):
     async def _search_type_api(self, obj_type, count=28, offset=0, **kwargs) -> Iterator:
         amount_yielded = 0
         cursor = offset
+        # TikTok ties all pages of one search to a search_id: the logid of the
+        # first response. Without echoing it back on later pages the server
+        # returns an empty item_list with has_more=0, capping results at 12.
+        search_id = ""
 
         while amount_yielded < count:
             params = {
                 "keyword": self.search_term,
                 "cursor": cursor,
+                "offset": cursor,
                 "from_page": "search",
+                "search_id": search_id,
                 "web_search_code": _WEB_SEARCH_CODE,
             }
 
@@ -108,6 +130,9 @@ class Search(Base):
 
             if res.get('type') == 'verify':
                 raise ApiFailedException("TikTok API is asking for verification")
+
+            if not search_id:
+                search_id = (res.get("extra") or {}).get("logid", "") or search_id
 
             for result in self._yield_results(obj_type, res):
                 yield result
@@ -151,9 +176,12 @@ class Search(Base):
             await self.check_and_wait_for_captcha()
 
             # Scroll first so the lazily-loaded search request fires, then give
-            # its response body time to be captured before reading it.
+            # its response body time to be captured before reading it. The
+            # results live in an inner scroll container (#grid-main), not the
+            # window — scrolling the window is a no-op and never triggers the
+            # infinite-scroll observer, so target the container.
             yielded_before = amount_yielded
-            await page.evaluate('window.scrollBy(0, window.innerHeight * 4)')
+            await page.evaluate(_SCROLL_SEARCH_GRID_JS)
             await asyncio.sleep(3)
             await self.check_and_resolve_refresh_button()
 
