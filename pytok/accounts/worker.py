@@ -117,13 +117,17 @@ class Worker:
 
     async def _ensure_session(self, max_build_attempts: int = 3):
         """Build + enter the PyTok session for the current account (reused
-        across tasks). On a failed build it rotates to another account, but only
-        up to max_build_attempts so a persistently-broken account can't spin the
-        worker in an endless open/close loop."""
+        across tasks).
+
+        Transient build failures rebuild on the SAME account (browser launches
+        are serialized by PyTok's shared startup_lock, so concurrent workers no
+        longer race here). Only bad credentials (LoginException) rotate to
+        another account. Bounded by max_build_attempts so a persistently-broken
+        account can't spin the worker in an endless open/close loop."""
         from ..tiktok import PyTok
 
-        # Stagger the very first browser startup across workers so concurrent
-        # zendriver launches don't race each other's session setup.
+        # Optional extra startup jitter (default 0; the shared startup_lock is
+        # what actually serializes concurrent browser launches now).
         if not self._startup_delayed:
             self._startup_delayed = True
             if self.startup_delay:
@@ -131,13 +135,14 @@ class Worker:
                             f"by {self.startup_delay:.0f}s")
                 await asyncio.sleep(self.startup_delay)
 
+        last_exc: Optional[Exception] = None
         attempts = 0
         while self.api is None:
             if attempts >= max_build_attempts:
-                raise NoAccountError(
-                    f"Worker {self.id}: could not build a session after "
-                    f"{attempts} attempts"
-                )
+                raise RuntimeError(
+                    f"Worker {self.id}: could not build a session for "
+                    f"{self._acct_name()} after {attempts} attempts"
+                ) from last_exc
             attempts += 1
             if self.current_account is None and not await self._acquire(wait=True):
                 raise NoAccountError(f"Worker {self.id}: no account for session")
@@ -160,17 +165,29 @@ class Worker:
                 await self.pool.release_account(self.current_account.username)
                 self.current_account = None
             except Exception as e:
-                # PyTok closes its own browser if __aenter__ fails inside the
-                # account-verification block, but a failure elsewhere may leave
-                # a live browser — shut it down defensively so we don't orphan it.
+                # Transient / unknown build failure (e.g. a browser-startup race,
+                # a slow cold start). PyTok closes its own browser if __aenter__
+                # fails inside the account-verification block, but a failure in
+                # the browser-launch phase leaves a live browser — shut it down
+                # defensively so we don't orphan it.
+                #
+                # Rebuild on the SAME account rather than releasing + rotating:
+                # the account isn't at fault, and releasing here makes N workers
+                # thrash each other's accounts when they fail concurrently
+                # (turning a transient blip into pool-wide churn). Keeping the
+                # account pinned lets each worker recover independently. A short
+                # backoff spaces out retries so a dying browser fully releases
+                # before the next launch. A persistently-unbuildable account is
+                # still bounded by max_build_attempts above.
+                last_exc = e
                 logger.error(f"Worker {self.id}: session build failed for "
-                             f"{self._acct_name()}: {e}")
+                             f"{self._acct_name()}: {e!r}; rebuilding on same account "
+                             f"(attempt {attempts}/{max_build_attempts})")
                 try:
                     await api.shutdown()
                 except Exception:
                     pass
-                await self._release_current()
-                self.current_account = None
+                await asyncio.sleep(min(2 ** attempts, 10))
         return self.api
 
     async def execute_task(self, task: PyTokTask) -> Any:

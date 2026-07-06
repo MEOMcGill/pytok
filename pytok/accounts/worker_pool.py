@@ -38,7 +38,7 @@ class WorkerPool:
         max_workers: int = 4,
         tasks_per_rest: Optional[int] = None,
         max_retries: int = 3,
-        startup_stagger: float = 6.0,
+        startup_stagger: float = 0.0,
         **pytok_kwargs,
     ):
         """
@@ -49,10 +49,11 @@ class WorkerPool:
             tasks_per_rest: rest+rotate a worker's account after this many tasks
                 (None = never force a rest).
             max_retries: per-task retry budget across rotated accounts.
-            startup_stagger: seconds between each worker's FIRST session build,
-                so N workers don't launch N Chrome browsers at the same instant
-                (worker-i waits i * startup_stagger before its first build).
-                Set 0 to disable.
+            startup_stagger: optional extra delay (seconds) before each worker's
+                FIRST session build (worker-i waits i * startup_stagger). Left at
+                0 by default: browser launches are now serialized deterministically
+                by a shared startup lock (see below), so a fixed stagger is no
+                longer needed to keep concurrent Chrome starts from racing.
             **pytok_kwargs: forwarded to each PyTok (headless, request_delay,
                 page_load_timeout, manual_captcha_solves, ...).
         """
@@ -69,6 +70,11 @@ class WorkerPool:
         self._initialized = False
         self._shutdown = False
         self._init_lock = asyncio.Lock()
+        # Shared by every worker's PyTok to serialize the racy browser-launch
+        # phase (zendriver start + session bind). Created lazily in initialize()
+        # so it binds to the running loop. This — not startup_stagger — is what
+        # keeps N concurrent Chrome starts from racing each other's session setup.
+        self._startup_lock: Optional[asyncio.Lock] = None
 
     async def initialize(self) -> int:
         if self._initialized:
@@ -81,6 +87,11 @@ class WorkerPool:
         num = max(1, min(self.max_workers, len(active)))
         logger.info(f"WorkerPool initializing {num} worker(s) "
                     f"(max={self.max_workers}, active={len(active)})")
+
+        # One lock shared by all workers' PyTok instances, so only one browser
+        # launch (first build or mid-run rebuild) runs at a time.
+        self._startup_lock = asyncio.Lock()
+        self.pytok_kwargs = {**self.pytok_kwargs, "startup_lock": self._startup_lock}
 
         for i in range(num):
             try:

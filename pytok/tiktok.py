@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import contextlib
 import json
 import logging
 import os
@@ -101,6 +102,7 @@ class PyTok:
             accounts_pool=None,
             release_on_shutdown: bool = True,
             force_relogin: bool = False,
+            startup_lock: Optional[asyncio.Lock] = None,
     ):
         """The PyTok class. Used to interact with TikTok.
 
@@ -141,12 +143,25 @@ class PyTok:
             can own the account across many tasks and rebuild a crashed session
             on the same account without a release/re-acquire race; the worker
             releases the account itself when it is finally done with it.
+
+        * startup_lock: An asyncio.Lock shared across PyTok instances that launch
+            browsers concurrently (e.g. a WorkerPool's workers). Held only around
+            the browser-launch phase (zendriver start + session bind), which is
+            NOT safe to run concurrently: zendriver's free_port() is TOCTOU and
+            two Chromes starting at the same instant intermittently leave one
+            session half-built ("No sessions created"). Serializing that phase
+            makes startup deterministic; it is released before account
+            verification so a slow login/captcha on one worker doesn't block the
+            others' startup. None (default) = no serialization (standalone use).
         """
         # assert headless is False, "Running in headless currently does not work reliably."
 
         self._account = account
         self._accounts_pool = accounts_pool
         self._release_on_shutdown = release_on_shutdown
+        # Shared across concurrent PyTok launches to serialize the racy
+        # browser-startup phase (see the startup_lock docstring above).
+        self._startup_lock = startup_lock
         # When True, verification clears the profile's session first and forces a
         # fresh credentialed login — used to recover an account whose cookies look
         # valid but whose session TikTok has invalidated server-side.
@@ -284,6 +299,43 @@ class PyTok:
         return results
 
     async def __aenter__(self):
+        # The browser-launch phase (zendriver start through session bind) is not
+        # safe to run concurrently with other PyTok launches — see startup_lock.
+        # Serialize it under the shared lock when one was supplied; release it
+        # before account verification so a slow login/captcha doesn't block other
+        # workers' startup.
+        startup_lock = self._startup_lock or contextlib.nullcontext()
+        async with startup_lock:
+            await self._launch_browser_and_bind_session()
+
+        # If running as a pool account, verify the profile is logged into the
+        # expected identity (repairing from the cookie backup / login if needed)
+        # before any scraping happens.
+        if self._account is not None:
+            try:
+                await self._verify_account()
+                # Re-derive API session tokens now that we may have injected
+                # cookies or logged in.
+                await self._refresh_api_tokens()
+            except Exception:
+                # Entry failed: __aexit__ won't run, so tear down here (which
+                # also releases the account back to the pool) before re-raising.
+                self._is_context_manager = True
+                await self.shutdown()
+                raise
+
+        self._is_context_manager = True
+        return self
+
+    async def _launch_browser_and_bind_session(self):
+        """Start the zendriver browser, load tiktok.com and bind the API session.
+
+        This is the concurrency-sensitive part of startup (zendriver's
+        free_port() is TOCTOU and the initial page-load JS context races under
+        concurrent launches), so callers serialize it via the shared
+        startup_lock. Kept as a discrete step so both the first build and any
+        mid-run rebuild go through the same serialized path.
+        """
         # Initialize zendriver state for network response tracking
         self._pending_requests = {}
         self._collected_responses = []
@@ -356,25 +408,6 @@ class PyTok:
 
         # TODO: test whether injecting visibility overrides into sessions helps
         # await self._inject_visibility_into_sessions()
-
-        # If running as a pool account, verify the profile is logged into the
-        # expected identity (repairing from the cookie backup / login if needed)
-        # before any scraping happens.
-        if self._account is not None:
-            try:
-                await self._verify_account()
-                # Re-derive API session tokens now that we may have injected
-                # cookies or logged in.
-                await self._refresh_api_tokens()
-            except Exception:
-                # Entry failed: __aexit__ won't run, so tear down here (which
-                # also releases the account back to the pool) before re-raising.
-                self._is_context_manager = True
-                await self.shutdown()
-                raise
-
-        self._is_context_manager = True
-        return self
 
     @classmethod
     async def from_pool(cls, accounts_pool, username: Optional[str] = None, **kwargs):
