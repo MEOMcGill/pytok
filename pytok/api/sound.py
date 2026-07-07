@@ -8,7 +8,7 @@ from urllib.parse import quote, urlencode
 from ..helpers import extract_tag_contents
 from ..exceptions import *
 
-from typing import TYPE_CHECKING, ClassVar, Iterator, Optional
+from typing import TYPE_CHECKING, Iterator, Optional
 
 if TYPE_CHECKING:
     from ..tiktok import PyTok
@@ -26,7 +26,8 @@ class Sound:
     ```
     """
 
-    parent: ClassVar[PyTok]
+    parent: PyTok
+    """The PyTok instance this object is bound to (set by api.sound(...))."""
 
     id: str
     """TikTok's ID for the sound"""
@@ -35,10 +36,16 @@ class Sound:
     author: Optional[User]
     """The author of the song (if it exists)"""
 
-    def __init__(self, id: Optional[str] = None, data: Optional[str] = None):
+    def __init__(
+        self,
+        id: Optional[str] = None,
+        data: Optional[str] = None,
+        parent: Optional[PyTok] = None,
+    ):
         """
         You must provide the id of the sound or it will not work.
         """
+        self.parent = parent
         if data is not None:
             self.as_dict = data
             self.__extract_from_data()
@@ -105,7 +112,7 @@ class Sound:
             self.author = self.parent.user(username=data["authorName"])
 
         if self.id is None:
-            Sound.parent.logger.error(
+            self.parent.logger.error(
                 f"Failed to create Sound with data: {data}\nwhich has keys {data.keys()}"
             )
 

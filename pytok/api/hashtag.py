@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 
-from typing import TYPE_CHECKING, ClassVar, Iterator, Optional
+from typing import TYPE_CHECKING, Iterator, Optional
 
 from zendriver import cdp
 
@@ -25,7 +25,8 @@ class Hashtag(Base):
     ```
     """
 
-    parent: ClassVar[PyTok]
+    parent: PyTok
+    """The PyTok instance this object is bound to (set by api.hashtag(...))."""
 
     id: Optional[str]
     """The ID of the hashtag"""
@@ -39,10 +40,12 @@ class Hashtag(Base):
         name: Optional[str] = None,
         id: Optional[str] = None,
         data: Optional[dict] = None,
+        parent: Optional[PyTok] = None,
     ):
         """
         You must provide the name or id of the hashtag.
         """
+        self.parent = parent
         self.name = name
         self.id = id
 
@@ -309,7 +312,7 @@ class Hashtag(Base):
             self.name = data["challenge"]["title"]
 
         if None in (self.name, self.id):
-            Hashtag.parent.logger.error(
+            self.parent.logger.error(
                 f"Failed to create Hashtag with data: {data}\nwhich has keys {data.keys()}"
             )
 
