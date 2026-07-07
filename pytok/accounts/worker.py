@@ -26,7 +26,6 @@ from ..exceptions import (
     NotAvailableException,
     NotFoundException,
     SoundRemovedException,
-    TimeoutException,
 )
 
 logger = logging.getLogger("PyTok")
@@ -46,12 +45,16 @@ DATA_LEVEL_EXCEPTIONS = (
     InvalidJSONException,
     FewerVideosThanExpectedException,
 )
-# Account/session-level & transient: cooldown the current account and rotate,
-# then retry the task on the next available account.
+# Account-level: cooldown the current account and rotate, then retry the task
+# on the next available account. Only genuine account-health signals belong
+# here: with max_workers == number of accounts there is never a spare account,
+# so a rotation costs the full cooldown (the worker waits out its own lock).
+# TimeoutException is deliberately NOT here — a content-visibility timeout is
+# usually a transient page-level failure, handled by the in-place session
+# rebuild in execute_task's generic handler.
 ROTATE_EXCEPTIONS = (
     CaptchaException,
     ApiFailedException,
-    TimeoutException,
 )
 
 # Rotation / rest policy.
@@ -234,15 +237,17 @@ class Worker:
                 await self._close_session()
 
             except Exception as e:
-                # Unknown error / browser crash / transient session failure.
-                # Drop the (probably dead) session and rebuild IN PLACE on the
-                # same account — these recover on a fresh session in seconds.
-                # We deliberately do NOT rotate+cooldown here: with a small pool
-                # (e.g. 2 accounts) rotating just locks this account for minutes
-                # and waits on the other busy one, turning a transient blip into
-                # a multi-minute stall. Genuine rate-limit/captcha/timeout still
-                # rotate via ROTATE_EXCEPTIONS above; a persistently unbuildable
-                # account is caught by _ensure_session's max_build_attempts.
+                # Unknown error / browser crash / transient session failure /
+                # content-visibility timeout. Drop the (probably dead) session
+                # and rebuild IN PLACE on the same account — these recover on a
+                # fresh session in seconds. We deliberately do NOT rotate+
+                # cooldown here: with max_workers == number of accounts there
+                # is never a spare account, so rotating just locks this account
+                # for minutes and waits on the other busy ones, turning a
+                # transient blip into a multi-minute stall. Genuine rate-limit/
+                # captcha signals still rotate via ROTATE_EXCEPTIONS above; a
+                # persistently unbuildable account is caught by
+                # _ensure_session's max_build_attempts.
                 last_exc = e
                 logger.error(f"Worker {self.id}: unexpected error on "
                              f"{self._acct_name()}: {e!r}; rebuilding session in place")
@@ -275,13 +280,40 @@ class Worker:
         if not await self._acquire(wait=True):
             raise NoAccountError(f"Worker {self.id}: no account for rotation")
 
-    async def _close_session(self):
-        if self.api is not None:
-            try:
-                await self.api.shutdown()  # release_on_shutdown=False: keeps account
-            except Exception:
-                pass
-            self.api = None
+    async def _close_session(self, timeout: float = 30.0):
+        """Shut down this worker's PyTok session, bounded so a frozen tab can't
+        hang the worker.
+
+        PyTok.shutdown syncs cookies through the live tab first, and CDP
+        commands have no timeout — if Chrome froze the tab, that await never
+        returns. This hung both mid-run rebuilds and pool teardown. On timeout,
+        escalate: skip the cookie sync and stop the browser directly (also
+        bounded, its close command rides the same connection), then fall back
+        to killing the Chrome process outright.
+        """
+        if self.api is None:
+            return
+        api, self.api = self.api, None
+        try:
+            async with asyncio.timeout(timeout):
+                await api.shutdown()  # release_on_shutdown=False: keeps account
+        except TimeoutError:
+            logger.warning(f"Worker {self.id}: session shutdown timed out after "
+                           f"{timeout:.0f}s; force-stopping browser")
+            browser = getattr(api, "_zendriver_browser", None)
+            if browser is not None:
+                try:
+                    async with asyncio.timeout(15):
+                        await browser.stop()
+                except Exception:
+                    proc = getattr(browser, "_process", None)
+                    if proc is not None:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+        except Exception:
+            pass
 
     async def _release_current(self):
         if self.current_account:
