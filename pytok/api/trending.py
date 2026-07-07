@@ -8,16 +8,20 @@ from .sound import Sound
 from .user import User
 from .hashtag import Hashtag
 
-from typing import TYPE_CHECKING, Iterator
+from typing import TYPE_CHECKING, Iterator, Optional
 
 if TYPE_CHECKING:
     from ..tiktok import PyTok
 
 
 class Trending:
-    """Contains static methods related to trending."""
+    """Contains methods related to trending."""
 
     parent: PyTok
+    """The PyTok instance this object is bound to (set by api.trending(...))."""
+
+    def __init__(self, parent: Optional[PyTok] = None):
+        self.parent = parent
 
     @staticmethod
     def videos(count=30, **kwargs) -> Iterator[Video]:

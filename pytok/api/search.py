@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import urllib.parse
-from typing import TYPE_CHECKING, Iterator
+from typing import TYPE_CHECKING, Iterator, Optional
 
 from zendriver import cdp
 
@@ -39,8 +39,10 @@ class Search(Base):
     """Contains methods for searching TikTok."""
 
     parent: PyTok
+    """The PyTok instance this object is bound to (set by api.search(...))."""
 
-    def __init__(self, search_term):
+    def __init__(self, search_term, parent: Optional[PyTok] = None):
+        self.parent = parent
         self.search_term = search_term
 
     async def videos(self, count=28, offset=0, **kwargs) -> Iterator[Video]:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import TYPE_CHECKING, ClassVar, Iterator, Optional
+from typing import TYPE_CHECKING, Iterator, Optional
 
 from zendriver import cdp
 
@@ -31,7 +31,8 @@ class User(Base):
 
     """
 
-    parent: ClassVar[PyTok]
+    parent: PyTok
+    """The PyTok instance this object is bound to (set by api.user(...))."""
 
     user_id: str
     """The user ID of the user."""
@@ -48,11 +49,13 @@ class User(Base):
             user_id: Optional[str] = None,
             sec_uid: Optional[str] = None,
             data: Optional[dict] = None,
+            parent: Optional[PyTok] = None,
     ):
         """
         You must provide the username or (user_id and sec_uid) otherwise this
         will not function correctly.
         """
+        self.parent = parent
         self.__update_id_sec_uid_username(user_id, sec_uid, username)
         self._used_api_for_info = False
         if data is not None:
@@ -571,7 +574,7 @@ class User(Base):
             # do something
         ```
         """
-        processed = User.parent._process_kwargs(kwargs)
+        processed = self.parent._process_kwargs(kwargs)
         kwargs["custom_device_id"] = processed.device_id
 
         amount_yielded = 0
@@ -594,14 +597,14 @@ class User(Base):
                 "language": processed.language,
             }
             path = "api/favorite/item_list/?{}&{}".format(
-                User.parent._add_url_params(), urlencode(query)
+                self.parent._add_url_params(), urlencode(query)
             )
 
             res = self.parent.get_data(path, **kwargs)
 
             if "itemList" not in res.keys():
                 if first:
-                    User.parent.logger.error("User's likes are most likely private")
+                    self.parent.logger.error("User's likes are most likely private")
                 return
 
             videos = res.get("itemList", [])
@@ -611,7 +614,7 @@ class User(Base):
                 yield self.parent.video(data=video)
 
             if not res.get("hasMore", False) and not first:
-                User.parent.logger.info(
+                self.parent.logger.info(
                     "TikTok isn't sending more TikToks beyond this point."
                 )
                 return
@@ -646,7 +649,7 @@ class User(Base):
             )
 
         if None in (self.username, self.user_id, self.sec_uid):
-            User.parent.logger.error(
+            self.parent.logger.error(
                 f"Failed to create User with data: {data}\nwhich has keys {data.keys()}"
             )
 
@@ -658,7 +661,7 @@ class User(Base):
     def __find_attributes(self) -> None:
         # It is more efficient to check search first, since self.user_object() makes HTML request.
         found = False
-        for u in self.parent.search.users(self.username):
+        for u in self.parent.search(self.username).users():
             if u.username == self.username:
                 found = True
                 self.__update_id_sec_uid_username(u.user_id, u.sec_uid, u.username)

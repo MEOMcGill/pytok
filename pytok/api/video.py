@@ -6,7 +6,7 @@ from datetime import datetime
 import logging
 import json
 from urllib import parse as url_parsers
-from typing import TYPE_CHECKING, ClassVar, Optional
+from typing import TYPE_CHECKING, Optional
 
 import brotli
 import httpx
@@ -44,7 +44,8 @@ class Video(Base):
     ```
     """
 
-    parent: ClassVar[PyTok]
+    parent: PyTok
+    """The PyTok instance this object is bound to (set by api.video(...))."""
 
     id: Optional[str]
     """TikTok's ID of the Video"""
@@ -67,10 +68,12 @@ class Video(Base):
             username: Optional[str] = None,
             url: Optional[str] = None,
             data: Optional[dict] = None,
+            parent: Optional["PyTok"] = None,
     ):
         """
         You must provide the id or a valid url, else this will fail.
         """
+        self.parent = parent
         self.id = id
         self.username = username
         if data is not None:
@@ -878,7 +881,7 @@ class Video(Base):
             ]
 
         if self.id is None:
-            Video.parent.logger.error(
+            self.parent.logger.error(
                 f"Failed to create Video with data: {data}\nwhich has keys {data.keys()}"
             )
 

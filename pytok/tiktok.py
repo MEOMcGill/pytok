@@ -36,12 +36,6 @@ DESKTOP_BASE_URL = "https://www.tiktok.com/"
 
 class PyTok:
     _is_context_manager = False
-    user = User
-    search = Search
-    sound = Sound
-    hashtag = Hashtag
-    video = Video
-    trending = Trending
     logger = logging.getLogger(LOGGER_NAME)
 
     # Default browser args for stealth
@@ -146,13 +140,16 @@ class PyTok:
 
         * startup_lock: An asyncio.Lock shared across PyTok instances that launch
             browsers concurrently (e.g. a WorkerPool's workers). Held only around
-            the browser-launch phase (zendriver start + session bind), which is
-            NOT safe to run concurrently: zendriver's free_port() is TOCTOU and
-            two Chromes starting at the same instant intermittently leave one
-            session half-built ("No sessions created"). Serializing that phase
-            makes startup deterministic; it is released before account
-            verification so a slow login/captcha on one worker doesn't block the
-            others' startup. None (default) = no serialization (standalone use).
+            the browser-launch phase (zendriver start + session bind), where
+            zendriver's free_port() is TOCTOU: two Chromes starting at the same
+            instant can pick the same debug port. Serializing that phase makes
+            startup deterministic; it is released before account verification so
+            a slow login/captcha on one worker doesn't block the others'
+            startup. None (default) = no serialization (standalone use).
+            (Historical note: most concurrent-startup failures — e.g. "No
+            sessions created" — were actually caused by API classes sharing a
+            class-level `parent`, so every new PyTok hijacked all workers'
+            objects; parent is now bound per instance via the api factories.)
         """
         # assert headless is False, "Running in headless currently does not work reliably."
 
@@ -194,14 +191,6 @@ class PyTok:
 
         self.logger.setLevel(logging_level)
 
-        # Add classes from the api folder
-        User.parent = self
-        Search.parent = self
-        Sound.parent = self
-        Hashtag.parent = self
-        Video.parent = self
-        Trending.parent = self
-
         self.request_cache = {}
 
         # Create zendriver-based TikTokApi instance for API requests
@@ -209,6 +198,42 @@ class PyTok:
             logging_level=logging_level
         )
 
+    # ------------------------------------------------------------------
+    # API object factories
+    #
+    # Each factory binds the created object to THIS PyTok instance via an
+    # instance-level `parent`. These used to be class aliases (`user = User`)
+    # with `User.parent` stamped globally in __init__ — which meant every
+    # PyTok constructed in the process hijacked `parent` for all existing
+    # API objects. With N concurrent workers, worker A's objects would route
+    # requests to worker B's (possibly half-built) browser, causing races
+    # like "No sessions created" at startup. Instance binding removes that
+    # shared state entirely.
+    # ------------------------------------------------------------------
+
+    def user(self, *args, **kwargs) -> User:
+        """Create a User bound to this PyTok instance."""
+        return User(*args, parent=self, **kwargs)
+
+    def search(self, *args, **kwargs) -> Search:
+        """Create a Search bound to this PyTok instance."""
+        return Search(*args, parent=self, **kwargs)
+
+    def sound(self, *args, **kwargs) -> Sound:
+        """Create a Sound bound to this PyTok instance."""
+        return Sound(*args, parent=self, **kwargs)
+
+    def hashtag(self, *args, **kwargs) -> Hashtag:
+        """Create a Hashtag bound to this PyTok instance."""
+        return Hashtag(*args, parent=self, **kwargs)
+
+    def video(self, *args, **kwargs) -> Video:
+        """Create a Video bound to this PyTok instance."""
+        return Video(*args, parent=self, **kwargs)
+
+    def trending(self, *args, **kwargs) -> Trending:
+        """Create a Trending bound to this PyTok instance."""
+        return Trending(*args, parent=self, **kwargs)
 
     # URL patterns we care about - TikTok API and video media
     _TRACKED_URL_PATTERNS = [
