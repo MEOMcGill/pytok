@@ -217,10 +217,11 @@ class User(Base):
             - get_bytes (bool): If True, download each video's MP4 as it is yielded and store
               it on the yielded Video as ``video.video_bytes`` (None if the download failed).
             - prefer_scraping (bool): If True, get videos by scraping the browser page rather
-              than the make_request API. The API returns playAddr URLs whose CDN edge signature
-              the browser cannot authenticate, so they 403 in ``video.bytes()``; scraping yields
-              the browser's own item_list URLs, which download cleanly. Use this when you intend
-              to call ``bytes()`` on the results.
+              than the make_request API. Normally unnecessary: API requests reuse the browser's
+              own fingerprint params (see ZendriverTikTokApi._set_session_params), so their
+              playAddr URLs download cleanly in ``video.bytes()``. Kept as an explicit escape
+              hatch for sessions where no browser param template could be captured (API-path
+              playAddr URLs then 403, as TikTok poisons URLs requested with made-up params).
             - cursor (int): The unix epoch to get uploaded videos since.
 
         Example Usage
@@ -272,8 +273,8 @@ class User(Base):
 
         remaining = None if count is None else count - amount_yielded
         if prefer_scraping:
-            # make_request returns playAddr URLs the browser can't authenticate against the
-            # video CDN (they 403 in bytes()); go straight to scraping for browser-sourced URLs.
+            # Explicit opt-out of the API path: go straight to scraping for
+            # browser-sourced URLs (see the prefer_scraping docstring above).
             async for video in self._get_videos_scraping(remaining):
                 yield video
             return

@@ -8,6 +8,8 @@ import re
 import time
 from typing import Optional
 
+from urllib.parse import parse_qs, urlparse
+
 import zendriver as zd
 from zendriver import cdp
 import random
@@ -272,17 +274,40 @@ class PyTok:
         self._pending_requests[request_id]['ready'] = True
 
     def _on_request_will_be_sent(self, event: cdp.network.RequestWillBeSent, connection=None):
-        """Capture the first outgoing request's headers from the main tab.
+        """Capture the browser's real request headers and API query params.
 
-        These are the browser's real request headers (user-agent, sec-ch-ua,
+        Headers: taken from the first outgoing request (user-agent, sec-ch-ua,
         accept-language, ...). The API client reuses them for signed fetches and
         the httpx/requests byte-download paths.
+
+        API params: taken from the first API request the webapp's own JS issues.
+        The API client uses them as the base params for its signed fetches so
+        our requests carry the same fingerprint (device_id, odinId,
+        clientABVersions, region, ...) the webapp sends — TikTok poisons the
+        playAddr URLs in item_list responses requested with made-up params
+        (they 403 on download). `clientABVersions` is the discriminator: the
+        webapp always sends it, while PyTok's own in-page fetches never include
+        it until a template has been captured, so we can't capture our own
+        requests here.
         """
         if not isinstance(event, cdp.network.RequestWillBeSent):
             return
         if self._captured_request_headers is None:
             raw = event.request.headers
             self._captured_request_headers = dict(raw) if raw else {}
+        if self._captured_api_params is None:
+            url = event.request.url
+            if (url.startswith('https://www.tiktok.com/api/')
+                    and 'clientABVersions=' in url
+                    and 'device_id=' in url):
+                parsed = urlparse(url)
+                self._captured_api_params = {
+                    k: v[0] for k, v in parse_qs(parsed.query).items()
+                }
+                self.tiktok_api.browser_api_params = self._captured_api_params
+                self.logger.debug(
+                    f"Captured browser API param template from {parsed.path}"
+                )
 
     async def process_pending_responses(self, url_pattern=None):
         """Fetch bodies for ready requests and return those matching the URL pattern."""
@@ -390,10 +415,14 @@ class PyTok:
         self._page.add_handler(cdp.network.ResponseReceived, self._on_response)
         self._page.add_handler(cdp.network.LoadingFinished, self._on_loading_finished)
 
-        # Capture the real request headers off the main tab's first navigation.
-        # The API client reuses these for its signed fetches and for the
-        # httpx/requests byte-download paths (which need a full browser UA).
+        # Capture the real request headers and API query params off the main
+        # tab's traffic (see _on_request_will_be_sent). The API client reuses
+        # them for its signed fetches and the httpx/requests byte-download
+        # paths. Reset both on (re)launch so a rebuilt browser can't serve a
+        # stale template.
         self._captured_request_headers = None
+        self._captured_api_params = None
+        self.tiktok_api.browser_api_params = None
         self._page.add_handler(cdp.network.RequestWillBeSent, self._on_request_will_be_sent)
 
         # Navigate to TikTok (use CDP navigate + wait_for_ready_state to avoid hanging on slow resources)
@@ -409,8 +438,11 @@ class PyTok:
             ) from ex
         await asyncio.sleep(3)
 
-        # Done capturing headers; stop listening so later navigations don't churn.
-        self._page.remove_handlers(cdp.network.RequestWillBeSent)
+        # The handler stays attached: headers are captured off the first
+        # request, but the API param template needs a navigation that fires a
+        # webapp API request, which may only happen later (account
+        # verification, first profile load). Both captures are one-shot, so
+        # the steady-state per-request cost is two None-checks.
 
         # Get user agent from zendriver page
         self._user_agent = await self._page.evaluate("navigator.userAgent")

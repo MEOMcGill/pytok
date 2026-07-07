@@ -31,6 +31,9 @@ class TikTokSession:
     ms_token: str = None
     base_url: str = "https://www.tiktok.com"
     is_valid: bool = True
+    # True when params were lifted from a captured browser API request rather
+    # than synthesized; make_request upgrades sessions that predate the capture.
+    params_from_browser: bool = False
 
 
 
@@ -47,6 +50,17 @@ class ZendriverTikTokApi:
         "https://sf16-website-login.neutral.ttwstatic.com/obj/"
         "tiktok_web_login_static/webmssdk/1.0.0.374/webmssdk.js"
     )
+
+    # Per-request / auth query params that must never be lifted from a captured
+    # browser API request into the session's base params — make_request and the
+    # individual API methods supply these per call.
+    _REQUEST_SPECIFIC_PARAMS = frozenset({
+        "msToken", "X-Bogus", "X-Gnarly",
+        "secUid", "uniqueId", "itemID", "aweme_id", "item_id", "comment_id",
+        "cursor", "count", "offset", "coverFormat",
+        "needPinnedItemIds", "post_item_list_request_type",
+        "keyword", "web_search_code", "search_id",
+    })
 
     def __init__(self, logging_level: int = logging.WARN, logger_name: str = None):
         self.sessions = []
@@ -65,6 +79,10 @@ class ZendriverTikTokApi:
         # Cached webmssdk.js source, captured from a healthy session and
         # re-injected to self-heal sessions where the signer failed to load.
         self._signing_sdk_src = None
+        # Query params of a real API request the browser's webapp issued,
+        # captured off the wire by PyTok. When present, they are the base
+        # params for our signed fetches (see _set_session_params for why).
+        self.browser_api_params = None
 
         if logger_name is None:
             logger_name = "ZendriverTikTokApi"
@@ -106,7 +124,28 @@ class ZendriverTikTokApi:
     # ------------------------------------------------------------------
 
     async def _set_session_params(self, session):
-        """Override session params to match what browser actually sends."""
+        """Derive the session's base API params.
+
+        Preferred source: the query params of a real API request the browser's
+        webapp issued (captured off the wire by PyTok). TikTok binds the CDN
+        signature of the playAddr URLs in item_list responses to the requesting
+        fingerprint: item_list fetched with made-up device_id/odinId/etc.
+        returns playAddr URLs that 403 on download (verified empirically —
+        identical request with the browser's own params returns URLs that
+        download fine), and inconsistent params also invite bot detection.
+
+        Fallback (no browser request captured yet): synthesize params from the
+        live tab, randomizing the identifiers we can't read.
+        """
+        if self.browser_api_params:
+            session.params = {
+                k: v for k, v in self.browser_api_params.items()
+                if k not in self._REQUEST_SPECIFIC_PARAMS
+            }
+            session.params_from_browser = True
+            return
+        session.params_from_browser = False
+
         user_agent = await session.tab.evaluate("navigator.userAgent")
         language = await session.tab.evaluate(
             "navigator.language || navigator.userLanguage"
@@ -667,6 +706,12 @@ class ZendriverTikTokApi:
             i, session = await self._get_valid_session_index(**kwargs)
         except Exception:
             i, session = self._get_session(**kwargs)
+
+        # Late-bind the browser param template: the capture needs a navigation
+        # that fires a webapp API request, which may land after this session was
+        # built. Upgrade the session's params on first use after the capture.
+        if self.browser_api_params and not session.params_from_browser:
+            await self._set_session_params(session)
 
         if session.params is not None:
             params = {**session.params, **params}
