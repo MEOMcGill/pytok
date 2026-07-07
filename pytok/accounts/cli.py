@@ -9,6 +9,7 @@ Uses ~/.pytok/accounts.db by default (override with --db or $PYTOK_HOME).
 
 import asyncio
 import os
+import shutil
 
 import click
 from tabulate import tabulate
@@ -19,6 +20,25 @@ from .pool import AccountsPool
 
 def run_async(coro):
     return asyncio.run(coro)
+
+
+def _seed_profile_dir(src: str, dst: str):
+    """Copy a warmed Chrome profile at `src` into the account's profile dir `dst`.
+
+    Gives the login browser a warmed profile (history/state) while still capturing
+    fresh cookies from the login flow. Refuses to clobber an already-populated
+    profile dir so a working/logged-in account is never destroyed by a re-run.
+    """
+    src = os.path.expanduser(src)
+    dst = os.path.expanduser(dst)
+    if not os.path.isdir(src):
+        raise click.UsageError(f"--seed-profile: source profile dir not found: {src}")
+    if os.path.isdir(dst) and os.listdir(dst):
+        raise click.UsageError(
+            f"Profile dir already populated: {dst}. Refusing to overwrite a warmed/logged-in "
+            f"profile — delete it (or add a fresh account) before seeding."
+        )
+    shutil.copytree(src, dst, dirs_exist_ok=True)
 
 
 @click.group()
@@ -259,15 +279,24 @@ def release(ctx, username):
 @cli.command()
 @click.option("--username", required=True, help="Login identifier to log in")
 @click.option("--headless", is_flag=True, help="Run headless (not recommended for login)")
+@click.option("--seed-profile", default=None,
+              help="Path to a warmed Chrome profile to copy into this account's profile dir "
+                   "before login. Gives a warmed browser (history/state) while the login flow "
+                   "still captures fresh cookies. Refuses to overwrite a populated profile dir; "
+                   "the source template is copied, never mutated.")
 @click.option("--force-relogin", is_flag=True,
               help="Clear the profile's session and force a fresh login (recover a stale account)")
 @click.pass_context
-def login(ctx, username, headless, force_relogin):
+def login(ctx, username, headless, seed_profile, force_relogin):
     """Open a browser for this account, log in, and capture identity + cookies.
 
     Use this once per new account: it launches the account's persistent Chrome
     profile, runs the login/verification flow, then stores the resolved TikTok
     identity and a cookie backup so future sessions start already logged in.
+
+    Pass --seed-profile to copy a warmed Chrome profile into this account's
+    profile dir first, so the login runs in a browser that already looks
+    used (helps avoid new-profile bot detection) while still logging in fresh.
 
     Pass --force-relogin to recover an account whose cookies look valid but whose
     session TikTok has invalidated (app-context shows no logged-in user).
@@ -281,6 +310,10 @@ def login(ctx, username, headless, force_relogin):
             click.echo(f"Account {username} not found or already in use")
             return
         try:
+            if seed_profile:
+                _seed_profile_dir(seed_profile, account.profile_dir)
+                click.echo(f"Seeded warmed profile: {os.path.expanduser(seed_profile)} "
+                           f"-> {account.profile_dir}")
             async with PyTok(account=account, accounts_pool=pool, headless=headless,
                              force_relogin=force_relogin) as api:
                 ident = await api._get_logged_in_identity()
