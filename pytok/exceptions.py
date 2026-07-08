@@ -48,6 +48,14 @@ class TimeoutException(TikTokException):
 class ApiFailedException(TikTokException):
     """TikTok API is failing"""
 
+class NoTemplateException(ApiFailedException):
+    """No browser param template has been captured yet for this API endpoint.
+
+    The param cache is lazily filled: the first request for an endpoint type
+    must go through the frontend scraping route, which captures the webapp's
+    own request params off the wire. A subclass of ApiFailedException so every
+    existing API→scraping fallback handles it transparently."""
+
 class FewerVideosThanExpectedException(TikTokException):
     """TikTok is returning fewer videos for this user than their metadata led us to expect"""
 

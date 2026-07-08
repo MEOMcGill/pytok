@@ -10,14 +10,18 @@ import dataclasses
 import json
 import logging
 import random
-import time
 from typing import Any, Optional
-from urllib.parse import urlencode, quote
+from urllib.parse import urlencode, quote, urlparse
 
 from zendriver import cdp
 from zendriver.core.connection import ProtocolException
 
-from .exceptions import InvalidJSONException, EmptyResponseException, ResponseValidationException
+from .exceptions import (
+    InvalidJSONException,
+    EmptyResponseException,
+    ResponseValidationException,
+    NoTemplateException,
+)
 
 
 @dataclasses.dataclass
@@ -31,9 +35,6 @@ class TikTokSession:
     ms_token: str = None
     base_url: str = "https://www.tiktok.com"
     is_valid: bool = True
-    # True when params were lifted from a captured browser API request rather
-    # than synthesized; make_request upgrades sessions that predate the capture.
-    params_from_browser: bool = False
 
 
 
@@ -51,15 +52,13 @@ class ZendriverTikTokApi:
         "tiktok_web_login_static/webmssdk/1.0.0.374/webmssdk.js"
     )
 
-    # Per-request / auth query params that must never be lifted from a captured
-    # browser API request into the session's base params — make_request and the
-    # individual API methods supply these per call.
-    _REQUEST_SPECIFIC_PARAMS = frozenset({
-        "msToken", "X-Bogus", "X-Gnarly",
-        "secUid", "uniqueId", "itemID", "aweme_id", "item_id", "comment_id",
-        "cursor", "count", "offset", "coverFormat",
-        "needPinnedItemIds", "post_item_list_request_type",
-        "keyword", "web_search_code", "search_id",
+    # Params never replayed from a cached per-endpoint template: signatures and
+    # tokens are stale the moment they're captured (they're re-generated fresh
+    # per request instead). Everything else in a captured request — including
+    # endpoint-specific keys like cursor/secUid — is kept as the template value
+    # and simply overridden by the caller's own per-request params.
+    _TEMPLATE_EXCLUDED_PARAMS = frozenset({
+        "msToken", "X-Bogus", "X-Gnarly", "X-Dynosaur",
     })
 
     def __init__(self, logging_level: int = logging.WARN, logger_name: str = None):
@@ -79,10 +78,23 @@ class ZendriverTikTokApi:
         # Cached webmssdk.js source, captured from a healthy session and
         # re-injected to self-heal sessions where the signer failed to load.
         self._signing_sdk_src = None
-        # Query params of a real API request the browser's webapp issued,
-        # captured off the wire by PyTok. When present, they are the base
-        # params for our signed fetches (see _set_session_params for why).
-        self.browser_api_params = None
+        # Per-endpoint param templates, lazily captured off the wire by PyTok
+        # from the webapp's own API requests (keyed by URL path, e.g.
+        # 'api/post/item_list'). The first request for an endpoint type must go
+        # through the frontend scraping route, which fires the webapp's own
+        # request and fills the cache; subsequent requests reuse the template.
+        # TikTok binds response trust (and the CDN signatures of returned
+        # playAddr URLs) to the requesting fingerprint, and each endpoint has
+        # its own param shape — replaying another endpoint's params (or made-up
+        # ones) invites bot detection / empty responses.
+        self._api_param_cache = {}
+        # Freshest msToken seen on any captured webapp request. TikTok rotates
+        # the token constantly; a stale one is rejected on logged-in sessions.
+        self._latest_ms_token = None
+        # Signed URLs of fetches we issued ourselves, so PyTok's capture
+        # handler never recycles our own (template-derived) requests back into
+        # the template cache.
+        self._inflight_fetch_urls = set()
 
         if logger_name is None:
             logger_name = "ZendriverTikTokApi"
@@ -120,97 +132,63 @@ class ZendriverTikTokApi:
         return i, self.sessions[i]
 
     # ------------------------------------------------------------------
-    # Session params (merged from PatchedTikTokApi)
+    # Per-endpoint param template cache
     # ------------------------------------------------------------------
 
-    async def _set_session_params(self, session):
-        """Derive the session's base API params.
+    @staticmethod
+    def _endpoint_key(url: str) -> str:
+        """Normalize an API URL to its cache key, e.g. 'api/post/item_list'."""
+        return urlparse(url).path.strip('/')
 
-        Preferred source: the query params of a real API request the browser's
-        webapp issued (captured off the wire by PyTok). TikTok binds the CDN
-        signature of the playAddr URLs in item_list responses to the requesting
-        fingerprint: item_list fetched with made-up device_id/odinId/etc.
-        returns playAddr URLs that 403 on download (verified empirically —
-        identical request with the browser's own params returns URLs that
-        download fine), and inconsistent params also invite bot detection.
+    def cache_api_params(self, url: str, params: dict):
+        """Store the query params of a webapp-issued API request as the
+        template for that endpoint type (freshest observation wins), and lift
+        its msToken as the newest known token.
 
-        Fallback (no browser request captured yet): synthesize params from the
-        live tab, randomizing the identifiers we can't read.
+        Called by PyTok's CDP capture handler for every API request the
+        webapp's own JS issues; our own fetches are excluded via
+        _inflight_fetch_urls.
         """
-        if self.browser_api_params:
-            session.params = {
-                k: v for k, v in self.browser_api_params.items()
-                if k not in self._REQUEST_SPECIFIC_PARAMS
-            }
-            session.params_from_browser = True
-            return
-        session.params_from_browser = False
+        key = self._endpoint_key(url)
+        is_new = key not in self._api_param_cache
+        self._api_param_cache[key] = dict(params)
+        ms_token = params.get("msToken")
+        if ms_token:
+            self._latest_ms_token = ms_token
+        if is_new:
+            self.logger.info(f"Captured param template for endpoint '{key}'")
 
-        user_agent = await session.tab.evaluate("navigator.userAgent")
-        language = await session.tab.evaluate(
-            "navigator.language || navigator.userLanguage"
-        )
-        platform = await session.tab.evaluate("navigator.platform")
-        device_id = str(random.randint(10**18, 10**19 - 1))
-        odin_id = str(random.randint(10**18, 10**19 - 1))
-        history_len = str(random.randint(1, 10))
-        screen_height = str(random.randint(600, 1080))
-        screen_width = str(random.randint(800, 1920))
-        web_id_last_time = str(int(time.time()))
-        timezone = await session.tab.evaluate(
-            "Intl.DateTimeFormat().resolvedOptions().timeZone"
-        )
-        browser_version = await session.tab.evaluate("navigator.appVersion")
-        os_name = platform.lower().split()[0] if platform else "windows"
+    def get_cached_api_params(self, url: str) -> Optional[dict]:
+        return self._api_param_cache.get(self._endpoint_key(url))
 
-        # Reflect the real login state in the params. The live frontend sends
-        # user_is_login=true whenever a session cookie is present; hardcoding
-        # "false" on a logged-in profile is an inconsistency TikTok can flag.
-        cookies = await self.get_session_cookies(session)
-        is_logged_in = any(
-            cookies.get(name) for name in ("sessionid", "sessionid_ss", "sid_tt")
-        )
+    def is_self_issued(self, url: str) -> bool:
+        """True if this request URL is one of our own in-flight fetches.
 
-        # The frontend sends priority_region = the user's geo country, which it
-        # takes from the store-country-code cookie (e.g. "ca" -> "CA"). region
-        # stays the content region ("US"). Fall back to region if unset.
-        store_country = cookies.get("store-country-code")
-        priority_region = store_country.upper() if store_country else "US"
+        Exact match against the registered signed URLs, plus a tolerant
+        fallback (same endpoint + same X-Bogus signature) in case the browser
+        re-normalizes the URL string on the wire.
+        """
+        if url in self._inflight_fetch_urls:
+            return True
+        key = self._endpoint_key(url)
+        for inflight in self._inflight_fetch_urls:
+            if self._endpoint_key(inflight) != key:
+                continue
+            marker = inflight.rsplit("X-Bogus=", 1)
+            if len(marker) == 2 and f"X-Bogus={marker[1].split('&')[0]}" in url:
+                return True
+        return False
 
-        session.params = {
-            "WebIdLastTime": web_id_last_time,
-            "aid": "1988",
-            "app_language": language,
-            "app_name": "tiktok_web",
-            "browser_language": language,
-            "browser_name": "Mozilla",
-            "browser_online": "true",
-            "browser_platform": platform,
-            "browser_version": browser_version,
-            "channel": "tiktok_web",
-            "cookie_enabled": "true",
-            "data_collection_enabled": "true",
-            "device_id": device_id,
-            "device_platform": "web_pc",
-            "focus_state": "true",
-            "history_len": history_len,
-            "is_fullscreen": "false",
-            "is_page_visible": "true",
-            "language": language,
-            "odinId": odin_id,
-            "os": os_name,
-            "priority_region": priority_region,
-            "region": "US",
-            "screen_height": screen_height,
-            "screen_width": screen_width,
-            "tz_name": timezone,
-            "user_is_login": "true" if is_logged_in else "false",
-            # "dash" matches the live frontend. Verified it does not change the
-            # item_list response: playAddr is still a progressive mp4 URL, so
-            # video.bytes() downloads work identically to "mp4".
-            "video_encoding": "dash",
-            "webcast_language": language,
-        }
+    def invalidate_cached_api_params(self, url: str):
+        """Drop a (presumed stale/burned) endpoint template so the next request
+        for this type lazily refills it via the frontend scraping route."""
+        key = self._endpoint_key(url)
+        if self._api_param_cache.pop(key, None) is not None:
+            self.logger.info(f"Invalidated param template for endpoint '{key}'")
+
+    def clear_api_param_cache(self):
+        self._api_param_cache = {}
+        self._latest_ms_token = None
 
     # ------------------------------------------------------------------
     # Session validation
@@ -342,7 +320,6 @@ class ZendriverTikTokApi:
                 "Failed to get msToken from cookies; requests may fail. "
                 "Consider passing an ms_token."
             )
-        await self._set_session_params(session)
         return session
 
     async def create_sessions(
@@ -431,7 +408,6 @@ class ZendriverTikTokApi:
             if ms_token:
                 session.ms_token = ms_token
             session.is_valid = True
-            await self._set_session_params(session)
 
     async def stop_playwright(self):
         """No-op - we don't own the browser."""
@@ -484,6 +460,10 @@ class ZendriverTikTokApi:
         except Exception:
             _, session = self._get_session(**kwargs)
 
+        # Register the URL so PyTok's CDP capture handler can tell this
+        # self-issued fetch apart from the webapp's own requests and never
+        # recycles it into the per-endpoint template cache.
+        self._inflight_fetch_urls.add(url)
         try:
             result = await self._evaluate(session.tab, js_script, await_promise=True)
             return result
@@ -491,6 +471,8 @@ class ZendriverTikTokApi:
             self.logger.error(f"Session failed during fetch: {e}")
             await self._mark_session_invalid(session)
             raise
+        finally:
+            self._inflight_fetch_urls.discard(url)
 
     # ------------------------------------------------------------------
     # Cookies
@@ -686,6 +668,12 @@ class ZendriverTikTokApi:
         if x_gnarly:
             url += f"&X-Gnarly={x_gnarly}"
 
+        # Stale X-Dynosaur values are stripped from cached templates; attach a
+        # fresh one when the signer can produce it.
+        x_dynosaur = sign_result.get("X-Dynosaur")
+        if x_dynosaur:
+            url += f"&X-Dynosaur={x_dynosaur}"
+
         return url
 
     # ------------------------------------------------------------------
@@ -707,32 +695,40 @@ class ZendriverTikTokApi:
         except Exception:
             i, session = self._get_session(**kwargs)
 
-        # Late-bind the browser param template: the capture needs a navigation
-        # that fires a webapp API request, which may land after this session was
-        # built. Upgrade the session's params on first use after the capture.
-        if self.browser_api_params and not session.params_from_browser:
-            await self._set_session_params(session)
-
-        if session.params is not None:
-            params = {**session.params, **params}
+        # Lazily-filled per-endpoint template: the first request for an
+        # endpoint type must go through the frontend scraping route, which
+        # fires the webapp's own request and fills the cache. No template ->
+        # tell the caller to scrape (NoTemplateException is an
+        # ApiFailedException, so every existing fallback handles it).
+        template = self.get_cached_api_params(url)
+        if template is None:
+            raise NoTemplateException(
+                f"No param template captured yet for '{self._endpoint_key(url)}' "
+                "— falling back to scraping to fill the cache"
+            )
+        base = {
+            k: v for k, v in template.items()
+            if k not in self._TEMPLATE_EXCLUDED_PARAMS
+        }
+        params = {**base, **params}
 
         if headers is not None:
             headers = {**session.headers, **headers}
         else:
             headers = session.headers
 
-        # get msToken
+        # msToken: TikTok rotates it constantly and (on logged-in sessions)
+        # rejects stale ones, so resolve it fresh per request — the newest of
+        # the live cookie and the token seen on the latest captured webapp
+        # request — rather than a value cached at session build.
         if params.get("msToken") is None:
-            if session.ms_token is not None:
-                params["msToken"] = session.ms_token
-            else:
-                cookies = await self.get_session_cookies(session)
-                ms_token = cookies.get("msToken")
-                if ms_token is None:
-                    self.logger.warning(
-                        "Failed to get msToken from cookies, trying anyway (probably will fail)"
-                    )
-                params["msToken"] = ms_token
+            cookies = await self.get_session_cookies(session)
+            ms_token = cookies.get("msToken") or self._latest_ms_token or session.ms_token
+            if ms_token is None:
+                self.logger.warning(
+                    "Failed to get msToken from cookies, trying anyway (probably will fail)"
+                )
+            params["msToken"] = ms_token
 
         encoded_params = f"{url}?{urlencode(params, safe='=', quote_via=quote)}"
         signed_url = await self.sign_url(encoded_params, session_index=i)
@@ -787,9 +783,10 @@ class ZendriverTikTokApi:
                 # detection *more* likely (a new msToken looks less trustworthy),
                 # and it empties the pool so the next handle can't resume the API
                 # path without a full recovery. So keep the session and retry on
-                # it; after exhausting retries, propagate the exception so the
-                # caller can fall back to scraping while this (still-valid) session
-                # remains available for the next handle.
+                # it; after exhausting retries, drop this endpoint's template
+                # (it's evidently stale/burned) and propagate the exception so
+                # the caller falls back to scraping — which both serves the
+                # current request and re-captures a fresh template off the wire.
                 if retry_count < retries:
                     self.logger.info(
                         f"Empty/invalid response ({type(e).__name__}), "
@@ -800,6 +797,7 @@ class ZendriverTikTokApi:
                     else:
                         await asyncio.sleep(1)
                 else:
+                    self.invalidate_cached_api_params(url)
                     raise
             except Exception as e:
                 # Session-level failure (tab died, protocol error, etc.): the
