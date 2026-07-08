@@ -10,6 +10,7 @@ import dataclasses
 import json
 import logging
 import random
+import time
 from typing import Any, Optional
 from urllib.parse import urlencode, quote, urlparse
 
@@ -60,6 +61,14 @@ class ZendriverTikTokApi:
     _TEMPLATE_EXCLUDED_PARAMS = frozenset({
         "msToken", "X-Bogus", "X-Gnarly", "X-Dynosaur",
     })
+
+    # Templates rot: captured params include moment-bound values (time_of_day,
+    # day_of_week, window state, ...) that TikTok cross-checks. Replaying a
+    # template past this age gets playAddr URLs in the response poisoned (they
+    # 403 on download) even though the JSON response itself still succeeds —
+    # observed live ~25-45 min after capture. Treat an aged template as absent
+    # so the lazy scraping route re-captures a fresh one.
+    TEMPLATE_TTL_SECONDS = 15 * 60
 
     def __init__(self, logging_level: int = logging.WARN, logger_name: str = None):
         self.sessions = []
@@ -151,7 +160,7 @@ class ZendriverTikTokApi:
         """
         key = self._endpoint_key(url)
         is_new = key not in self._api_param_cache
-        self._api_param_cache[key] = dict(params)
+        self._api_param_cache[key] = (dict(params), time.monotonic())
         ms_token = params.get("msToken")
         if ms_token:
             self._latest_ms_token = ms_token
@@ -159,7 +168,20 @@ class ZendriverTikTokApi:
             self.logger.info(f"Captured param template for endpoint '{key}'")
 
     def get_cached_api_params(self, url: str) -> Optional[dict]:
-        return self._api_param_cache.get(self._endpoint_key(url))
+        key = self._endpoint_key(url)
+        entry = self._api_param_cache.get(key)
+        if entry is None:
+            return None
+        params, captured_at = entry
+        if time.monotonic() - captured_at > self.TEMPLATE_TTL_SECONDS:
+            self.logger.info(
+                f"Param template for endpoint '{key}' exceeded its "
+                f"{self.TEMPLATE_TTL_SECONDS}s TTL; treating as absent so the "
+                "scraping route re-captures a fresh one"
+            )
+            del self._api_param_cache[key]
+            return None
+        return params
 
     def is_self_issued(self, url: str) -> bool:
         """True if this request URL is one of our own in-flight fetches.
