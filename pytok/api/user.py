@@ -217,11 +217,11 @@ class User(Base):
             - get_bytes (bool): If True, download each video's MP4 as it is yielded and store
               it on the yielded Video as ``video.video_bytes`` (None if the download failed).
             - prefer_scraping (bool): If True, get videos by scraping the browser page rather
-              than the make_request API. Normally unnecessary: API requests reuse the browser's
-              own fingerprint params (see ZendriverTikTokApi._set_session_params), so their
-              playAddr URLs download cleanly in ``video.bytes()``. Kept as an explicit escape
-              hatch for sessions where no browser param template could be captured (API-path
-              playAddr URLs then 403, as TikTok poisons URLs requested with made-up params).
+              than the make_request API. Normally unnecessary: API requests reuse a per-endpoint
+              param template captured from the webapp's own requests (lazily filled by the
+              scraping route on the first request of each endpoint type — see
+              ZendriverTikTokApi.cache_api_params), so their playAddr URLs download cleanly in
+              ``video.bytes()``. Kept as an explicit escape hatch to force the scraping path.
             - cursor (int): The unix epoch to get uploaded videos since.
 
         Example Usage
