@@ -147,6 +147,10 @@ class Base:
         if tries >= max_tries:
             # try some other behaviour
             current_url = page.url
+            # Bounce off the page only after banking what it already fetched:
+            # response bodies are read lazily and their request ids die with the
+            # page (see PyTok.collect_pending_response_bodies).
+            await self.parent.collect_pending_response_bodies()
             await page.get("https://www.tiktok.com")
             await asyncio.sleep(5)
             await page.get(current_url)
@@ -261,6 +265,10 @@ class Base:
         # now try some other behaviour
         page = self.parent._page
         current_url = page.url
+        # Bank the bodies of anything this page already fetched before leaving it:
+        # their request ids stop resolving once the page is gone (see
+        # PyTok.collect_pending_response_bodies).
+        await self.parent.collect_pending_response_bodies()
         await page.send(cdp.page.navigate("https://www.tiktok.com"))
         await asyncio.sleep(3)
 

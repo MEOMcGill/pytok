@@ -301,9 +301,27 @@ class PyTok:
             params = {k: v[0] for k, v in parse_qs(urlparse(url).query).items()}
             self.tiktok_api.cache_api_params(url, params)
 
-    async def process_pending_responses(self, url_pattern=None):
-        """Fetch bodies for ready requests and return those matching the URL pattern."""
-        # Fetch bodies for all ready requests
+    def seen_request_urls(self, url_pattern):
+        """URLs of tracked requests seen since the last clear, matching url_pattern.
+
+        Covers requests whose bodies are still pending as well as those already
+        collected, so callers can read what the page asked for even when the
+        response body itself is gone or unusable.
+        """
+        urls = [info['url'] for info in self._pending_requests.values()]
+        urls += [resp['url'] for resp in self._collected_responses]
+        return [url for url in urls if url_pattern in url]
+
+    async def collect_pending_response_bodies(self):
+        """Fetch and store the bodies of every finished request.
+
+        Bodies are pulled out of Chrome lazily, and a request id only stays valid
+        while its page lives: navigate away and get_response_body fails, silently
+        losing the response. Call this before any navigation that isn't meant to
+        discard what the current page fetched (see the recovery navigations in
+        api.base). Unlike process_pending_responses this consumes nothing, so
+        later filtered reads still find everything.
+        """
         ready_ids = [
             rid for rid, info in self._pending_requests.items()
             if info['ready']
@@ -328,6 +346,10 @@ class PyTok:
                     })
             except Exception:
                 pass
+
+    async def process_pending_responses(self, url_pattern=None):
+        """Fetch bodies for ready requests and return those matching the URL pattern."""
+        await self.collect_pending_response_bodies()
 
         results = []
         remaining = []

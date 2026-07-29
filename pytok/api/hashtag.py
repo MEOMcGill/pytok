@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 
 from typing import TYPE_CHECKING, Iterator, Optional
+from urllib.parse import parse_qs, urlparse
 
 from zendriver import cdp
 
@@ -14,6 +16,24 @@ if TYPE_CHECKING:
 from .base import Base
 from ..exceptions import *
 from ..helpers import extract_tag_contents
+
+# challenge/detail statusCode TikTok returns for a hashtag that doesn't exist.
+HASHTAG_NOT_FOUND_STATUS_CODES = (10205,)
+
+# What the hashtag page renders instead of a video grid when the tag doesn't
+# exist. Apostrophes are normalised before matching, since TikTok renders a
+# typographic apostrophe rather than the ASCII one.
+HASHTAG_NOT_FOUND_TEXTS = ("Couldn't find this hashtag",)
+
+
+def _apostrophe_variants(texts):
+    """Both apostrophe spellings of each text, for matchers that compare literally."""
+    variants = []
+    for text in texts:
+        variants.append(text)
+        if "'" in text:
+            variants.append(text.replace("'", "’"))
+    return variants
 
 
 class Hashtag(Base):
@@ -104,46 +124,194 @@ class Hashtag(Base):
         if resp is None:
             raise ApiFailedException("TikTok returned None response")
 
+        status_code = max(resp.get('statusCode', 0), resp.get('status_code', 0))
+        if status_code in HASHTAG_NOT_FOUND_STATUS_CODES:
+            raise NoContentException(
+                f"TikTok has no hashtag '{self.name}': statusCode={status_code}"
+            )
+        if status_code != 0:
+            raise ApiFailedException(
+                f"TikTok returned error for hashtag info: statusCode={status_code}"
+            )
+
         if 'challengeInfo' not in resp:
             raise ApiFailedException("Failed to get challengeInfo from response")
 
-        self.as_dict = resp['challengeInfo']
-        self.__extract_from_data()
-        return self.as_dict
-
-    async def _info_full_scrape(self, **kwargs) -> dict:
-        await self._navigate_to_hashtag_page()
-        await self.wait_for_content_or_unavailable_or_captcha('[data-e2e=challenge-item]', 'Not available')
-        await self.check_and_close_signin()
-
-        # The challenge/detail response can land after the grid renders, so poll
-        # for it rather than reading once.
-        challenge_info = None
-        for _ in range(5):
-            for resp in await self.parent.process_pending_responses("api/challenge/detail"):
-                res = self._parse_response(resp)
-                if res and res.get('challengeInfo'):
-                    challenge_info = res['challengeInfo']
-            if challenge_info is not None:
-                break
-            await asyncio.sleep(1.5)
-
-        if challenge_info is None:
-            # Chrome can garbage-collect a response body before we read it; the
-            # page's own rehydration JSON carries the same object.
-            challenge_info = self._challenge_info_from_html(
-                await self.parent._page.get_content()
+        challenge_info = resp['challengeInfo']
+        # A statusCode==0 response for an unknown tag can still come back with a
+        # hollow challengeInfo (no id) rather than a not-found status.
+        if not self._challenge_info_has_id(challenge_info):
+            raise NoContentException(
+                f"TikTok returned no hashtag data for '{self.name}'"
             )
-
-        if challenge_info is None:
-            raise ApiFailedException("Failed to get challengeInfo from the hashtag page")
 
         self.as_dict = challenge_info
         self.__extract_from_data()
         return self.as_dict
 
-    def _challenge_info_from_html(self, html):
-        """Pull challengeInfo out of the hashtag page's rehydration JSON."""
+    @staticmethod
+    def _challenge_info_has_id(challenge_info):
+        """True if this challengeInfo names a hashtag that actually exists."""
+        if not challenge_info:
+            return False
+        return bool(challenge_info.get('id') or challenge_info.get('challenge', {}).get('id'))
+
+    async def _info_full_scrape(self, **kwargs) -> dict:
+        await self._navigate_to_hashtag_page()
+        # Check for the not-found page before waiting on the video grid: that wait
+        # spends ~90s reloading and scrolling before giving up with a
+        # TimeoutException, which reads as a transient fault and gets the account
+        # rotated (see accounts.worker) instead of reporting a missing hashtag.
+        await self._raise_if_hashtag_missing()
+        await self.check_and_wait_for_captcha()
+
+        challenge_info, page_challenge_id = await self._scrape_challenge_info()
+
+        try:
+            await self.wait_for_content_or_unavailable_or_captcha(
+                '[data-e2e=challenge-item]',
+                'Not available',
+                no_content_text=_apostrophe_variants(HASHTAG_NOT_FOUND_TEXTS),
+            )
+        except TimeoutException:
+            # The grid matters to videos(), which scrolls it for more; for info()
+            # alone what we already read off the page is enough.
+            if challenge_info is None and page_challenge_id is None:
+                raise
+            self.parent.logger.warning(
+                "Hashtag video grid never rendered, but the page identified the hashtag"
+            )
+        await self.check_and_close_signin()
+
+        if challenge_info is None:
+            # Anonymous sessions get the same object inlined in the page.
+            challenge_info = self._challenge_info_from_html(
+                await self.parent._page.get_content()
+            )
+
+        if challenge_info is None and page_challenge_id is not None:
+            self.parent.logger.warning(
+                f"Hashtag page never fetched challenge/detail for '{self.name}'; "
+                f"continuing with id {page_challenge_id} only, without its stats"
+            )
+            challenge_info = {'challenge': {'id': page_challenge_id, 'title': self.name}}
+
+        if challenge_info is None:
+            raise ApiFailedException("Failed to get challengeInfo from the hashtag page")
+
+        if not self._challenge_info_has_id(challenge_info):
+            raise NoContentException(
+                f"The hashtag page carries no data for '{self.name}'"
+            )
+
+        self.as_dict = challenge_info
+        self.__extract_from_data()
+        return self.as_dict
+
+    async def _scrape_challenge_info(self, reloads=2):
+        """Get this hashtag's data off the loaded page.
+
+        TikTok serves two variants of the hashtag page: one whose JS fetches
+        challenge/detail, and one that renders the same feed from SSR and fetches
+        nothing. Only the first carries the hashtag's data for a logged-in session
+        (the rehydration JSON inlines a webapp.challenge-detail scope for
+        anonymous sessions only), and which one you get looks like a coin flip, so
+        reload to ask again. Landing the response also captures the param template
+        that lets the API route serve this endpoint for the rest of the session.
+
+        Returns (challengeInfo or None, hashtag id the page reported or None) —
+        the id lets the caller carry on without the stats.
+        """
+        challenge_info = await self._harvest_challenge_info()
+        page_challenge_id = None
+
+        for _ in range(reloads):
+            if challenge_info is not None:
+                return challenge_info, None
+            # Read the id before reloading: navigating clears the collected
+            # responses that carry it.
+            page_challenge_id = page_challenge_id or await self._find_challenge_id()
+            self.parent.logger.info(
+                "Hashtag page rendered without fetching challenge/detail, reloading"
+            )
+            await self._navigate_to_hashtag_page()
+            await self._raise_if_hashtag_missing()
+            await self.check_and_wait_for_captcha()
+            challenge_info = await self._harvest_challenge_info()
+
+        if challenge_info is not None:
+            return challenge_info, None
+        return None, page_challenge_id or await self._find_challenge_id()
+
+    async def _find_challenge_id(self):
+        """The hashtag's id as the loaded page itself reports it, or None.
+
+        For the SSR variant of the page this is all there is: the app deep link
+        in the page's meta tags, and the challengeID on the feed request the page
+        did fire, both name the hashtag even though nothing fetched its details.
+        """
+        html = await self.parent._page.get_content()
+        match = re.search(r'challenge/detail/(\d+)', html)
+        if match:
+            return match.group(1)
+
+        for url in self.parent.seen_request_urls('challenge/item_list'):
+            challenge_id = parse_qs(urlparse(url).query).get('challengeID', [None])[0]
+            if challenge_id:
+                return challenge_id
+        return None
+
+    async def _harvest_challenge_info(self, rounds=5, delay=1.5):
+        """Poll the captured challenge/detail responses for this hashtag's data.
+
+        The response can land a moment after the page reports itself loaded, so
+        poll rather than reading once. Returns None if it never arrives.
+        """
+        for attempt in range(rounds):
+            for resp in await self.parent.process_pending_responses("api/challenge/detail"):
+                res = self._parse_response(resp)
+                if res and res.get('challengeInfo'):
+                    return res['challengeInfo']
+            if attempt < rounds - 1:
+                await asyncio.sleep(delay)
+        return None
+
+    async def _raise_if_hashtag_missing(self):
+        """Raise NoContentException if the loaded page is TikTok's not-found page.
+
+        TikTok serves a normal 200 page for a hashtag that doesn't exist: no video
+        grid, an empty webapp.challenge-detail in the rehydration JSON, and a
+        "Couldn't find this hashtag" message. Only positive evidence counts — a
+        merely missing grid can also mean a login wall or a slow render.
+        """
+        page_text = await self._get_page_text()
+        if page_text:
+            normalised = page_text.replace("’", "'")
+            for text in HASHTAG_NOT_FOUND_TEXTS:
+                if text in normalised:
+                    raise NoContentException(
+                        f"TikTok has no hashtag '{self.name}': page says '{text}'"
+                    )
+
+        detail = self._challenge_detail_from_html(await self.parent._page.get_content())
+        if detail is None:
+            return
+        status_code = max(detail.get('statusCode', 0), detail.get('status_code', 0))
+        if status_code in HASHTAG_NOT_FOUND_STATUS_CODES:
+            raise NoContentException(
+                f"TikTok has no hashtag '{self.name}': page statusCode={status_code}"
+            )
+
+    async def _get_page_text(self):
+        """The page's visible text, or None if it can't be read."""
+        try:
+            return await self.parent._page.evaluate('document.body.innerText')
+        except Exception as ex:
+            self.parent.logger.debug(f"Could not read page text: {ex}")
+            return None
+
+    def _challenge_detail_from_html(self, html):
+        """The page's webapp.challenge-detail scope, or None if there isn't one."""
         tag_contents = extract_tag_contents(html)
         if not tag_contents:
             return None
@@ -151,7 +319,11 @@ class Hashtag(Base):
             data = json.loads(tag_contents)
         except json.JSONDecodeError:
             return None
-        detail = data.get('__DEFAULT_SCOPE__', {}).get('webapp.challenge-detail', {})
+        return data.get('__DEFAULT_SCOPE__', {}).get('webapp.challenge-detail')
+
+    def _challenge_info_from_html(self, html):
+        """Pull challengeInfo out of the hashtag page's rehydration JSON."""
+        detail = self._challenge_detail_from_html(html) or {}
         return detail.get('challengeInfo') or None
 
     async def videos(self, count=30, offset=0, prefer_scraping=False, **kwargs) -> Iterator[Video]:
@@ -320,6 +492,7 @@ class Hashtag(Base):
         await self._navigate_to_hashtag_page()
         await self.check_and_wait_for_captcha()
         await self.check_and_close_signin()
+        await self._raise_if_hashtag_missing()
         if not await self._is_selector_visible('[data-e2e=challenge-item]'):
             self.parent.logger.warning(
                 "Hashtag video grid not visible yet (TikTok requires login for this "
