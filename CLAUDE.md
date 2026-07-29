@@ -38,7 +38,8 @@ API Classes (api/*.py) - all inherit from Base
 ├── User - user info, videos
 ├── Video - metadata, bytes, comments, related videos
 ├── Hashtag - hashtag info and videos
-├── Search, Sound, Trending (partial implementations)
+├── Sound - sound info and videos by music ID
+├── Search, Trending (partial implementations)
 ```
 
 ### Key Design Pattern: API-First with Fallback

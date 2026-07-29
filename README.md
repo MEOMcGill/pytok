@@ -45,6 +45,22 @@ if __name__ == "__main__":
 ```
 
 
+The same pattern works for the other feeds — hashtags, search, and sounds:
+
+```py
+async for video in api.hashtag(name="funny").videos(count=100):
+    ...
+async for video in api.search("news").videos(count=100):
+    ...
+# Music id: the trailing number of a sound's URL
+# (tiktok.com/music/original-sound-7016547803243022337), also in every
+# video's `music` dict.
+sound = api.sound(id="7016547803243022337")
+print(await sound.info())
+async for video in sound.videos(count=100):
+    ...
+```
+
 Please note pulling data from TikTok takes a while! We recommend leaving the scripts running on a server for a while for them to finish downloading everything. Feel free to play around with the delay constants to either speed up the process or avoid TikTok rate limiting, like so: `PyTok(request_delay=10)`
 
 ## Accounts, login, and persistent sessions
