@@ -13,15 +13,24 @@ pip install git+https://github.com/networkdynamics/pytok.git@master
 
 ## Quick Start Guide
 
+Scrape as a logged-in account, acquired from an **accounts pool**. Anonymous sessions barely work any more — TikTok returns empty responses to most endpoints without a login — so this is the supported way to use PyTok. Register and log in an account **once** (see [Accounts, login, and persistent sessions](#accounts-login-and-persistent-sessions) below), then every run comes up already authenticated:
+
+```bash
+python -m pytok.accounts.cli add   --username you@email.com --password 'your-password'
+python -m pytok.accounts.cli login --username you@email.com
+```
+
 Here's a quick bit of code to get the videos from a particular user on TikTok. There's more examples in the [examples](https://github.com/networkdynamics/pytok/tree/master/examples) directory.
 
 ```py
 import asyncio
 
 from pytok.tiktok import PyTok
+from pytok.accounts import AccountsPool
 
 async def main():
-    async with PyTok() as api:
+    pool = AccountsPool()
+    async with await PyTok.from_pool(pool) as api:
         user = api.user(username="therock")
         user_data = await user.info()
         print(user_data)

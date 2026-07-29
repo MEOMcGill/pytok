@@ -87,8 +87,15 @@ PyTok(
 
 ## Usage Pattern
 
+Always scrape as a logged-in account from the accounts pool (`pytok/accounts/`).
+Anonymous sessions mostly get empty responses from TikTok now, so every example,
+test and manual check should acquire an account with `PyTok.from_pool`:
+
 ```python
-async with PyTok() as api:
+from pytok.accounts import AccountsPool
+
+pool = AccountsPool()                       # ~/.pytok/accounts.db
+async with await PyTok.from_pool(pool) as api:   # or username="you@email.com"
     user = api.user(username="therock")
     user_data = await user.info()
 
@@ -96,3 +103,8 @@ async with PyTok() as api:
         video_data = video.info()
         video_bytes = await video.bytes()
 ```
+
+Accounts are registered and logged in once via
+`python -m pytok.accounts.cli add|login`; `cli release <username>` recovers an
+account left `in_use` by a crashed run. `WorkerPool` runs one session per account
+concurrently.
