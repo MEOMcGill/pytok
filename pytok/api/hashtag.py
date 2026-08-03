@@ -330,7 +330,8 @@ class Hashtag(Base):
         """Returns a dictionary listing TikToks with a specific hashtag.
 
         - Parameters:
-            - count (int): The amount of videos you want returned.
+            - count (int | None): The amount of videos you want returned. None means
+              keep paginating until the hashtag listing runs out.
             - offset (int): The the offset of videos from 0 you want to get.
             - prefer_scraping (bool): If True, get videos by scrolling the browser page
               rather than through the make_request API. Normally unnecessary: API
@@ -351,6 +352,11 @@ class Hashtag(Base):
         seen_ids = set()
         amount_yielded = 0
 
+        # count=None means "keep going until the listing runs out", so ask whether
+        # there is a limit at all before comparing against it.
+        def enough():
+            return count is not None and amount_yielded >= count
+
         async def emit(source):
             """Yield videos from a source, deduping and honouring `count`."""
             nonlocal amount_yielded
@@ -362,7 +368,7 @@ class Hashtag(Base):
                     seen_ids.add(video_id)
                 amount_yielded += 1
                 yield video
-                if amount_yielded >= count:
+                if enough():
                     return
 
         if not prefer_scraping:
@@ -391,7 +397,7 @@ class Hashtag(Base):
         )
         async for video in emit(self._iter_video_objs(items)):
             yield video
-        if amount_yielded >= count:
+        if enough():
             return
         if not has_more:
             return
