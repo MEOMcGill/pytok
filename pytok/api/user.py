@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from typing import TYPE_CHECKING, Iterator, Optional
 
@@ -214,8 +215,13 @@ class User(Base):
 
         - Parameters:
             - count (int): The amount of videos you want returned.
-            - get_bytes (bool): If True, download each video's MP4 as it is yielded and store
-              it on the yielded Video as ``video.video_bytes`` (None if the download failed).
+            - get_bytes (bool | callable): If True, download each video's MP4 as it is yielded
+              and store it on the yielded Video as ``video.video_bytes`` (None if the download
+              failed). May instead be a predicate ``(video) -> bool`` (sync or async, and given
+              the video before its bytes are fetched, so ``video.id``/``video.as_dict`` are
+              available), consulted per video: when it returns False no download is attempted
+              and ``video.video_bytes`` stays None. Use it to skip videos you already hold
+              somewhere, since the download happens in here rather than in the caller's loop.
             - prefer_scraping (bool): If True, get videos by scraping the browser page rather
               than the make_request API. Normally unnecessary: API requests reuse a per-endpoint
               param template captured from the webapp's own requests (lazily filled by the
@@ -233,12 +239,24 @@ class User(Base):
         ```
         """
         async for video in self._iter_videos(count=count, batch_size=batch_size, prefer_scraping=prefer_scraping, **kwargs):
+            video.video_bytes = None
             if get_bytes:
-                try:
-                    video.video_bytes = await video.bytes()
-                except Exception as ex:
-                    self.parent.logger.warning(f"get_bytes: failed to download bytes for video {video.id}: {ex}")
-                    video.video_bytes = None
+                wanted = True
+                if callable(get_bytes):
+                    try:
+                        wanted = get_bytes(video)
+                        if inspect.isawaitable(wanted):
+                            wanted = await wanted
+                    except Exception as ex:
+                        # a broken predicate shouldn't silently turn into "download everything"
+                        self.parent.logger.warning(f"get_bytes: predicate failed for video {video.id}, skipping bytes: {ex}")
+                        wanted = False
+                if wanted:
+                    try:
+                        video.video_bytes = await video.bytes()
+                    except Exception as ex:
+                        self.parent.logger.warning(f"get_bytes: failed to download bytes for video {video.id}: {ex}")
+                        video.video_bytes = None
             yield video
 
     async def _iter_videos(self, count=None, batch_size=100, prefer_scraping=False, **kwargs) -> Iterator[Video]:
