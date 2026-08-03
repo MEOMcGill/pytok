@@ -76,7 +76,8 @@ class Search(Base):
         Searches for Videos
 
         - Parameters:
-            - count (int): The amount of videos you want returned.
+            - count (int | None): The amount of videos you want returned.
+              None means every result in the listing.
             - offset (int): The offset of videos from your data you want returned.
             - prefer_scraping (bool): If True, get results by scrolling the browser
               page rather than through the make_request API. See search_type().
@@ -95,7 +96,8 @@ class Search(Base):
         Searches for users.
 
         - Parameters:
-            - count (int): The amount of users you want returned.
+            - count (int | None): The amount of users you want returned.
+              None means every result in the listing.
             - offset (int): The offset of users from your data you want returned.
             - prefer_scraping (bool): If True, get results by scrolling the browser
               page rather than through the make_request API. See search_type().
@@ -114,7 +116,8 @@ class Search(Base):
         Searches for a specific type of object. Use .videos() & .users() instead.
 
         - Parameters:
-            - count (int): The amount of objects you want returned.
+            - count (int | None): The amount of objects you want returned.
+              None means keep paginating until the listing runs out.
             - offset (int): The offset of objects you want returned.
             - obj_type (str): user | item
             - prefer_scraping (bool): If True, skip the make_request API route and
@@ -142,6 +145,13 @@ class Search(Base):
         seen_ids = set()
         amount_yielded = 0
 
+        # count=None means "keep going until the listing runs out", so every stop
+        # check has to ask whether there is a limit at all before comparing to it.
+        def enough():
+            return count is not None and amount_yielded >= count
+
+        wanted = count if count is not None else "all"
+
         async def emit(source):
             """Yield results from a source, deduping and honouring `count`."""
             nonlocal amount_yielded
@@ -152,18 +162,18 @@ class Search(Base):
                     seen_ids.add(result_id)
                 amount_yielded += 1
                 yield result
-                if amount_yielded >= count:
+                if enough():
                     return
 
         if not prefer_scraping:
             try:
                 async for result in emit(self._search_type_api(obj_type, cursor=offset)):
                     yield result
-                if amount_yielded >= count or (amount_yielded and self._exhausted_listing):
+                if enough() or (amount_yielded and self._exhausted_listing):
                     return
                 self.parent.logger.warning(
                     f"API path returned {amount_yielded} search results ({obj_type}) "
-                    f"of {count} and stopped short of the end of the listing. "
+                    f"of {wanted} and stopped short of the end of the listing. "
                     "Falling back to scraping method."
                 )
             except ApiFailedException as ex:
@@ -184,7 +194,7 @@ class Search(Base):
         )
         async for result in emit(self._aiter(results)):
             yield result
-        if amount_yielded >= count:
+        if enough():
             return
         if not has_more:
             return
@@ -195,14 +205,14 @@ class Search(Base):
                     self._search_type_api(obj_type, cursor=cursor, search_id=search_id)
                 ):
                     yield result
-                if amount_yielded >= count or self._exhausted_listing:
+                if enough() or self._exhausted_listing:
                     return
                 # The resumed API stopped short of the end of the listing. Don't
                 # settle for what we have — carry on by scrolling, which
                 # paginates the same listing without replaying any params.
                 self.parent.logger.warning(
                     f"Resumed API path stopped at {amount_yielded} search results "
-                    f"of {count}, short of the end of the listing. "
+                    f"of {wanted}, short of the end of the listing. "
                     "Continuing by scrolling the page."
                 )
             except ApiFailedException as ex:
@@ -211,7 +221,8 @@ class Search(Base):
                     "Continuing by scrolling the page."
                 )
 
-        async for result in emit(self._scroll_for_results(obj_type, count=count - amount_yielded)):
+        remaining = None if count is None else count - amount_yielded
+        async for result in emit(self._scroll_for_results(obj_type, count=remaining)):
             yield result
 
     def _note_page_size(self, page_size):
@@ -420,7 +431,9 @@ class Search(Base):
         """Scroll the loaded search page, yielding results from each new response.
 
         `count` is how many results the caller still needs; it sizes the scroll
-        budget, since the page hands back one page of results per scroll.
+        budget, since the page hands back one page of results per scroll. None
+        means the caller wants the whole listing, so no budget is imposed and
+        stopping is left to has_more and the empty-round guard.
         """
         page = self.parent._page
 
@@ -429,11 +442,13 @@ class Search(Base):
         # One scroll yields one page, so a fixed budget silently caps big
         # requests. Allow enough scrolls for `count` with slack for rounds that
         # come back empty, and let the empty-round guard below stop us early.
-        max_scroll_attempts = max(30, math.ceil(count / _VIDEO_PAGE_SIZE) * 2)
+        # count=None asks for everything, so there is no budget to size -- the
+        # empty-round guard is what ends an unbounded scroll.
+        max_scroll_attempts = None if count is None else max(30, math.ceil(count / _VIDEO_PAGE_SIZE) * 2)
         empty_rounds = 0
         max_empty_rounds = 3
 
-        while has_more and scroll_attempts < max_scroll_attempts:
+        while has_more and (max_scroll_attempts is None or scroll_attempts < max_scroll_attempts):
             await self.check_and_wait_for_captcha()
 
             # Scroll first so the lazily-loaded search request fires, then give
