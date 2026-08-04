@@ -5,6 +5,7 @@ import base64
 from datetime import datetime
 import logging
 import json
+import time
 from urllib import parse as url_parsers
 from typing import TYPE_CHECKING, Optional
 
@@ -366,17 +367,18 @@ class Video(Base):
             output.write(video_bytes)
         ```
         """
-        # playAddr is the highest-bitrate variant; prefer it for quality, fall back to download.
+        # playAddr is the highest-bitrate variant; prefer it for quality, fall back to
+        # download. Carry the variant name so a failure can say which URL was tried.
         bytes_urls = [
-            self.as_dict['video'].get('playAddr'),
-            self.as_dict['video'].get('downloadAddr'),
+            ("playAddr", self.as_dict['video'].get('playAddr')),
+            ("downloadAddr", self.as_dict['video'].get('downloadAddr')),
         ]
-        bytes_urls = [url for url in bytes_urls if url]
+        bytes_urls = [(name, url) for name, url in bytes_urls if url]
         if not bytes_urls:
             raise exceptions.NotAvailableException("Post does not have a video")
 
         # If the bytes were already captured on the wire (e.g. during playback), use them.
-        paths = [url_parsers.urlparse(url).path for url in bytes_urls]
+        paths = [url_parsers.urlparse(url).path for _, url in bytes_urls]
         cached = self._find_cached_bytes(paths)
         if cached is not None and self._looks_like_video(cached):
             return cached
@@ -392,16 +394,56 @@ class Video(Base):
         req_exceptions = []
         for fetcher_name, fetcher in (("httpx", self._httpx_fetch_bytes),
                                       ("browser", self._browser_fetch_bytes)):
-            for bytes_url in bytes_urls:
+            for url_name, bytes_url in bytes_urls:
+                label = f"{fetcher_name}/{url_name}"
+                started = time.monotonic()
                 try:
                     data = await asyncio.wait_for(fetcher(bytes_url), timeout=timeout)
+                except asyncio.TimeoutError:
+                    # asyncio.TimeoutError stringifies to '', which is what used to make
+                    # this whole list read as ['httpx: ', 'browser: ', ...] -- saying
+                    # nothing about what went wrong. Name it outright. Landing here rather
+                    # than on httpx's own ReadTimeout is a signal in itself: it points at
+                    # the CDP round trip (cookie read, in-page eval), which has no timeout
+                    # of its own, rather than at the CDN download.
+                    req_exceptions.append(f"{label}: timed out after {timeout}s")
                 except Exception as ex:
-                    req_exceptions.append(f"{fetcher_name}: {ex}")
-                    continue
-                if self._looks_like_video(data):
-                    return data
-                req_exceptions.append(f"{fetcher_name}: {bytes_url[:60]}... did not return an MP4")
-        raise Exception(f"Failed to get video bytes, exceptions: {req_exceptions}")
+                    # never interpolate a bare exception -- plenty of them stringify to ''
+                    if not str(ex):
+                        detail = type(ex).__name__
+                    elif type(ex) is Exception:
+                        detail = str(ex)  # raised here with a written-out message already
+                    else:
+                        detail = f"{type(ex).__name__}: {ex}"
+                    req_exceptions.append(
+                        f"{label}: {detail} (after {time.monotonic() - started:.1f}s)"
+                    )
+                else:
+                    if self._looks_like_video(data):
+                        return data
+                    req_exceptions.append(f"{label}: {self._describe_body(data)}")
+        raise Exception(
+            f"Failed to get video bytes for video {self.id}: " + "; ".join(req_exceptions)
+        )
+
+    @staticmethod
+    def _describe_body(body) -> str:
+        """Say what a response that wasn't an MP4 actually was.
+
+        The old message only echoed the URL back, so a CDN error page, an empty body and a
+        DASH fragment were indistinguishable -- all three read as "did not return an MP4".
+        """
+        if body is None:
+            return "returned no data"
+        if not isinstance(body, (bytes, bytearray)):
+            return f"returned {type(body).__name__}, not bytes"
+        if not body:
+            return "returned 0 bytes"
+        head = bytes(body[:12])
+        if head.lstrip()[:1] in (b'<', b'{'):
+            # an HTML/JSON error page served with a 200
+            return f"returned {len(body)} bytes of markup/JSON, not an MP4 ({head!r})"
+        return f"returned {len(body)} bytes but no ftyp box, not a progressive MP4 ({head!r})"
 
     def _find_cached_bytes(self, paths) -> Optional[bytes]:
         """Return video bytes from the CDP response cache if present, else None."""
