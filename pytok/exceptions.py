@@ -39,6 +39,17 @@ class InvalidJSONException(TikTokException):
 class NotAvailableException(TikTokException):
     """The requested object is not available in this region."""
 
+class NoVideoException(NotAvailableException):
+    """This post has no video to download — it is a photo/slideshow post.
+
+    A property of the post, not of the session or the account, so a caller collecting media
+    should skip it and carry on rather than counting it as a download failure. Photo-heavy
+    profiles post these in long runs, which would otherwise look like a broken session.
+
+    Subclasses NotAvailableException so callers that only catch that keep working. A caller
+    which maps NotAvailableException to "this account is unavailable, skip the handle" has to
+    catch this one *first*: one photo post says nothing about the account."""
+
 class NoContentException(TikTokException):
     """TikTok returned no content"""
 
