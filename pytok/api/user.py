@@ -260,9 +260,41 @@ class User(Base):
             yield video
 
     async def _iter_videos(self, count=None, batch_size=100, prefer_scraping=False, **kwargs) -> Iterator[Video]:
-        if self.as_dict and self.as_dict.get('videoCount', 1) == 0:
+        """Yield this user's videos, refusing to pass off a blocked listing as an empty one.
+
+        Every route in here (initial page harvest, API, scraping) falls back to the next on
+        failure, and the last one just stops if it finds nothing -- so a session TikTok is
+        bot-blocking produced an empty iterator that a caller could not tell apart from an
+        account with no videos. That silence is expensive downstream: the TikTok crawler
+        recorded such handles as successfully collected and wrote PHH crawler history for the
+        range, telling the gap report never to ask again.
+
+        The profile's own videoCount is the discriminator, and it is what makes this safe to
+        check here rather than in the caller: it compares against what this iterator *yielded*,
+        not what the caller kept, so a caller filtering everything out (a date window, say) is
+        not mistaken for a failure. Raised as ApiFailedException because a block is
+        session-level -- the accounts WorkerPool rotates and retries on a fresh session.
+        """
+        # None when info() was never called: no expectation to check against, so the guard
+        # below stays off rather than guessing.
+        expected_videos = self.as_dict.get('videoCount') if self.as_dict else None
+        if expected_videos == 0:
             return
 
+        amount_yielded = 0
+        async for video in self._iter_videos_inner(count=count, batch_size=batch_size,
+                                                  prefer_scraping=prefer_scraping, **kwargs):
+            amount_yielded += 1
+            yield video
+
+        if amount_yielded == 0 and expected_videos:
+            raise ApiFailedException(
+                f"no videos returned for @{self.username} though the profile reports "
+                f"{expected_videos} -- the listing failed rather than being empty "
+                f"(TikTok commonly answers a blocked session with an empty response)"
+            )
+
+    async def _iter_videos_inner(self, count=None, batch_size=100, prefer_scraping=False, **kwargs) -> Iterator[Video]:
         # If user info was obtained via TikTok-Api, use API for videos directly
         # If user info was scraped (page already loaded), get initial videos from page first
         amount_yielded = 0
