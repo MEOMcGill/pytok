@@ -375,7 +375,11 @@ class Video(Base):
         ]
         bytes_urls = [(name, url) for name, url in bytes_urls if url]
         if not bytes_urls:
-            raise exceptions.NotAvailableException("Post does not have a video")
+            # a photo/slideshow post rather than anything wrong: raise the specific exception
+            # so a media collector can skip it without treating it as a failed download.
+            raise exceptions.NoVideoException(
+                f"Post {self.id} has no video to download (photo/slideshow post)"
+            )
 
         # If the bytes were already captured on the wire (e.g. during playback), use them.
         paths = [url_parsers.urlparse(url).path for _, url in bytes_urls]
