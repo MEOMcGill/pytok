@@ -30,10 +30,50 @@ zendriver and nodriver share the underlying fragility, so swapping libraries doe
 not help.
 """
 
+import asyncio
 import dataclasses
 import logging
+import os
+
+from .exceptions import CDPTimeoutException
 
 logger = logging.getLogger(__name__)
+
+# Upper bound on how long a single CDP command may wait for its reply. Any real command
+# answers in milliseconds; the slowest legitimate one is the in-page base64 video fetch,
+# whose caller already caps it well below this. So this is not a performance knob — it exists
+# purely so a command that will *never* be answered cannot hang its coroutine forever.
+DEFAULT_CDP_TIMEOUT = 120.0
+
+
+def _cdp_timeout():
+    """Seconds to allow one CDP command, or None to disable the bound entirely."""
+    raw = os.environ.get("PYTOK_CDP_TIMEOUT")
+    if raw is None:
+        return DEFAULT_CDP_TIMEOUT
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "Ignoring PYTOK_CDP_TIMEOUT=%r (not a number); using %gs", raw,
+            DEFAULT_CDP_TIMEOUT,
+        )
+        return DEFAULT_CDP_TIMEOUT
+    # <= 0 is the escape hatch for debugging a command that legitimately takes forever
+    return value if value > 0 else None
+
+
+def _cdp_command_name(cdp_obj) -> str:
+    """Name the command without touching the generator.
+
+    Transaction.__init__ gets the real method name via ``next(cdp_obj)``, which *consumes*
+    the first yield — doing that here would corrupt the command before it is sent. The
+    generator's code name ("get_cookies", "evaluate") is close enough for an error message.
+    """
+    try:
+        return cdp_obj.gi_code.co_qualname
+    except AttributeError:
+        return getattr(getattr(cdp_obj, "gi_code", None), "co_name", "?")
 
 # (dataclass field name, JSON key) for each spelling of the policy, newest first.
 _POLICY_SPELLINGS = (
@@ -102,9 +142,70 @@ def _patch_transaction_dispatch() -> None:
     logger.debug("Applied CDP transaction dispatch guard to zendriver")
 
 
+def _patch_connection_send_timeout() -> None:
+    """Bound every CDP command so an unanswered one can't hang forever. Idempotent.
+
+    ``Connection.send`` ends in ``return await tx`` on a bare Future. Nothing resolves that
+    future except a reply from the browser, and nothing bounds the wait — so any page that
+    stops servicing the DevTools protocol hangs its caller permanently, and each caller has
+    to remember to impose its own timeout.
+
+    Relying on callers is what kept biting us. ``video.bytes()`` grew a timeout, which fixed
+    the byte fetch and moved the hang to the listing walk instead: on 2026-08-05 the media
+    backfill lost all three pool workers one at a time over two hours to CDP calls elsewhere
+    in pytok, ending with an alive-but-idle event loop, every thread-pool thread idle, and no
+    error of any kind in the log. Bounding it here covers every call site at once, including
+    the ones nobody has thought about yet.
+
+    On timeout we raise ``CDPTimeoutException`` rather than letting ``asyncio.TimeoutError``
+    out: the bare one stringifies to ``''`` (which has already cost us one debugging session),
+    and the named one lands in ``Worker.execute_task``'s generic handler, which rebuilds the
+    session in place — the right recovery for a dead browser.
+
+    Depends on the transaction dispatch guard above. ``wait_for`` *cancels* the transaction on
+    timeout, so a late reply would otherwise hit a cancelled future, raise
+    ``InvalidStateError`` inside the listener and kill it — turning one bounded hang into a
+    permanently dead connection. Bounding ``send`` without that guard would be worse than not
+    bounding it at all, which is why ``apply_cdp_patches`` installs them in this order.
+    """
+    from zendriver.core.connection import Connection
+
+    # marker on the function, not the class: Connection's CantTouchThis metaclass refuses
+    # attribute assignment outright, so there is nowhere on the class to record this.
+    if getattr(Connection.send, "_pytok_bounded", False):
+        return
+
+    original_send = Connection.send
+
+    async def send(self, cdp_obj, _is_update: bool = False):
+        timeout = _cdp_timeout()
+        if timeout is None:
+            return await original_send(self, cdp_obj, _is_update)
+        try:
+            return await asyncio.wait_for(
+                original_send(self, cdp_obj, _is_update), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            raise CDPTimeoutException(
+                f"CDP command {_cdp_command_name(cdp_obj)} was not answered within "
+                f"{timeout:g}s — the page has stopped servicing DevTools, so this session "
+                f"needs rebuilding"
+            ) from None
+
+    send._pytok_bounded = True
+    # Connection's metaclass (CantTouchThis) rejects every class-level assignment, to stop
+    # callers creating shared mutable class state like `websocket`. Replacing a method is not
+    # that, so go under it via type.__setattr__ rather than leaving the hang unfixed.
+    type.__setattr__(Connection, "send", send)
+    logger.debug("Bounded zendriver CDP commands at %s", _cdp_timeout())
+
+
 def apply_cdp_patches() -> None:
     """Apply every zendriver runtime patch. Idempotent."""
+    # order matters: the dispatch guard has to be in place before send() starts cancelling
+    # transactions on timeout, or a late reply to a cancelled one kills the listener.
     _patch_transaction_dispatch()
+    _patch_connection_send_timeout()
     _apply_client_security_state_patch()
 
 

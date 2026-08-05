@@ -56,6 +56,19 @@ class NoContentException(TikTokException):
 class TimeoutException(TikTokException):
     """Timed out trying to get content from TikTok"""
 
+class CDPTimeoutException(TikTokException):
+    """A CDP command was sent to the browser and never answered.
+
+    Means the page has stopped servicing the DevTools protocol, so every later command on
+    that connection would hang too — the session is dead and has to be rebuilt.
+
+    Deliberately a plain TikTokException: it is in neither the accounts pool's
+    DATA_LEVEL_EXCEPTIONS (which propagate with no retry — this is not the target's fault)
+    nor ROTATE_EXCEPTIONS (which cooldown the account for minutes — the account is fine, it
+    is the browser that is broken). That drops it into Worker.execute_task's generic handler,
+    which closes the session and rebuilds in place on the same account: the fast recovery
+    this actually wants."""
+
 class ApiFailedException(TikTokException):
     """TikTok API is failing"""
 
