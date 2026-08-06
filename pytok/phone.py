@@ -21,11 +21,31 @@ the per-*IP* load. Phones with their own SIMs or proxies would; phones on a shar
 not. Do not size a crawl on the assumption that N phones give N times the headroom.
 
 **Deep pagination.** Mobile web hands over the first `item_list` page (~35 videos) and
-then stops: there is no infinite scroll to drive, and the response URL is signed
-(`msToken` + `X-Bogus` + `X-Gnarly`) over its own query string, so replaying it with an
-advanced cursor returns a 200 with an empty body. Going deeper needs the signing
-machinery in `tiktok_api.py` driven from inside the page, which this module does not do
-yet -- `user_videos()` documents its own ceiling and says when it hit it.
+then stops: there is no infinite scroll to drive. `user_videos()` documents its own
+ceiling and says when it hit it.
+
+Forging the next page from inside the page does not work, and it is worth recording why,
+because the obvious diagnosis is wrong. It is *not* a signing problem:
+
+- TikTok's `webmssdk.js` patches `fetch` and `XMLHttpRequest` (none of them are native),
+  and `/api/post/item_list/` is in its `_mssdk._enablePathList`. A `fetch()` issued from
+  page context with `X-Bogus`/`X-Gnarly` omitted comes back out on the wire *with both
+  freshly added* -- verified against `Network.requestWillBeSentExtraInfo`.
+- Diffing that outgoing request against the app's own: the header sets are identical, no
+  header only one of them sends.
+- `msToken` is not a rotating single-use nonce -- the one in the captured URL and the one
+  in `document.cookie` are the same string.
+
+And yet, seconds apart on one page load, the app's own request returns ~82 KB while ours
+returns a 200 with an empty body -- including when replayed completely unchanged. TikTok
+is separating app-initiated from injected requests on something that is not in the URL or
+the headers, so re-signing harder will not fix it.
+
+Driving the *desktop* bundle from the handset (UA + viewport override) does make the app
+issue its own paginating requests, but anonymously every one of them comes back empty --
+the same thing desktop sessions do without an account. So depth needs a logged-in
+session, not better forgery; the account pool in `pytok.accounts` is the lead worth
+following, not this module.
 
 So: use this for breadth (first page for many profiles, from a fingerprint TikTok treats
 differently), not for depth on one profile.

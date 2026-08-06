@@ -175,11 +175,16 @@ Drive several at once by giving each its own `cdp_port`.
 **Two limits worth knowing before you plan a crawl around this.** Phones on one WiFi share
 a single egress IP and TikTok's burst limits are largely IP-level, so N handsets do *not*
 give N times the rate-limit headroom — only SIMs or proxies would. And mobile web serves
-one `item_list` page (~35 videos) per profile: there is no infinite scroll, and the
-response URL is signed over its own query string, so replaying it with an advanced cursor
-returns an empty body. `user_videos()` logs when it hits that ceiling rather than passing a
-truncated listing off as a complete one. Use this route for breadth across many profiles,
-not depth on one.
+one `item_list` page (~35 videos) per profile, with no infinite scroll to drive.
+`user_videos()` logs when it hits that ceiling rather than passing a truncated listing off
+as a complete one. Use this route for breadth across many profiles, not depth on one.
+
+Fetching the next page yourself from inside the page does not work, and the module
+docstring records the measurements in full so nobody re-derives them: TikTok's SDK really
+does re-sign an injected `fetch` (`X-Bogus`/`X-Gnarly` appear on the wire), the request
+headers are identical to the app's own, and `msToken` is not a single-use nonce — yet the
+app's request returns ~82 KB and an identical injected one returns an empty 200. Depth
+needs a logged-in session, not better request forgery.
 
 ## Citation
 
