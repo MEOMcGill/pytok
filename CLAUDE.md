@@ -71,6 +71,9 @@ PyTok tracks network responses via Chrome DevTools Protocol:
 - `api/base.py` - Base class with DOM interaction, captcha detection, scrolling
 - `api/user.py` - User data and video fetching
 - `api/video.py` - Video metadata, bytes download, comments
+- `phone.py` - Optional third route: drives Chrome on a physical Android phone over
+  adb + CDP to read mobile web (`PhoneTikTok`). Independent of `PyTok`/zendriver and
+  needs no account. First `item_list` page only; see its module docstring for why
 - `helpers.py` - HTML parsing, extracts `__UNIVERSAL_DATA_FOR_REHYDRATION__` JSON from pages
 - `utils.py` - DataFrame conversion helpers (`get_video_df`, `get_comment_df`, `get_user_df`)
 
