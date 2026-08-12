@@ -81,7 +81,16 @@ class NoTemplateException(ApiFailedException):
     existing API→scraping fallback handles it transparently."""
 
 class FewerVideosThanExpectedException(TikTokException):
-    """TikTok is returning fewer videos for this user than their metadata led us to expect"""
+    """TikTok is returning fewer videos for this user than their metadata led us to expect.
+
+    Raised when a listing walk stops partway through a profile without TikTok ever saying the
+    listing had ended. Distinct from the bare "no videos at all" case: a profile's first page
+    comes from the page HTML, which a bot-flagged session still receives, so a blocked walk
+    yields a page or two and then dies looking like a complete profile.
+
+    Session-level rather than data-level, hence its place in ROTATE_EXCEPTIONS: the profile
+    really does have the videos, this session just could not page through them, so retrying on
+    a fresh one is worth doing."""
 
 class AccountPrivateException(TikTokException):
     """This TikTok account is private and cannot be scraped"""

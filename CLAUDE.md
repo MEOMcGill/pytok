@@ -2,6 +2,25 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Comments
+
+Comment the code, not the investigation. A comment earns its place by explaining something
+the reader cannot get from the code — why a non-obvious choice is the way it is, or what
+breaks if it changes. Keep it to a line or two.
+
+Leave out the evidence that led to the change. No measured statistics, no counts from a
+particular run, no dates, no "verified on ...", no before/after numbers. They read as
+authoritative but go stale the moment anything shifts, and they cost the reader more than
+they give. If a number is genuinely load-bearing — a timeout, a threshold — state the
+number and the reason for it, not the experiment that produced it.
+
+That history does belong somewhere, just not in the source: put it in the commit message
+and the PR description, where it is timestamped and stays attached to the change.
+
+Prefer restating a mechanism concisely over narrating how it was discovered. "An empty
+bot-blocked response arrives without `hasMore`, so defaulting it to False ends the walk
+early" is useful. Appending how many handles that affected on a given day is not.
+
 ## Project Overview
 
 PyTok is a TikTok web scraping library using a dual-approach architecture:

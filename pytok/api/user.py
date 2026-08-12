@@ -16,6 +16,12 @@ if TYPE_CHECKING:
 
 from .base import Base
 
+# How much of a profile's own videoCount a walk has to reach before it counts as complete.
+# Slack is needed because videoCount is not a promise: it keeps counting posts the listing no
+# longer serves (deleted, region-locked, moderated), so a healthy walk lands a little short.
+# Only consulted when TikTok never said the listing ended -- see _iter_videos.
+LISTING_MIN_COVERAGE = 0.9
+
 
 class User(Base):
     """
@@ -259,7 +265,8 @@ class User(Base):
                         video.video_bytes = None
             yield video
 
-    async def _iter_videos(self, count=None, batch_size=100, prefer_scraping=False, **kwargs) -> Iterator[Video]:
+    async def _iter_videos(self, count=None, batch_size=100, prefer_scraping=False,
+                           min_coverage=None, **kwargs) -> Iterator[Video]:
         """Yield this user's videos, refusing to pass off a blocked listing as an empty one.
 
         Every route in here (initial page harvest, API, scraping) falls back to the next on
@@ -274,6 +281,15 @@ class User(Base):
         not what the caller kept, so a caller filtering everything out (a date window, say) is
         not mistaken for a failure. Raised as ApiFailedException because a block is
         session-level -- the accounts WorkerPool rotates and retries on a fresh session.
+
+        A walk cut short *after* yielding something was equally silent, and is the common
+        case: a bot-flagged session still gets the first page, which comes from the profile
+        HTML rather than from the item_list endpoint, so the listing dies after a page or two
+        while the guard above sees 16 videos and reports success.
+
+        `_listing_exhausted` separates the two. It is set only where TikTok itself said
+        nothing followed this page, so without it a walk far short of videoCount was cut off
+        rather than finished.
         """
         # None when info() was never called: no expectation to check against, so the guard
         # below stays off rather than guessing.
@@ -281,17 +297,39 @@ class User(Base):
         if expected_videos == 0:
             return
 
+        # "did TikTok tell us the listing ended?" -- reset per walk, since a True left by an
+        # earlier walk on this object would suppress the truncation check below
+        self._listing_exhausted = False
+
         amount_yielded = 0
         async for video in self._iter_videos_inner(count=count, batch_size=batch_size,
                                                   prefer_scraping=prefer_scraping, **kwargs):
             amount_yielded += 1
             yield video
 
+        # Note both checks are reached only when the iterator above ran to exhaustion: a
+        # caller that breaks out (the crawler stopping at a date window) leaves this
+        # generator suspended at its yield, so neither guard can fire on a deliberate stop.
         if amount_yielded == 0 and expected_videos:
             raise ApiFailedException(
                 f"no videos returned for @{self.username} though the profile reports "
                 f"{expected_videos} -- the listing failed rather than being empty "
                 f"(TikTok commonly answers a blocked session with an empty response)"
+            )
+
+        if count and amount_yielded >= count:
+            return  # the caller's own cap, not a truncation
+        if self._listing_exhausted or not expected_videos:
+            # TikTok said the listing ended, so a shortfall is a stale videoCount, not a block
+            return
+
+        floor = expected_videos * (LISTING_MIN_COVERAGE if min_coverage is None else min_coverage)
+        if amount_yielded < floor:
+            raise FewerVideosThanExpectedException(
+                f"listing for @{self.username} stopped after {amount_yielded} videos though "
+                f"the profile reports {expected_videos}, and TikTok never said the listing "
+                f"ended -- the walk was cut short rather than finished; retry on a fresh "
+                f"session"
             )
 
     async def _iter_videos_inner(self, count=None, batch_size=100, prefer_scraping=False, **kwargs) -> Iterator[Video]:
@@ -317,6 +355,8 @@ class User(Base):
 
                 if finished:
                     self.parent.logger.info(f"Finished after initial videos")
+                    # the page's own item_list responses carried hasMore=false
+                    self._listing_exhausted = True
                     return
 
                 self.parent.logger.info(f"Continuing with _get_videos_api to get more videos")
@@ -398,6 +438,8 @@ class User(Base):
                 self.parent.logger.info(
                     "TikTok isn't sending more TikToks beyond this point."
                 )
+                # reached the documented end of the listing, so the walk is complete
+                self._listing_exhausted = True
                 return
 
             cursor = res.get('cursor', cursor)
@@ -481,6 +523,8 @@ class User(Base):
                 return
 
         if not has_more:
+            # the embedded page JSON says this first page is the whole profile
+            self._listing_exhausted = True
             return
 
         # Scroll to get more videos
@@ -553,14 +597,23 @@ class User(Base):
         return all_videos, finished, cursor
 
     async def _get_videos_scroll(self, count, seen_ids=None, amount_yielded=0):
-        """Scroll to load more videos using zendriver."""
+        """Scroll to load more videos using zendriver.
+
+        Most walks end up here, because item_list is the route TikTok blocks first, so how
+        this loop decides to stop sets how deep a walk can get. Two of its stopping
+        conditions used to be indistinguishable from reaching the end of a profile; only this
+        loop knows which one fired, so it records that in `_listing_exhausted`.
+        """
         page = self.parent._page
         if seen_ids is None:
             seen_ids = set()
 
         has_more = True
         scroll_attempts = 0
-        max_scroll_attempts = 30
+        # A bounded walk stops at `count` anyway; an unbounded one wants the whole profile,
+        # which 30 scrolls caps at a few hundred videos. The no-new-videos check below is the
+        # real terminator, so this is only a backstop against scrolling a page that never ends.
+        max_scroll_attempts = 30 if count else 400
         no_new_videos_count = 0
         last_video_count = amount_yielded
 
@@ -593,7 +646,11 @@ class User(Base):
                             if count and amount_yielded >= count:
                                 return
 
-                    has_more = data.get('hasMore', False)
+                    # Only believe hasMore when TikTok actually sent it. Defaulting to False
+                    # ended the walk on any response arriving without it -- which is what an
+                    # empty bot-blocked body looks like.
+                    if 'hasMore' in data:
+                        has_more = data['hasMore']
                 except Exception as e:
                     self.parent.logger.debug(f"Error processing video response: {e}")
 
@@ -608,6 +665,18 @@ class User(Base):
 
             last_video_count = current_count
             scroll_attempts += 1
+
+        # Only a hasMore=false answer means the profile ran out. Giving up because the page
+        # stopped producing new videos, or because the backstop above ran out of scrolls, is a
+        # walk that was cut off -- _iter_videos raises on that so the pool retries the handle
+        # on a fresh session instead of recording a partial profile as fully collected.
+        if not has_more:
+            self._listing_exhausted = True
+        else:
+            self.parent.logger.info(
+                f"Stopped scrolling @{self.username} after {scroll_attempts} scrolls with "
+                f"{amount_yielded} videos while TikTok still reported more available"
+            )
 
     def liked(self, count: int = 30, cursor: int = 0, **kwargs) -> Iterator[Video]:
         """

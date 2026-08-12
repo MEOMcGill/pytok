@@ -23,6 +23,7 @@ from ..exceptions import (
     InvalidJSONException,
     LoginException,
     NoContentException,
+    NoTemplateException,
     NotAvailableException,
     NotFoundException,
     SoundRemovedException,
@@ -44,7 +45,6 @@ DATA_LEVEL_EXCEPTIONS = (
     NoContentException,
     SoundRemovedException,
     InvalidJSONException,
-    FewerVideosThanExpectedException,
 )
 # Account/session-level & transient: cooldown the current account and rotate,
 # then retry the task on the next available account.
@@ -52,6 +52,9 @@ ROTATE_EXCEPTIONS = (
     CaptchaException,
     ApiFailedException,
     TimeoutException,
+    # The profile does have the videos; this session could not page through them, so a fresh
+    # one is worth trying. Data-level would mean giving up on the handle after one attempt.
+    FewerVideosThanExpectedException,
 )
 
 # Rotation / rest policy.
@@ -218,7 +221,15 @@ class Worker:
 
             except ROTATE_EXCEPTIONS as e:
                 last_exc = e
-                minutes = RATE_LIMIT_MINUTES if isinstance(e, ApiFailedException) else REST_MINUTES
+                # A bare ApiFailedException means TikTok refused the API route outright, which is
+                # rate-limit shaped and earns the long cooldown. NoTemplateException is not: it
+                # is the param cache filling itself on the first request per endpoint, a routine
+                # condition that says nothing about the account, so charging it the long cooldown
+                # idles a healthy account for nothing.
+                if isinstance(e, ApiFailedException) and not isinstance(e, NoTemplateException):
+                    minutes = RATE_LIMIT_MINUTES
+                else:
+                    minutes = REST_MINUTES
                 logger.warning(f"Worker {self.id}: {type(e).__name__} on "
                                f"{self._acct_name()} (attempt {attempt + 1}"
                                f"/{self.max_retries}); cooldown {minutes}m + rotate")
