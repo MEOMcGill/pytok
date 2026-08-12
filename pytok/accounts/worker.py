@@ -222,12 +222,10 @@ class Worker:
                 last_exc = e
                 # A bare ApiFailedException means TikTok refused the API route outright, which
                 # is rate-limit shaped and earns the long cooldown. Its two routine subclasses
-                # are not: NoTemplateException is just the per-endpoint param cache filling
-                # itself on the first request, and ListingTruncatedException means this session
-                # could not paginate. Neither says the account misbehaved, and charging them 15
-                # minutes idles a healthy account for nothing — measured on a 2026-08-05 run,
-                # NoTemplateException alone fired 188 times, or ~47 account-hours of cooldown
-                # against a pool of two. Rotate them onto a different session cheaply instead.
+                # are not: NoTemplateException is the param cache filling itself on the first
+                # request per endpoint, and ListingTruncatedException means this session could
+                # not paginate. Neither says the account misbehaved, so charging them the long
+                # cooldown idles a healthy account for nothing -- rotate them cheaply instead.
                 if isinstance(e, (NoTemplateException, ListingTruncatedException)):
                     minutes = REST_MINUTES
                 elif isinstance(e, ApiFailedException):

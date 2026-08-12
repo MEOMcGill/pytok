@@ -84,15 +84,13 @@ class ListingTruncatedException(ApiFailedException):
     """A listing walk stopped partway through a profile without TikTok saying it had ended.
 
     Distinct from the bare "no videos at all" case: a profile's first page comes from the page
-    HTML's embedded JSON, which a bot-flagged session still receives, so a blocked walk yields
-    one or two pages and then dies. Nothing about that looked like a failure before, so partial
-    profiles were recorded as fully collected — see User._iter_videos.
+    HTML, which a bot-flagged session still receives, so a blocked walk yields a page or two
+    and then dies looking like a complete profile.
 
-    A subclass of ApiFailedException so existing API→scraping fallbacks and the accounts pool's
-    ROTATE_EXCEPTIONS keep handling it unchanged. It is called out separately in
-    Worker.execute_task's cooldown policy because it says nothing bad about the *account* —
-    only that this session could not paginate — so it earns a cheap rotation onto a different
-    session rather than a rate-limit penalty."""
+    A subclass of ApiFailedException so existing API→scraping fallbacks and the pool's
+    ROTATE_EXCEPTIONS keep handling it unchanged, but called out separately in
+    Worker.execute_task's cooldown policy: it says nothing bad about the account, only that
+    this session could not paginate."""
 
 class FewerVideosThanExpectedException(TikTokException):
     """TikTok is returning fewer videos for this user than their metadata led us to expect"""

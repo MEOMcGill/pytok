@@ -282,19 +282,14 @@ class User(Base):
         not mistaken for a failure. Raised as ApiFailedException because a block is
         session-level -- the accounts WorkerPool rotates and retries on a fresh session.
 
-        The same silence covers a walk cut short *after* yielding something, which is the
-        common case rather than the exotic one: a bot-flagged session still gets the first
-        page, because that comes from the profile HTML's embedded JSON rather than from the
-        item_list endpoint. So the listing dies at one or two pages while the guard above,
-        seeing 16 videos, reports success. Measured over a 2026-08-05 media backfill: 122 of
-        651 handles stopped at exactly 16 videos and 72 at exactly 32, mean depth 55.7 against
-        profiles averaging several hundred posts, and only 349 of 653 reached back beyond
-        2025-03. Every one of those was recorded as a complete collection.
+        A walk cut short *after* yielding something was equally silent, and is the common
+        case: a bot-flagged session still gets the first page, which comes from the profile
+        HTML rather than from the item_list endpoint, so the listing dies after a page or two
+        while the guard above sees 16 videos and reports success.
 
-        `_listing_exhausted` is what separates the two: it is set only where TikTok itself
-        said there was nothing after this page, which is the one piece of positive evidence
-        that the whole profile was seen. Absent that, falling well short of videoCount means
-        the walk was cut off, and the pool should rotate and retry rather than believe it.
+        `_listing_exhausted` separates the two. It is set only where TikTok itself said
+        nothing followed this page, so without it a walk far short of videoCount was cut off
+        rather than finished.
         """
         # None when info() was never called: no expectation to check against, so the guard
         # below stays off rather than guessing.
@@ -302,8 +297,8 @@ class User(Base):
         if expected_videos == 0:
             return
 
-        # "did TikTok tell us the listing ended?" -- False until a route below says otherwise.
-        # Set here so a route that raises before running cannot leave a stale answer behind.
+        # "did TikTok tell us the listing ended?" -- reset per walk, since a True left by an
+        # earlier walk on this object would suppress the truncation check below
         self._listing_exhausted = False
 
         amount_yielded = 0
@@ -604,14 +599,10 @@ class User(Base):
     async def _get_videos_scroll(self, count, seen_ids=None, amount_yielded=0):
         """Scroll to load more videos using zendriver.
 
-        This is the route almost every walk ends up on, because the item_list API route is
-        the one TikTok bot-blocks first: over a 2026-08-05 backfill it failed 653 times with
-        an empty response and handed off to scraping 1,856 times. So how this loop decides to
-        stop determines how deep the crawler can ever see.
-
-        Two of its stopping conditions used to be indistinguishable from reaching the end of
-        a profile, and both are addressed here rather than in the caller, since only this loop
-        knows which one fired.
+        Most walks end up here, because item_list is the route TikTok blocks first, so how
+        this loop decides to stop sets how deep a walk can get. Two of its stopping
+        conditions used to be indistinguishable from reaching the end of a profile; only this
+        loop knows which one fired, so it records that in `_listing_exhausted`.
         """
         page = self.parent._page
         if seen_ids is None:
@@ -619,11 +610,9 @@ class User(Base):
 
         has_more = True
         scroll_attempts = 0
-        # A bounded walk keeps the original ceiling -- it stops at `count` anyway. An unbounded
-        # one (what a media backfill runs) wants the whole profile, and 30 scrolls capped that
-        # at a few hundred videos no matter how much was left: the measured run never got past
-        # 355 for any handle. The no-new-videos check below is the real terminator, so this is
-        # only a backstop against scrolling forever on a page that keeps answering.
+        # A bounded walk stops at `count` anyway; an unbounded one wants the whole profile,
+        # which 30 scrolls caps at a few hundred videos. The no-new-videos check below is the
+        # real terminator, so this is only a backstop against scrolling a page that never ends.
         max_scroll_attempts = 30 if count else 400
         no_new_videos_count = 0
         last_video_count = amount_yielded
@@ -658,10 +647,8 @@ class User(Base):
                                 return
 
                     # Only believe hasMore when TikTok actually sent it. Defaulting to False
-                    # meant any response arriving without it ended the walk as if the profile
-                    # were exhausted -- and the empty body TikTok answers a bot-flagged
-                    # session with is exactly such a response. That is what stopped 122 of
-                    # 651 handles at exactly one page.
+                    # ended the walk on any response arriving without it -- which is what an
+                    # empty bot-blocked body looks like.
                     if 'hasMore' in data:
                         has_more = data['hasMore']
                 except Exception as e:
