@@ -325,7 +325,7 @@ class User(Base):
 
         floor = expected_videos * (LISTING_MIN_COVERAGE if min_coverage is None else min_coverage)
         if amount_yielded < floor:
-            raise ListingTruncatedException(
+            raise FewerVideosThanExpectedException(
                 f"listing for @{self.username} stopped after {amount_yielded} videos though "
                 f"the profile reports {expected_videos}, and TikTok never said the listing "
                 f"ended -- the walk was cut short rather than finished; retry on a fresh "
