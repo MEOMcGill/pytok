@@ -21,8 +21,10 @@ from ..exceptions import (
     EmptyResponseException,
     FewerVideosThanExpectedException,
     InvalidJSONException,
+    ListingTruncatedException,
     LoginException,
     NoContentException,
+    NoTemplateException,
     NotAvailableException,
     NotFoundException,
     SoundRemovedException,
@@ -218,7 +220,20 @@ class Worker:
 
             except ROTATE_EXCEPTIONS as e:
                 last_exc = e
-                minutes = RATE_LIMIT_MINUTES if isinstance(e, ApiFailedException) else REST_MINUTES
+                # A bare ApiFailedException means TikTok refused the API route outright, which
+                # is rate-limit shaped and earns the long cooldown. Its two routine subclasses
+                # are not: NoTemplateException is just the per-endpoint param cache filling
+                # itself on the first request, and ListingTruncatedException means this session
+                # could not paginate. Neither says the account misbehaved, and charging them 15
+                # minutes idles a healthy account for nothing — measured on a 2026-08-05 run,
+                # NoTemplateException alone fired 188 times, or ~47 account-hours of cooldown
+                # against a pool of two. Rotate them onto a different session cheaply instead.
+                if isinstance(e, (NoTemplateException, ListingTruncatedException)):
+                    minutes = REST_MINUTES
+                elif isinstance(e, ApiFailedException):
+                    minutes = RATE_LIMIT_MINUTES
+                else:
+                    minutes = REST_MINUTES
                 logger.warning(f"Worker {self.id}: {type(e).__name__} on "
                                f"{self._acct_name()} (attempt {attempt + 1}"
                                f"/{self.max_retries}); cooldown {minutes}m + rotate")
