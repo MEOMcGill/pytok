@@ -73,6 +73,29 @@ class Base:
         except Exception:
             return False
 
+    async def _wait_for_page_load(self, page, what):
+        """Wait for the current navigation to reach readyState 'complete'.
+
+        Honours PyTok's page_load_timeout rather than imposing a ceiling of its own: a
+        profile page reaches 'interactive' seconds before 'complete', so a ceiling
+        shorter than the real load time throws away pages whose embedded data tag is
+        already there and parseable.
+
+        Raises pytok's TimeoutException rather than letting the bare TimeoutError out.
+        That one stringifies to '', which tells a log reader nothing, and being an
+        unrecognised type it lands in the accounts pool's generic handler, which
+        rebuilds the session in place on the same account -- no use when the page is
+        merely slow, and it repeats for every handle.
+        """
+        timeout = getattr(self.parent, '_page_load_timeout', 45)
+        try:
+            async with asyncio.timeout(timeout):
+                await page.wait_for_ready_state(until='complete', timeout=timeout + 1)
+        except (asyncio.TimeoutError, TimeoutError) as ex:
+            raise exceptions.TimeoutException(
+                f"{what} did not reach readyState 'complete' within {timeout}s"
+            ) from ex
+
     async def _is_captcha_visible(self):
         """Check if any captcha text is visible."""
         for text in CAPTCHA_TEXTS:
@@ -278,12 +301,20 @@ class Base:
             await asyncio.sleep(2)
 
         await page.send(cdp.page.navigate(current_url))
-        await asyncio.sleep(3)
 
-        if await self._is_selector_visible(content_tag):
-            return await self._find_element_by_selector(content_tag, timeout=1)
-        else:
-            raise exceptions.TimeoutException("Content did not become visible in time")
+        # Poll for the content instead of reading once after a fixed sleep. A page's
+        # embedded data tag and its content grid land seconds apart, and for the first
+        # few seconds get_content() returns a half-built document with no tag at all --
+        # so a caller that returns here on a short sleep hands back a page whose data
+        # the caller then fails to parse, reported as if the page had no data.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + getattr(self.parent, '_page_load_timeout', 45)
+        while loop.time() < deadline:
+            if await self._is_selector_visible(content_tag):
+                return await self._find_element_by_selector(content_tag, timeout=1)
+            await asyncio.sleep(1)
+
+        raise exceptions.TimeoutException("Content did not become visible in time")
 
     async def check_for_unavailable_or_captcha(self, unavailable_text):
         page = self.parent._page
