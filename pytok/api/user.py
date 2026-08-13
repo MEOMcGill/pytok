@@ -65,6 +65,9 @@ class User(Base):
         self.parent = parent
         self.__update_id_sec_uid_username(user_id, sec_uid, username)
         self._used_api_for_info = False
+        # the webapp's own api/user/detail response, when the page was client-rendered
+        # and left nothing embedded to parse (see _harvest_user_detail_xhr)
+        self._xhr_user_detail: Optional[dict] = None
         if data is not None:
             self.as_dict = data
             self.__extract_from_data()
@@ -162,6 +165,57 @@ class User(Base):
         self._used_api_for_info = True
         return resp
 
+    @staticmethod
+    def _user_from_user_detail(data) -> Optional[dict]:
+        """Pull the user out of an api/user/detail payload.
+
+        The rehydration tag's webapp.user-detail scope carries the same shape, so both
+        delivery routes parse through here.
+        """
+        if not isinstance(data, dict) or data.get('statusCode', 0) != 0:
+            return None
+        user_info = data.get('userInfo', {})
+        user = user_info.get('user', {})
+        if not user or not user.get('id'):
+            return None
+        return {**user, **user_info.get('stats', {})}
+
+    async def _harvest_user_detail_xhr(self) -> bool:
+        """Bank the webapp's own api/user/detail response, if it made one.
+
+        A server-rendered page never requests that endpoint — its details are already
+        embedded — so this only ever finds anything on a client-rendered one, where the
+        captured response is the *only* copy of the user's details in existence.
+
+        Reading the capture drains it, hence stashing the first hit: the caller polls
+        this, and the response must survive until the parse.
+        """
+        if self._xhr_user_detail is not None:
+            return True
+        try:
+            responses = await self.parent.process_pending_responses('api/user/detail')
+        except Exception:
+            return False
+        for resp in responses or []:
+            body = resp.get('body') or ''
+            if not body:
+                continue
+            try:
+                data = json.loads(body) if isinstance(body, str) else body
+            except Exception:
+                continue
+            user = self._user_from_user_detail(data)
+            if not user:
+                continue
+            # the page may have fetched details for other users too (sidebars, suggested
+            # accounts), so don't accept one that isn't the profile we asked for
+            unique_id = user.get('uniqueId')
+            if unique_id and unique_id.lower() != self.username.lower():
+                continue
+            self._xhr_user_detail = user
+            return True
+        return False
+
     async def _info_full_scrape(self, **kwargs) -> dict:
         url = f"https://www.tiktok.com/@{self.username}"
 
@@ -169,11 +223,14 @@ class User(Base):
 
         self.parent.logger.debug(f"Loading page: {url}")
         await page.send(cdp.page.navigate(url))
-        self.parent.logger.debug(f"Navigate sent, waiting for the embedded data tag")
-        # This method reads the rehydration JSON, so wait for that rather than for
-        # readyState 'complete' -- the tag is parseable long before the page finishes
-        # pulling in its media, and on a heavy profile 'complete' may never arrive.
-        await self._wait_for_data_tag(page, f"@{self.username}")
+        self.parent.logger.debug(f"Navigate sent, waiting for the profile's data")
+        # Wait for the data rather than for readyState 'complete': the tag is parseable
+        # long before the page finishes pulling in its media, and on a heavy profile
+        # 'complete' may never arrive. Either delivery route ends the wait -- embedded in
+        # the tag, or fetched by the page from api/user/detail.
+        self._xhr_user_detail = None
+        await self._wait_for_page_data(page, f"@{self.username}",
+                                       fallback=self._harvest_user_detail_xhr)
 
         # Wait for video items using base class method (handles refresh button, captcha, login popup)
         await self.wait_for_content_or_unavailable_or_captcha(
@@ -182,32 +239,45 @@ class User(Base):
             no_content_text=["No content", "This account is private", "Log in to TikTok"]
         )
 
+        user = None
+
         # Get user info from page HTML (like the working example)
         html_body = await page.get_content()
-        tag_contents = extract_tag_contents(html_body)
+        try:
+            tag_contents = extract_tag_contents(html_body)
+        except NotAvailableException:
+            # No embedded payload at all, which is a client-rendered page rather than a
+            # missing account -- the XHR route below is where its details are. Letting
+            # this out would report the profile as unavailable, which the accounts pool
+            # treats as data-level and skips the handle for good.
+            tag_contents = None
 
-        if not tag_contents:
-            raise InvalidJSONException("Could not find data script tag in page")
+        if tag_contents:
+            self.initial_json = json.loads(tag_contents)
 
-        self.initial_json = json.loads(tag_contents)
+            # Try different JSON structures TikTok uses (matching the working example)
+            if '__DEFAULT_SCOPE__' in self.initial_json:
+                user = self._user_from_user_detail(
+                    self.initial_json['__DEFAULT_SCOPE__'].get('webapp.user-detail', {})
+                )
 
-        user = None
-        sec_uid = None
+            if 'UserModule' in self.initial_json and user is None:
+                users = self.initial_json['UserModule'].get('users', {})
+                stats = self.initial_json['UserModule'].get('stats', {})
+                if self.username in users:
+                    user = {**users[self.username], **stats.get(self.username, {})}
 
-        # Try different JSON structures TikTok uses (matching the working example)
-        if '__DEFAULT_SCOPE__' in self.initial_json:
-            user_detail = self.initial_json['__DEFAULT_SCOPE__'].get('webapp.user-detail', {})
-            if user_detail.get('statusCode') == 0:
-                user_info = user_detail.get('userInfo', {})
-                user = {**user_info.get('user', {}), **user_info.get('stats', {})}
-                sec_uid = user_info.get('user', {}).get('secUid')
-
-        if 'UserModule' in self.initial_json and user is None:
-            users = self.initial_json['UserModule'].get('users', {})
-            stats = self.initial_json['UserModule'].get('stats', {})
-            if self.username in users:
-                user = {**users[self.username], **stats.get(self.username, {})}
-                sec_uid = user.get('secUid')
+        if user is None:
+            # Client-rendered: nothing embedded to parse, so use what the page fetched
+            # for itself. Re-harvest first — the response may only have landed while we
+            # were waiting on the video grid above.
+            await self._harvest_user_detail_xhr()
+            user = self._xhr_user_detail
+            if user is not None:
+                self.parent.logger.debug(
+                    f"@{self.username}: page carried no embedded data, took the user's "
+                    f"details from its own api/user/detail response"
+                )
 
         if user is None:
             raise InvalidJSONException("Failed to find user data in HTML")
@@ -477,7 +547,14 @@ class User(Base):
         has_more = True
 
         html = await page.get_content()
-        tag_contents = extract_tag_contents(html)
+        try:
+            tag_contents = extract_tag_contents(html)
+        except NotAvailableException:
+            # A client-rendered page embeds nothing, so there is no first page to read
+            # here -- but the scroll below works off the item_list responses the page
+            # fetches for itself, which arrive either way. has_more stays True so we go
+            # straight there rather than reporting the profile as unavailable.
+            tag_contents = None
 
         if tag_contents:
             data = json.loads(tag_contents)
@@ -581,7 +658,13 @@ class User(Base):
         if len(video_responses) == 0:
             # Check HTML data for status codes before failing
             html = await self.parent._page.get_content()
-            tag_contents = extract_tag_contents(html)
+            try:
+                tag_contents = extract_tag_contents(html)
+            except NotAvailableException:
+                # Best-effort status check only; a client-rendered page has no embedded
+                # JSON to check. Fall through to ApiFailedException, which retries and
+                # falls back, rather than letting "no tag" surface as "no such account".
+                tag_contents = None
             if tag_contents:
                 data = json.loads(tag_contents)
                 if '__DEFAULT_SCOPE__' in data:
