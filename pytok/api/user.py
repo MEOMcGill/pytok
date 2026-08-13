@@ -169,10 +169,11 @@ class User(Base):
 
         self.parent.logger.debug(f"Loading page: {url}")
         await page.send(cdp.page.navigate(url))
-        self.parent.logger.debug(f"Navigate sent, waiting for ready state")
-        async with asyncio.timeout(10):
-            await page.wait_for_ready_state(until='complete', timeout=11)
-        await asyncio.sleep(3)  # Brief wait for dynamic content
+        self.parent.logger.debug(f"Navigate sent, waiting for the embedded data tag")
+        # This method reads the rehydration JSON, so wait for that rather than for
+        # readyState 'complete' -- the tag is parseable long before the page finishes
+        # pulling in its media, and on a heavy profile 'complete' may never arrive.
+        await self._wait_for_data_tag(page, f"@{self.username}")
 
         # Wait for video items using base class method (handles refresh button, captcha, login popup)
         await self.wait_for_content_or_unavailable_or_captcha(
@@ -453,8 +454,10 @@ class User(Base):
         self.parent.logger.debug(f"Loading page: {url}")
         await page.send(cdp.page.navigate(url))
         self.parent.logger.debug(f"Navigate sent, waiting for ready state")
-        async with asyncio.timeout(30):
-            await page.wait_for_ready_state(until='complete', timeout=31)
+        # Not fatal if 'complete' never lands: the wait for the video grid below is the
+        # real readiness gate, and a profile heavy enough to never finish loading is
+        # still perfectly scrapeable once its grid is up.
+        await self._wait_for_page_load(page, f"@{self.username}", required=False)
         await asyncio.sleep(3)  # Brief wait for dynamic content
         self.parent.logger.debug(f"Page loaded for scraping videos")
 

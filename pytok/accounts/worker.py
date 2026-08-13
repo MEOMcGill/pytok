@@ -61,6 +61,12 @@ ROTATE_EXCEPTIONS = (
 DEFAULT_TASKS_PER_REST = None  # None => never force a rest on task count
 REST_MINUTES = 5
 RATE_LIMIT_MINUTES = 15
+# Consecutive in-place session rebuilds (counted across tasks, not within one) before
+# the generic handler gives up on rebuilding and rotates instead. Rebuilding in place
+# is the right first move for a dead tab, but a fault that outlives the rebuild -- a
+# page that will not finish loading for this session -- otherwise repeats it on every
+# handle forever, pinning the worker to one account.
+MAX_INPLACE_REBUILDS = 3
 
 
 class Worker:
@@ -92,6 +98,9 @@ class Worker:
         self.tasks_done: int = 0
         self.api = None  # PyTok, built lazily and reused across tasks
         self._initialized = False
+        # Spans tasks: a session whose fault survives the rebuild fails the next handle
+        # the same way, so counting only within one task would never reach the limit.
+        self._inplace_rebuilds: int = 0
 
     def _acct_name(self) -> str:
         return self.current_account.username if self.current_account else "<none>"
@@ -208,6 +217,7 @@ class Worker:
                 result = await task(api)
                 await self.pool.increment_scrape_count(self.current_account.username)
                 self.tasks_done += 1
+                self._inplace_rebuilds = 0
                 return result
 
             except NoAccountError:
@@ -248,16 +258,32 @@ class Worker:
                 # Unknown error / browser crash / transient session failure.
                 # Drop the (probably dead) session and rebuild IN PLACE on the
                 # same account — these recover on a fresh session in seconds.
-                # We deliberately do NOT rotate+cooldown here: with a small pool
-                # (e.g. 2 accounts) rotating just locks this account for minutes
-                # and waits on the other busy one, turning a transient blip into
-                # a multi-minute stall. Genuine rate-limit/captcha/timeout still
-                # rotate via ROTATE_EXCEPTIONS above; a persistently unbuildable
-                # account is caught by _ensure_session's max_build_attempts.
+                # Rotating on the first one instead would, with a small pool (e.g. 2
+                # accounts), lock this account for minutes and wait on the other busy
+                # one, turning a transient blip into a multi-minute stall.
+                #
+                # But only up to MAX_INPLACE_REBUILDS: a fault that survives the
+                # rebuild is not the tab, and repeating the rebuild then fails every
+                # subsequent handle on this worker. _ensure_session's
+                # max_build_attempts does not cover that case — the session builds
+                # fine, it is the page that never loads.
                 last_exc = e
-                logger.error(f"Worker {self.id}: unexpected error on "
-                             f"{self._acct_name()}: {e!r}; rebuilding session in place")
-                await self._close_session()
+                self._inplace_rebuilds += 1
+                if self._inplace_rebuilds >= MAX_INPLACE_REBUILDS:
+                    # Rebuilding has stopped helping, so the fault is not the tab.
+                    # Rotate: a different account (and a cooldown for this one) is the
+                    # only lever left, and it stops this worker burning every handle.
+                    logger.error(f"Worker {self.id}: unexpected error on "
+                                 f"{self._acct_name()}: {e!r}; "
+                                 f"{self._inplace_rebuilds} in-place rebuilds did not "
+                                 f"help, cooldown {REST_MINUTES}m + rotate")
+                    self._inplace_rebuilds = 0
+                    await self.rotate_account(REST_MINUTES)
+                else:
+                    logger.error(f"Worker {self.id}: unexpected error on "
+                                 f"{self._acct_name()}: {e!r}; rebuilding session in "
+                                 f"place ({self._inplace_rebuilds}/{MAX_INPLACE_REBUILDS})")
+                    await self._close_session()
 
         raise RuntimeError(
             f"Worker {self.id}: task failed after {self.max_retries} attempts"
