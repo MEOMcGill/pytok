@@ -1152,8 +1152,28 @@ class PyTok:
         # login() short-circuits on the presence of session cookies, which can be
         # stale server-side (logged in per cookies, but app-context has no user).
         # Require a real, matching identity read before trusting the session.
-        ident = await self._get_logged_in_identity(navigate=True)
+        #
+        # Retried, because a just-completed login is still settling: TikTok redirects to the
+        # home page after sign-in and the app context carries no user until that lands. A
+        # single read here fails on a login that in fact succeeded, and the account is then
+        # marked inactive with a session that works -- which no later run can repair, since
+        # the cookies it left behind make login() short-circuit on every retry.
+        ident = await self._identity_with_retries(
+            lambda: self._get_logged_in_identity(navigate=True)
+        )
         if not ident:
+            # Drop the cookies we just judged unusable. Leaving them made the account
+            # unrecoverable: they are enough for login() to short-circuit on the next run, so
+            # every later attempt reported success without ever showing a login form, failed
+            # this same check, and disabled the account again.
+            try:
+                await self._page.send(cdp.network.clear_browser_cookies())
+                self.logger.info(
+                    f"Cleared the unusable session for {account.username} so the next login "
+                    f"starts from a real sign-in rather than short-circuiting on these cookies"
+                )
+            except Exception as e:
+                self.logger.debug(f"clear_browser_cookies failed: {e}")
             if pool:
                 await pool.set_active(
                     account.username, False,
@@ -1161,7 +1181,8 @@ class PyTok:
                 )
             raise LoginException(
                 f"Account {account.username} appears logged in by cookies but TikTok "
-                f"shows no user (session expired/invalid); clear its profile and re-login"
+                f"shows no user (session expired/invalid); the stale cookies have been "
+                f"cleared, so re-running the login will present a sign-in form"
             )
         if account.user_id and ident.get('user_id') and ident['user_id'] != account.user_id:
             raise LoginException(
@@ -1169,6 +1190,27 @@ class PyTok:
                 f"but account {account.username} expects uid {account.user_id}"
             )
         await _confirm(ident)
+
+    async def _identity_with_retries(self, read, attempts: int = 5, delay: int = 3) -> Optional[dict]:
+        """Read the logged-in identity, retrying while a fresh session settles.
+
+        Returns the first non-empty read, or None once the attempts run out. The wait is
+        short and only paid on the failing path, where the alternative is disabling an
+        account whose session is fine.
+        """
+        for attempt in range(1, attempts + 1):
+            ident = await read()
+            if ident:
+                if attempt > 1:
+                    self.logger.info(f"Identity readable on attempt {attempt}")
+                return ident
+            if attempt < attempts:
+                self.logger.info(
+                    f"No identity yet (attempt {attempt}/{attempts}); the session may still "
+                    f"be settling, retrying in {delay}s"
+                )
+                await asyncio.sleep(delay)
+        return None
 
     async def _identity_after_reload(self, matcher) -> Optional[dict]:
         """Reload tiktok.com (so injected cookies take effect) then run matcher."""
