@@ -547,7 +547,14 @@ class User(Base):
         has_more = True
 
         html = await page.get_content()
-        tag_contents = extract_tag_contents(html)
+        try:
+            tag_contents = extract_tag_contents(html)
+        except NotAvailableException:
+            # A client-rendered page embeds nothing, so there is no first page to read
+            # here -- but the scroll below works off the item_list responses the page
+            # fetches for itself, which arrive either way. has_more stays True so we go
+            # straight there rather than reporting the profile as unavailable.
+            tag_contents = None
 
         if tag_contents:
             data = json.loads(tag_contents)
@@ -651,7 +658,13 @@ class User(Base):
         if len(video_responses) == 0:
             # Check HTML data for status codes before failing
             html = await self.parent._page.get_content()
-            tag_contents = extract_tag_contents(html)
+            try:
+                tag_contents = extract_tag_contents(html)
+            except NotAvailableException:
+                # Best-effort status check only; a client-rendered page has no embedded
+                # JSON to check. Fall through to ApiFailedException, which retries and
+                # falls back, rather than letting "no tag" surface as "no such account".
+                tag_contents = None
             if tag_contents:
                 data = json.loads(tag_contents)
                 if '__DEFAULT_SCOPE__' in data:
