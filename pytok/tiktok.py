@@ -171,7 +171,8 @@ class PyTok:
         # driving it from the stored credentials. The automatic flow cannot get past a
         # captcha the solver fails to read, which is a dead end for an account that needs
         # one; a person can type the credentials and solve it.
-        self._manual_login = manual_login
+        # not _manual_login: that is the method this flag ends up calling
+        self._use_manual_login = manual_login
         self._login_timeout = login_timeout
         # Set True only once the live logged-in uid is confirmed to match the
         # account. Gates cookie snapshots so a stale/unverified session can never
@@ -1134,7 +1135,7 @@ class PyTok:
         # 3) Fall back to an interactive/credentialed login. Withholding the credentials is
         # what selects login()'s manual path, so a person drives the whole flow.
         self.logger.info(f"No valid session for {account.username}; running login flow")
-        if self._manual_login:
+        if self._use_manual_login:
             self.logger.info(
                 f"Manual login: complete the sign-in for {account.username} in the browser "
                 f"window (waiting up to {self._login_timeout}s)"
