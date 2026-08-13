@@ -101,20 +101,27 @@ class Base:
                 raise exceptions.TimeoutException(msg) from ex
             self.parent.logger.warning(f"{msg}; carrying on to wait for content")
 
-    async def _wait_for_data_tag(self, page, what):
-        """Wait until the page's embedded data tag is present and parseable.
+    async def _wait_for_page_data(self, page, what, fallback=None):
+        """Wait until the page's data is readable.
 
-        The right readiness gate for anything that reads the rehydration JSON. The tag
-        lands early in the load, whereas readyState 'complete' can be tens of seconds
-        later on a heavy profile -- so gating on 'complete' fails pages whose data has
-        been sitting in the document the whole time. Polls rather than sleeping a fixed
-        interval, because for the first moments after a navigation get_content() returns
-        a half-built document with no tag in it at all.
+        Usually that means the embedded data tag. It lands early in the load, whereas
+        readyState 'complete' can be tens of seconds later on a heavy page -- so gating
+        on 'complete' fails pages whose data has been sitting in the document the whole
+        time. Polls rather than sleeping a fixed interval, because for the first moments
+        after a navigation get_content() returns a half-built document with no tag in it.
+
+        `fallback` is an optional coroutine for callers whose data can arrive by another
+        route: TikTok also serves these pages client-rendered, as a shell whose script
+        fetches the data over XHR and leaves nothing embedded to parse. It is polled
+        alongside the tag, and ending the wait on whichever appears first means a
+        client-rendered page costs no more than a server-rendered one.
         """
         timeout = getattr(self.parent, '_page_load_timeout', 45)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         while loop.time() < deadline:
+            if fallback is not None and await fallback():
+                return
             try:
                 html = await page.get_content()
                 if html and extract_tag_contents(html):
@@ -124,7 +131,7 @@ class Base:
             await asyncio.sleep(0.5)
 
         raise exceptions.TimeoutException(
-            f"{what}: embedded data tag did not appear within {timeout}s"
+            f"{what}: no page data appeared within {timeout}s"
         )
 
     async def _is_captcha_visible(self):
