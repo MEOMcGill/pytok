@@ -286,8 +286,16 @@ def release(ctx, username):
                    "the source template is copied, never mutated.")
 @click.option("--force-relogin", is_flag=True,
               help="Clear the profile's session and force a fresh login (recover a stale account)")
+@click.option("--manual-login", is_flag=True,
+              help="Sign in by hand in the browser window instead of driving the stored "
+                   "credentials. Use this when the automatic flow cannot get past a captcha: "
+                   "you type the username and password and solve the challenge, then this "
+                   "captures the identity and cookies once you are in.")
+@click.option("--timeout", default=None, type=int,
+              help="Seconds to wait for the login to complete (default 300, or 600 with "
+                   "--manual-login, since typing credentials and solving a captcha takes longer)")
 @click.pass_context
-def login(ctx, username, headless, seed_profile, force_relogin):
+def login(ctx, username, headless, seed_profile, force_relogin, manual_login, timeout):
     """Open a browser for this account, log in, and capture identity + cookies.
 
     Use this once per new account: it launches the account's persistent Chrome
@@ -300,8 +308,23 @@ def login(ctx, username, headless, seed_profile, force_relogin):
 
     Pass --force-relogin to recover an account whose cookies look valid but whose
     session TikTok has invalidated (app-context shows no logged-in user).
+
+    Pass --manual-login to sign in yourself in the browser window rather than having
+    the stored credentials typed in. This is the way past a captcha the solver cannot
+    read, which the automatic flow can only fail on. Combine the two to recover a
+    stale account that also needs a challenge solved:
+
+        cli login --username you@example.com --force-relogin --manual-login
+
+    Completion is detected by polling for the session, so no console is needed and it
+    works when driven from a scheduled task or over ssh. It does need a real desktop
+    for the browser, so --manual-login and --headless are mutually exclusive.
     """
     from ..tiktok import PyTok
+
+    if manual_login and headless:
+        raise click.UsageError("--manual-login needs a visible browser; drop --headless")
+    login_timeout = timeout if timeout is not None else (600 if manual_login else 300)
 
     async def _login():
         pool = AccountsPool(ctx.obj["db"])
@@ -314,8 +337,13 @@ def login(ctx, username, headless, seed_profile, force_relogin):
                 _seed_profile_dir(seed_profile, account.profile_dir)
                 click.echo(f"Seeded warmed profile: {os.path.expanduser(seed_profile)} "
                            f"-> {account.profile_dir}")
+            if manual_login:
+                click.echo(f"Manual login: a browser will open on {account.username}'s profile. "
+                           f"Sign in there and solve any challenge; this waits up to "
+                           f"{login_timeout}s and stores the session once you are in.")
             async with PyTok(account=account, accounts_pool=pool, headless=headless,
-                             force_relogin=force_relogin) as api:
+                             force_relogin=force_relogin, manual_login=manual_login,
+                             login_timeout=login_timeout) as api:
                 ident = await api._get_logged_in_identity()
                 if ident:
                     click.echo(f"Logged in as @{ident.get('unique_id')} (uid {ident.get('user_id')})")

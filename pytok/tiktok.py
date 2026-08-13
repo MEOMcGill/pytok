@@ -98,6 +98,8 @@ class PyTok:
             accounts_pool=None,
             release_on_shutdown: bool = True,
             force_relogin: bool = False,
+            manual_login: bool = False,
+            login_timeout: int = 300,
             startup_lock: Optional[asyncio.Lock] = None,
     ):
         """The PyTok class. Used to interact with TikTok.
@@ -165,6 +167,12 @@ class PyTok:
         # fresh credentialed login — used to recover an account whose cookies look
         # valid but whose session TikTok has invalidated server-side.
         self._force_relogin = force_relogin
+        # When True, verification hands the login to whoever is at the browser instead of
+        # driving it from the stored credentials. The automatic flow cannot get past a
+        # captcha the solver fails to read, which is a dead end for an account that needs
+        # one; a person can type the credentials and solve it.
+        self._manual_login = manual_login
+        self._login_timeout = login_timeout
         # Set True only once the live logged-in uid is confirmed to match the
         # account. Gates cookie snapshots so a stale/unverified session can never
         # overwrite a good cookie backup.
@@ -681,8 +689,9 @@ class PyTok:
         timeout : int, optional
             Maximum time in seconds to wait for login completion (default: 300)
         wait_for_input : bool, optional
-            If True (default), waits for you to press Enter after logging in
-            manually. If False, polls for login cookies until timeout.
+            If True, waits for you to press Enter after logging in manually.
+            If False (default), polls for login cookies until timeout — which is
+            what a caller with no console attached needs.
 
         Returns
         -------
@@ -1122,9 +1131,18 @@ class PyTok:
                     await _confirm(ident)
                     return
 
-        # 3) Fall back to an interactive/credentialed login.
+        # 3) Fall back to an interactive/credentialed login. Withholding the credentials is
+        # what selects login()'s manual path, so a person drives the whole flow.
         self.logger.info(f"No valid session for {account.username}; running login flow")
-        ok = await self.login(username=account.username, password=account.password)
+        if self._manual_login:
+            self.logger.info(
+                f"Manual login: complete the sign-in for {account.username} in the browser "
+                f"window (waiting up to {self._login_timeout}s)"
+            )
+            ok = await self.login(timeout=self._login_timeout)
+        else:
+            ok = await self.login(username=account.username, password=account.password,
+                                  timeout=self._login_timeout)
         if not ok:
             if pool:
                 await pool.set_active(account.username, False, "Login failed during verification")
