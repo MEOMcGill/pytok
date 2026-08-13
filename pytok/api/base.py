@@ -6,6 +6,7 @@ import random
 from zendriver import cdp
 
 from .. import exceptions, captcha_solver
+from ..helpers import extract_tag_contents
 
 TOK_DELAY = 20
 CAPTCHA_DELAY = 999999
@@ -73,28 +74,58 @@ class Base:
         except Exception:
             return False
 
-    async def _wait_for_page_load(self, page, what):
+    async def _wait_for_page_load(self, page, what, required=True):
         """Wait for the current navigation to reach readyState 'complete'.
 
-        Honours PyTok's page_load_timeout rather than imposing a ceiling of its own: a
-        profile page reaches 'interactive' seconds before 'complete', so a ceiling
-        shorter than the real load time throws away pages whose embedded data tag is
-        already there and parseable.
+        Honours PyTok's page_load_timeout rather than imposing a ceiling of its own.
 
-        Raises pytok's TimeoutException rather than letting the bare TimeoutError out.
-        That one stringifies to '', which tells a log reader nothing, and being an
-        unrecognised type it lands in the accounts pool's generic handler, which
-        rebuilds the session in place on the same account -- no use when the page is
-        merely slow, and it repeats for every handle.
+        `required=False` downgrades a timeout to a warning, for callers that follow this
+        with a stronger readiness gate of their own (waiting for the content grid, say).
+        'complete' waits on every image, video and beacon the page pulls in, so on a
+        heavy profile it lands tens of seconds after the content is usable, or not at
+        all -- failing there would throw away a page the caller could have scraped.
+
+        When it does raise, it raises pytok's TimeoutException rather than letting the
+        bare TimeoutError out. That one stringifies to '', which tells a log reader
+        nothing, and being an unrecognised type it lands in the accounts pool's generic
+        handler, which rebuilds the session in place on the same account -- no use when
+        the page is merely slow, and it repeats for every handle.
         """
         timeout = getattr(self.parent, '_page_load_timeout', 45)
         try:
             async with asyncio.timeout(timeout):
                 await page.wait_for_ready_state(until='complete', timeout=timeout + 1)
         except (asyncio.TimeoutError, TimeoutError) as ex:
-            raise exceptions.TimeoutException(
-                f"{what} did not reach readyState 'complete' within {timeout}s"
-            ) from ex
+            msg = f"{what} did not reach readyState 'complete' within {timeout}s"
+            if required:
+                raise exceptions.TimeoutException(msg) from ex
+            self.parent.logger.warning(f"{msg}; carrying on to wait for content")
+
+    async def _wait_for_data_tag(self, page, what):
+        """Wait until the page's embedded data tag is present and parseable.
+
+        The right readiness gate for anything that reads the rehydration JSON. The tag
+        lands early in the load, whereas readyState 'complete' can be tens of seconds
+        later on a heavy profile -- so gating on 'complete' fails pages whose data has
+        been sitting in the document the whole time. Polls rather than sleeping a fixed
+        interval, because for the first moments after a navigation get_content() returns
+        a half-built document with no tag in it at all.
+        """
+        timeout = getattr(self.parent, '_page_load_timeout', 45)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            try:
+                html = await page.get_content()
+                if html and extract_tag_contents(html):
+                    return
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+
+        raise exceptions.TimeoutException(
+            f"{what}: embedded data tag did not appear within {timeout}s"
+        )
 
     async def _is_captcha_visible(self):
         """Check if any captcha text is visible."""
