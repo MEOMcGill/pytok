@@ -36,6 +36,11 @@ def _apostrophe_variants(texts):
     return variants
 
 
+# The hashtag feed's items, used both to wait for the feed and to report how far it
+# has grown during a scroll walk.
+CHALLENGE_ITEM_SELECTOR = '[data-e2e=challenge-item]'
+
+
 class Hashtag(Base):
     """
     A TikTok Hashtag/Challenge.
@@ -169,7 +174,7 @@ class Hashtag(Base):
 
         try:
             await self.wait_for_content_or_unavailable_or_captcha(
-                '[data-e2e=challenge-item]',
+                CHALLENGE_ITEM_SELECTOR,
                 'Not available',
                 no_content_text=_apostrophe_variants(HASHTAG_NOT_FOUND_TEXTS),
             )
@@ -499,7 +504,7 @@ class Hashtag(Base):
         await self.check_and_wait_for_captcha()
         await self.check_and_close_signin()
         await self._raise_if_hashtag_missing()
-        if not await self._is_selector_visible('[data-e2e=challenge-item]'):
+        if not await self._is_selector_visible(CHALLENGE_ITEM_SELECTOR):
             self.parent.logger.warning(
                 "Hashtag video grid not visible yet (TikTok requires login for this "
                 "feed; pass a logged-in user_data_dir if you get no results)."
@@ -514,7 +519,6 @@ class Hashtag(Base):
         API route can't take over. Returns (items, has_more, cursor) so pagination
         continues from where the page's own requests left off.
         """
-        page = self.parent._page
         items = []
         has_more = True
         cursor = 0
@@ -548,7 +552,7 @@ class Hashtag(Base):
             if not has_more or attempt == attempts - 1:
                 break
             await self.check_and_wait_for_captcha()
-            await page.evaluate('window.scrollBy(0, window.innerHeight * 4)')
+            await self.scroll_feed(CHALLENGE_ITEM_SELECTOR)
             await asyncio.sleep(2.5)
 
         return items, has_more, cursor
@@ -576,57 +580,27 @@ class Hashtag(Base):
 
     async def _scroll_for_videos(self):
         """Scroll the loaded hashtag page, yielding videos from each new response."""
-        page = self.parent._page
+        yielded = 0
+        walk = self.scroll_walk("api/challenge/item_list", CHALLENGE_ITEM_SELECTOR,
+                                before_round=self.check_and_wait_for_captcha)
+        try:
+            async for rnd in walk.rounds():
+                for resp in rnd.responses:
+                    res = self._parse_response(resp)
+                    if res is None:
+                        walk.stats['unusable_responses'] += 1
+                        continue
 
-        has_more = True
-        scroll_attempts = 0
-        max_scroll_attempts = 30
-        empty_rounds = 0
-        max_empty_rounds = 5
+                    videos = res.get("itemList", [])
+                    rnd.produced += len(videos)
+                    for video in videos:
+                        yielded += 1
+                        yield self.parent.video(data=video)
 
-        while has_more and scroll_attempts < max_scroll_attempts:
-            await self.check_and_wait_for_captcha()
-
-            # Scroll first so the lazily-loaded item_list request fires, then give
-            # its response body time to be captured before reading it.
-            yielded_this_round = 0
-            await page.evaluate('window.scrollBy(0, window.innerHeight * 4)')
-            await asyncio.sleep(3)
-            await self.check_and_resolve_refresh_button()
-
-            video_responses = await self.parent.process_pending_responses("api/challenge/item_list")
-            for resp in video_responses:
-                res = self._parse_response(resp)
-                if res is None:
-                    continue
-
-                for video in res.get("itemList", []):
-                    yielded_this_round += 1
-                    yield self.parent.video(data=video)
-
-                if not res.get("hasMore", False):
-                    self.parent.logger.info(
-                        "TikTok isn't sending more TikToks beyond this point."
-                    )
-                    has_more = False
-
-            if not has_more:
-                break
-
-            # Give up early if scrolling stops producing new videos (e.g. the
-            # feed is login-walled) rather than scrolling to the hard limit.
-            if yielded_this_round == 0:
-                empty_rounds += 1
-                if empty_rounds >= max_empty_rounds:
-                    self.parent.logger.info(
-                        "No new hashtag videos after repeated scrolls, stopping."
-                    )
-                    return
-            else:
-                empty_rounds = 0
-
-            await self.parent.request_delay()
-            scroll_attempts += 1
+                    if 'hasMore' in res:
+                        rnd.stop = not res['hasMore']
+        finally:
+            self.parent.logger.info(f"#{self.name}: walked {yielded} videos, {walk.summary()}")
 
     def __extract_from_data(self):
         data = self.as_dict
