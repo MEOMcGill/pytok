@@ -180,7 +180,10 @@ class ScrollWalk:
         self.rounds_done = 0
         self.loop_seconds = 0.0
         self.feed_items = 0
-        self.reason = 'ran out of scrolls'
+        # Holds unless the walk ends on its own terms, which covers the caller closing the
+        # generator -- a date window it has walked past, a session it has given up on. Do
+        # not let that read as a budget we exhausted.
+        self.reason = 'the caller stopped reading the walk'
         # True only when the feed itself said nothing follows. Every other way of stopping
         # is a walk that was cut off, which callers must not mistake for a complete one.
         self.listing_ended = False
@@ -245,6 +248,8 @@ class ScrollWalk:
                     stall_rounds >= SCROLL_STALL_ROUNDS and stalled_for >= SCROLL_STALL_SECONDS):
                 self.reason = f'nothing new for {stalled_for:.0f}s over {stall_rounds} rounds'
                 return
+
+        self.reason = f'ran out of scrolls ({self.max_rounds})'
 
     def summary(self):
         parts = [f"{self.rounds_done} scrolls in {self.loop_seconds:.0f}s"]
