@@ -3,12 +3,12 @@
 
 # pytok
 
-This is a zendriver based version of David Teacher's unofficial api wrapper for TikTok.com in python. It re-implements a currently limited set of the features of the original library, with a shifted focus on using browser automation to allow automatic captcha solves with a hopefully minor trade-off in performance.
+This is a zendriver based version of David Teacher's unofficial api wrapper for TikTok.com in python. It re-implements a set of features from the original library, with a shifted focus on using browser automation to allow automatic captcha solves with a hopefully minor trade-off in performance.
 
 ## Installation
 
 ```bash
-pip install git+https://github.com/networkdynamics/pytok.git@master
+pip install git+https://github.com/MEOMcGill/pytok.git@master
 ```
 
 ## Quick Start Guide
