@@ -20,21 +20,15 @@ if TYPE_CHECKING:
 # web_search_code mirrors what the TikTok web app sends with search requests
 _WEB_SEARCH_CODE = '{"tiktok":{"client_params_x":{"search_engine":{"ies_mt_user_live_video_card_use_libra":1,"mt_search_general_user_live_card":1}},"search_server":{}}}'
 
-# TikTok's search results render inside an inner scroll container, not the
-# document body — so window.scrollBy does nothing. Scroll that container to
-# fire the lazily-loaded pagination requests. Fall back to the window in case
-# the layout changes.
-_SCROLL_SEARCH_GRID_JS = """
-(() => {
-  const el = document.querySelector('#grid-main') ||
-             document.querySelector('[class*=SearchGridLayoutContainer]');
-  if (el && el.scrollHeight > el.clientHeight) {
-    el.scrollTop = el.scrollHeight;
-    return;
-  }
-  window.scrollBy(0, window.innerHeight * 4);
-})()
-"""
+# TikTok's search results render inside an inner scroll container, not the document
+# body -- so scrolling the window does nothing and never fires the lazily-loaded
+# pagination requests. base.scroll_feed falls back to the window if this is not
+# found, in case the layout changes.
+_SEARCH_GRID_SELECTOR = '#grid-main, [class*=SearchGridLayoutContainer]'
+
+# Scrolls with no `count` to size them are only ended by the walk's stall check; this is
+# just a backstop against a page that never stops producing.
+_UNBOUNDED_MAX_ROUNDS = 400
 
 # Page size TikTok serves videos at. User search pages come 20 at a time, so
 # this is only used to size scroll budgets — as the smaller of the two it can
@@ -345,7 +339,6 @@ class Search(Base):
         so pagination continues from where the page's own requests left off. Each
         result is a (object, id) pair as produced by _yield_results.
         """
-        page = self.parent._page
         results = []
         has_more = True
         cursor = 0
@@ -389,7 +382,7 @@ class Search(Base):
             if not has_more or attempt == attempts - 1:
                 break
             await self.check_and_wait_for_captcha()
-            await page.evaluate(_SCROLL_SEARCH_GRID_JS)
+            await self.scroll_feed(container_selector=_SEARCH_GRID_SELECTOR)
             await asyncio.sleep(2.5)
 
         return results, has_more, cursor, search_id
@@ -432,78 +425,49 @@ class Search(Base):
 
         `count` is how many results the caller still needs; it sizes the scroll
         budget, since the page hands back one page of results per scroll. None
-        means the caller wants the whole listing, so no budget is imposed and
-        stopping is left to has_more and the empty-round guard.
+        means the caller wants the whole listing, so stopping is left to has_more
+        and the walk's stall check.
         """
-        page = self.parent._page
+        # One scroll yields one page, so a fixed budget silently caps big requests. Allow
+        # enough scrolls for `count` with slack for rounds that come back empty, and let the
+        # walk's stall check stop us early. count=None asks for everything, so there is no
+        # budget to size -- then only the stall check ends the scroll.
+        max_rounds = (_UNBOUNDED_MAX_ROUNDS if count is None
+                      else max(30, math.ceil(count / _VIDEO_PAGE_SIZE) * 2))
+        yielded = 0
+        # The results live in an inner scroll container, not the window: scrolling the
+        # window there is a no-op that never triggers the infinite-scroll observer.
+        walk = self.scroll_walk(_endpoint_path(obj_type),
+                                container_selector=_SEARCH_GRID_SELECTOR,
+                                max_rounds=max_rounds,
+                                before_round=self.check_and_wait_for_captcha)
+        try:
+            async for rnd in walk.rounds():
+                for resp in rnd.responses:
+                    res = self._parse_response(resp)
+                    if res is None:
+                        walk.stats['unusable_responses'] += 1
+                        continue
 
-        has_more = True
-        scroll_attempts = 0
-        # One scroll yields one page, so a fixed budget silently caps big
-        # requests. Allow enough scrolls for `count` with slack for rounds that
-        # come back empty, and let the empty-round guard below stop us early.
-        # count=None asks for everything, so there is no budget to size -- the
-        # empty-round guard is what ends an unbounded scroll.
-        max_scroll_attempts = None if count is None else max(30, math.ceil(count / _VIDEO_PAGE_SIZE) * 2)
-        empty_rounds = 0
-        max_empty_rounds = 3
+                    results = list(self._yield_results(obj_type, res, with_id=True))
+                    rnd.produced += len(results)
+                    for result in results:
+                        yielded += 1
+                        yield result
 
-        while has_more and (max_scroll_attempts is None or scroll_attempts < max_scroll_attempts):
-            await self.check_and_wait_for_captcha()
-
-            # Scroll first so the lazily-loaded search request fires, then give
-            # its response body time to be captured before reading it. The
-            # results live in an inner scroll container (#grid-main), not the
-            # window — scrolling the window is a no-op and never triggers the
-            # infinite-scroll observer, so target the container.
-            yielded_this_round = 0
-            await page.evaluate(_SCROLL_SEARCH_GRID_JS)
-            await asyncio.sleep(3)
-            await self.check_and_resolve_refresh_button()
-
-            responses = await self.parent.process_pending_responses(_endpoint_path(obj_type))
-            for resp in responses:
-                res = self._parse_response(resp)
-                if res is None:
-                    continue
-
-                page_size = 0
-                for result in self._yield_results(obj_type, res, with_id=True):
-                    page_size += 1
-                    yielded_this_round += 1
-                    yield result
-
-                # Only a short page is trusted when it says the listing is over
-                # (see _note_page_size). An empty or exactly-full page saying the
-                # same is as likely to be TikTok stalling us, so leave those to
-                # the empty-round guard below, which gives the page a couple more
-                # scrolls to recover.
-                short_page = self._note_page_size(page_size)
-                if not res.get("has_more", 0) and short_page:
-                    self.parent.logger.info(
-                        f"TikTok is not sending results beyond this point "
-                        f"(last page held {page_size})."
-                    )
-                    self._exhausted_listing = True
-                    has_more = False
-
-            if not has_more:
-                break
-
-            # Give up early if scrolling stops producing new results rather than
-            # scrolling all the way to the hard limit.
-            if yielded_this_round == 0:
-                empty_rounds += 1
-                if empty_rounds >= max_empty_rounds:
-                    self.parent.logger.info(
-                        "No new search results after repeated scrolls, stopping."
-                    )
-                    return
-            else:
-                empty_rounds = 0
-
-            await self.parent.request_delay()
-            scroll_attempts += 1
+                    # Only a short page is trusted when it says the listing is over (see
+                    # _note_page_size). An empty or exactly-full page saying the same is as
+                    # likely to be TikTok stalling us, so leave those to the walk's stall
+                    # check, which gives the page a few more scrolls to recover.
+                    short_page = self._note_page_size(len(results))
+                    if not res.get("has_more", 0) and short_page:
+                        self._exhausted_listing = True
+                        rnd.stop = True
+        finally:
+            self.parent.logger.info(
+                f"search {obj_type} '{self.search_term}': walked {yielded} results, "
+                f"{walk.summary()}"
+            )
 
     def _yield_results(self, obj_type, res, with_id=False):
         """Build User/Video objects from a search response payload."""

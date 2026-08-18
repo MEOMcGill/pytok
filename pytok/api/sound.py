@@ -19,6 +19,11 @@ from ..exceptions import *
 from ..helpers import extract_tag_contents
 
 
+# The sound feed's items, used both to wait for the feed and to report how far it has
+# grown during a scroll walk.
+MUSIC_ITEM_SELECTOR = '[data-e2e=music-item]'
+
+
 class Sound(Base):
     """
     A TikTok Sound/Music/Song.
@@ -130,7 +135,7 @@ class Sound(Base):
 
         if music_info is None:
             await self.wait_for_content_or_unavailable_or_captcha(
-                '[data-e2e=music-item]', 'Not available'
+                MUSIC_ITEM_SELECTOR, 'Not available'
             )
             await self.check_and_close_signin()
 
@@ -395,7 +400,7 @@ class Sound(Base):
         await self._navigate_to_sound_page()
         await self.check_and_wait_for_captcha()
         await self.check_and_close_signin()
-        if not await self._is_selector_visible('[data-e2e=music-item]'):
+        if not await self._is_selector_visible(MUSIC_ITEM_SELECTOR):
             self.parent.logger.warning(
                 "Sound video grid not visible yet (TikTok requires login for this "
                 "feed; pass a logged-in user_data_dir if you get no results)."
@@ -410,7 +415,6 @@ class Sound(Base):
         API route can't take over. Returns (items, has_more, cursor) so pagination
         continues from where the page's own requests left off.
         """
-        page = self.parent._page
         items = []
         has_more = True
         cursor = 0
@@ -444,7 +448,7 @@ class Sound(Base):
             if not has_more or attempt == attempts - 1:
                 break
             await self.check_and_wait_for_captcha()
-            await page.evaluate('window.scrollBy(0, window.innerHeight * 4)')
+            await self.scroll_feed(MUSIC_ITEM_SELECTOR)
             await asyncio.sleep(2.5)
 
         return items, has_more, cursor
@@ -472,57 +476,29 @@ class Sound(Base):
 
     async def _scroll_for_videos(self):
         """Scroll the loaded sound page, yielding videos from each new response."""
-        page = self.parent._page
+        yielded = 0
+        walk = self.scroll_walk("api/music/item_list", MUSIC_ITEM_SELECTOR,
+                                before_round=self.check_and_wait_for_captcha)
+        try:
+            async for rnd in walk.rounds():
+                for resp in rnd.responses:
+                    res = self._parse_response(resp)
+                    if res is None:
+                        walk.stats['unusable_responses'] += 1
+                        continue
 
-        has_more = True
-        scroll_attempts = 0
-        max_scroll_attempts = 30
-        empty_rounds = 0
-        max_empty_rounds = 5
+                    videos = res.get("itemList", [])
+                    rnd.produced += len(videos)
+                    for video in videos:
+                        yielded += 1
+                        yield self.parent.video(data=video)
 
-        while has_more and scroll_attempts < max_scroll_attempts:
-            await self.check_and_wait_for_captcha()
-
-            # Scroll first so the lazily-loaded item_list request fires, then give
-            # its response body time to be captured before reading it.
-            yielded_this_round = 0
-            await page.evaluate('window.scrollBy(0, window.innerHeight * 4)')
-            await asyncio.sleep(3)
-            await self.check_and_resolve_refresh_button()
-
-            video_responses = await self.parent.process_pending_responses("api/music/item_list")
-            for resp in video_responses:
-                res = self._parse_response(resp)
-                if res is None:
-                    continue
-
-                for video in res.get("itemList", []):
-                    yielded_this_round += 1
-                    yield self.parent.video(data=video)
-
-                if not res.get("hasMore", False):
-                    self.parent.logger.info(
-                        "TikTok isn't sending more TikToks beyond this point."
-                    )
-                    has_more = False
-
-            if not has_more:
-                break
-
-            # Give up early if scrolling stops producing new videos (e.g. the
-            # feed is login-walled) rather than scrolling to the hard limit.
-            if yielded_this_round == 0:
-                empty_rounds += 1
-                if empty_rounds >= max_empty_rounds:
-                    self.parent.logger.info(
-                        "No new sound videos after repeated scrolls, stopping."
-                    )
-                    return
-            else:
-                empty_rounds = 0
-
-            await self.parent.request_delay()
-            scroll_attempts += 1
+                    if 'hasMore' in res:
+                        rnd.stop = not res['hasMore']
+        finally:
+            self.parent.logger.info(
+                f"sound {self.id}: walked {yielded} videos, {walk.summary()}"
+            )
 
     def __extract_from_data(self):
         data = self.as_dict or {}

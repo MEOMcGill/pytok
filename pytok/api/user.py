@@ -22,6 +22,10 @@ from .base import Base
 # Only consulted when TikTok never said the listing ended -- see _iter_videos.
 LISTING_MIN_COVERAGE = 0.9
 
+# The profile grid's items, which is both what we wait for on load and how a scroll round
+# reports how far the grid has grown.
+POST_ITEM_SELECTOR = '[data-e2e="user-post-item"]'
+
 
 class User(Base):
     """
@@ -234,7 +238,7 @@ class User(Base):
 
         # Wait for video items using base class method (handles refresh button, captcha, login popup)
         await self.wait_for_content_or_unavailable_or_captcha(
-            '[data-e2e="user-post-item"]',
+            POST_ITEM_SELECTOR,
             "Couldn't find this account",
             no_content_text=["No content", "This account is private", "Log in to TikTok"]
         )
@@ -543,7 +547,7 @@ class User(Base):
 
         # Wait for video items using base class method (handles refresh button, captcha, login popup)
         await self.wait_for_content_or_unavailable_or_captcha(
-            '[data-e2e="user-post-item"]',
+            POST_ITEM_SELECTOR,
             "Couldn't find this account",
             no_content_text=["No content", "This account is private", "Log in to TikTok"]
         )
@@ -691,85 +695,77 @@ class User(Base):
         return all_videos, finished, cursor
 
     async def _get_videos_scroll(self, count, seen_ids=None, amount_yielded=0):
-        """Scroll to load more videos using zendriver.
+        """Scroll the profile page, yielding videos out of each item_list response.
 
         Most walks end up here, because item_list is the route TikTok blocks first, so how
         this loop decides to stop sets how deep a walk can get. Two of its stopping
         conditions used to be indistinguishable from reaching the end of a profile; only this
         loop knows which one fired, so it records that in `_listing_exhausted`.
+
+        Each round is one page.evaluate and a wait for the response that scroll asked for.
+        Nothing here may reach for zendriver's element API: its cost grows with the square
+        of the grid, which set the real ceiling on how deep a walk could get (see
+        base._SCROLL_FEED_JS). Waiting for the response rather than sleeping a flat
+        interval is what makes a round cost what the network costs, and it also says
+        whether the page asked for a page at all -- a feed that stopped asking needs
+        nudging, not more patience.
         """
-        page = self.parent._page
         if seen_ids is None:
             seen_ids = set()
 
-        has_more = True
-        scroll_attempts = 0
         # A bounded walk stops at `count` anyway; an unbounded one wants the whole profile,
-        # which 30 scrolls caps at a few hundred videos. The no-new-videos check below is the
-        # real terminator, so this is only a backstop against scrolling a page that never ends.
-        max_scroll_attempts = 30 if count else 400
-        no_new_videos_count = 0
-        last_video_count = amount_yielded
+        # which 30 scrolls caps at a few hundred videos. The walk's own stall check is the
+        # real terminator, so this is only a backstop against a page that never ends.
+        walk = self.scroll_walk('api/post/item_list', POST_ITEM_SELECTOR,
+                                max_rounds=30 if count else 400)
+        try:
+            async for rnd in walk.rounds():
+                fresh = []
+                for resp in rnd.responses:
+                    body = resp.get('body') or ''
+                    if not body:
+                        # A bot-blocked listing is a 200 with nothing in it. Tallied rather
+                        # than passed over in silence, because it is the signal that tells a
+                        # short walk that was blocked from one that was finished.
+                        walk.stats['empty_listing_responses'] += 1
+                        continue
+                    try:
+                        data = json.loads(body) if isinstance(body, str) else body
+                    except Exception as ex:
+                        walk.stats['unparseable_responses'] += 1
+                        self.parent.logger.debug(f"Error processing video response: {ex}")
+                        continue
 
-        while scroll_attempts < max_scroll_attempts and has_more:
-            # Scroll down
-            await page.evaluate('window.scrollBy(0, window.innerHeight * 3)')
-            await asyncio.sleep(2)
-
-            # Check for refresh button that may appear during scrolling
-            await self.check_and_resolve_refresh_button()
-
-            # Process any pending responses
-            video_responses = await self.parent.process_pending_responses('api/post/item_list')
-
-            for resp in video_responses:
-                body = resp.get('body', '')
-                if not body:
-                    continue
-
-                try:
-                    data = json.loads(body) if isinstance(body, str) else body
-                    item_list = data.get('itemList', [])
-                    for item in item_list:
+                    for item in data.get('itemList', []):
                         video_id = item.get('id')
                         if video_id and video_id not in seen_ids:
                             seen_ids.add(video_id)
-                            amount_yielded += 1
-                            yield self.parent.video(data=item)
-
-                            if count and amount_yielded >= count:
-                                return
+                            fresh.append(item)
 
                     # Only believe hasMore when TikTok actually sent it. Defaulting to False
                     # ended the walk on any response arriving without it -- which is what an
                     # empty bot-blocked body looks like.
                     if 'hasMore' in data:
-                        has_more = data['hasMore']
-                except Exception as e:
-                    self.parent.logger.debug(f"Error processing video response: {e}")
+                        rnd.stop = not data['hasMore']
 
-            current_count = amount_yielded
-            if current_count == last_video_count:
-                no_new_videos_count += 1
-                if no_new_videos_count >= 5:
-                    self.parent.logger.info("No new videos found after multiple scrolls, stopping")
-                    break
-            else:
-                no_new_videos_count = 0
+                rnd.produced = len(fresh)
+                for item in fresh:
+                    amount_yielded += 1
+                    yield self.parent.video(data=item)
+                    if count and amount_yielded >= count:
+                        walk.reason = 'reached the requested count'
+                        return
 
-            last_video_count = current_count
-            scroll_attempts += 1
-
-        # Only a hasMore=false answer means the profile ran out. Giving up because the page
-        # stopped producing new videos, or because the backstop above ran out of scrolls, is a
-        # walk that was cut off -- _iter_videos raises on that so the pool retries the handle
-        # on a fresh session instead of recording a partial profile as fully collected.
-        if not has_more:
-            self._listing_exhausted = True
-        else:
+            # Only a hasMore=false answer means the profile ran out. Giving up because the
+            # page stopped producing new videos, or because the backstop above ran out of
+            # scrolls, is a walk that was cut off -- _iter_videos raises on that so the pool
+            # retries the handle on a fresh session instead of recording a partial profile as
+            # fully collected.
+            if walk.listing_ended:
+                self._listing_exhausted = True
+        finally:
             self.parent.logger.info(
-                f"Stopped scrolling @{self.username} after {scroll_attempts} scrolls with "
-                f"{amount_yielded} videos while TikTok still reported more available"
+                f"@{self.username}: walked {amount_yielded} videos, {walk.summary()}"
             )
 
     def liked(self, count: int = 30, cursor: int = 0, **kwargs) -> Iterator[Video]:
