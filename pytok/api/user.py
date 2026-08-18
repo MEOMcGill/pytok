@@ -238,6 +238,10 @@ class User(Base):
             "Couldn't find this account",
             no_content_text=["No content", "This account is private", "Log in to TikTok"]
         )
+        # The grid's own listing response has landed by now, and nothing reads it until the
+        # caller asks for videos -- which may be a captcha solve and a page of work away.
+        # Bank it here so it is ours rather than Chrome's for that whole gap.
+        await self.parent.collect_pending_response_bodies()
 
         user = None
 
@@ -531,8 +535,11 @@ class User(Base):
         await asyncio.sleep(3)  # Brief wait for dynamic content
         self.parent.logger.debug(f"Page loaded for scraping videos")
 
-        # Process any pending responses
-        await self.parent.process_pending_responses()
+        # Bank what the page has fetched so far. Draining it instead would throw away this
+        # page's own listing response, which on a profile whose grid fits in one page is
+        # the only one there will ever be -- nothing further is lazy-loaded for the scroll
+        # below to pick up.
+        await self.parent.collect_pending_response_bodies()
 
         # Wait for video items using base class method (handles refresh button, captcha, login popup)
         await self.wait_for_content_or_unavailable_or_captcha(
@@ -540,6 +547,7 @@ class User(Base):
             "Couldn't find this account",
             no_content_text=["No content", "This account is private", "Log in to TikTok"]
         )
+        await self.parent.collect_pending_response_bodies()
 
         # Get initial videos from page HTML (like the working example)
         videos = []

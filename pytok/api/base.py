@@ -120,6 +120,11 @@ class Base:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         while loop.time() < deadline:
+            # A response body only lives in Chrome until it decides to drop it, so bank
+            # them as they finish rather than at the end of the wait: the listing the page
+            # fetches on load is often the only copy there is, and this wait can run for
+            # tens of seconds beside it.
+            await self.parent.collect_pending_response_bodies()
             if fallback is not None and await fallback():
                 return
             try:
