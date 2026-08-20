@@ -67,6 +67,12 @@ RATE_LIMIT_MINUTES = 15
 # page that will not finish loading for this session -- otherwise repeats it on every
 # handle forever, pinning the worker to one account.
 MAX_INPLACE_REBUILDS = 3
+# How long a session teardown may take before it is abandoned. Every CDP call awaits its
+# reply on an unbounded future, so a browser that dies mid-teardown can hang shutdown for
+# good -- and with it the worker, which then never reaches the release in rotate_account and
+# leaves its account marked in_use with nothing able to reclaim it. Abandoning the teardown
+# may orphan the browser process, which is the lesser loss.
+SESSION_CLOSE_TIMEOUT = 30
 
 
 class Worker:
@@ -296,29 +302,42 @@ class Worker:
         cooldown expires (via get_available_or_wait), giving the periodic-rest
         behaviour rather than crashing.
         """
-        await self._close_session()
-        if self.current_account:
-            await self.pool.lock_until(
-                self.current_account.username,
-                f"datetime('now', '+{cooldown_minutes} minutes')",
-            )
-            await self.pool.release_account(self.current_account.username)
-            logger.info(f"Worker {self.id} rested {self.current_account.username} "
-                        f"({cooldown_minutes}m)")
-            self.current_account = None
-        self.tasks_done = 0
-        self._initialized = False
+        # The cooldown and release run whatever the teardown did: a worker that cannot
+        # close its browser must still give the account back, or the account stays in_use
+        # and no worker -- this one included -- can ever be handed it again.
+        try:
+            await self._close_session()
+        finally:
+            if self.current_account:
+                await self.pool.lock_until(
+                    self.current_account.username,
+                    f"datetime('now', '+{cooldown_minutes} minutes')",
+                )
+                await self.pool.release_account(self.current_account.username)
+                logger.info(f"Worker {self.id} rested {self.current_account.username} "
+                            f"({cooldown_minutes}m)")
+                self.current_account = None
+            self.tasks_done = 0
+            self._initialized = False
 
         if not await self._acquire(wait=True):
             raise NoAccountError(f"Worker {self.id}: no account for rotation")
 
     async def _close_session(self):
-        if self.api is not None:
-            try:
-                await self.api.shutdown()  # release_on_shutdown=False: keeps account
-            except Exception:
-                pass
-            self.api = None
+        if self.api is None:
+            return
+        # Drop the reference first, so an abandoned teardown can't be re-entered by the
+        # rebuild that follows.
+        api, self.api = self.api, None
+        try:
+            # release_on_shutdown=False: keeps the account
+            await asyncio.wait_for(api.shutdown(), timeout=SESSION_CLOSE_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.error(f"Worker {self.id}: session teardown for {self._acct_name()} did "
+                         f"not finish in {SESSION_CLOSE_TIMEOUT}s; abandoning it (the "
+                         f"browser process may be left running)")
+        except Exception:
+            pass
 
     async def _release_current(self):
         if self.current_account:
