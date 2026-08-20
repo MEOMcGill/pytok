@@ -269,7 +269,15 @@ class AccountsPool:
         q = f"SELECT username FROM accounts WHERE {self._id_cond(username)} AND in_use = false"
         return await self._get_and_mark_in_use(q)
 
-    async def get_available_or_wait(self, poll: float = 5.0) -> Account | None:
+    async def get_available_or_wait(self, poll: float = 5.0,
+                                    remind_after: float = 300.0) -> Account | None:
+        """Wait for an account to come free, reporting periodically while it doesn't.
+
+        The reminder matters more than it looks: a wait past the longest cooldown means
+        something is holding an account it will never give back, and a wait logged once is
+        indistinguishable in the log from a run that finished quietly.
+        """
+        waited = 0.0
         msg_shown = False
         while True:
             account = await self.get_available()
@@ -281,15 +289,24 @@ class AccountsPool:
             if self._raise_when_no_account:
                 raise NoAccountError("No account available")
 
-            if not msg_shown:
+            if not msg_shown or waited >= remind_after:
                 nat = await self.next_available_at()
-                if not nat:
+                if not nat and not msg_shown:
                     logger.warning("No active accounts. Stopping...")
                     return None
-                logger.info(f"No account available. Next available at {nat}")
+                if msg_shown:
+                    stats = await self.stats()
+                    logger.warning(
+                        f"Still no account after {waited / 60:.0f}m (next available "
+                        f"{nat or 'never'}); pool: {stats}"
+                    )
+                else:
+                    logger.info(f"No account available. Next available at {nat}")
                 msg_shown = True
+                waited = 0.0
 
             await asyncio.sleep(poll)
+            waited += poll
 
     async def next_available_at(self):
         qs = """
