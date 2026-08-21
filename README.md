@@ -137,6 +137,55 @@ if __name__ == "__main__":
 
 Please do not hesitate to make an issue in this repo to get our help with this!
 
+## Scraping from a physical Android phone
+
+`pytok.phone` is a third data route, alongside the API requests and the desktop browser:
+it drives **Chrome on a real handset** over `adb` + the Chrome DevTools Protocol, reading
+TikTok's mobile web. The phone presents a genuine mobile fingerprint that no desktop
+stealth patch reproduces, and in testing an anonymous phone session returned a full
+listing with no captcha and no login.
+
+```py
+import asyncio
+from pytok.phone import PhoneTikTok, list_serials
+
+async def main():
+    serials = await list_serials()          # phones in adb state "device"
+    async with PhoneTikTok(serials[0]) as phone:
+        user = await phone.user_info("therock")
+        videos = await phone.user_videos("therock")
+        print(user["followerCount"], len(videos))
+
+asyncio.run(main())
+```
+
+`user_info()` returns the same dict shape as `User.info()`, and `user_videos()` returns raw
+`itemList` dicts that go straight into `utils.get_video_df` — so phone-sourced rows join
+cleanly with rows from the other routes.
+
+Phones can live on a remote host (one SSH hop) and are configured by argument or env var:
+
+```bash
+PYTOK_PHONE_SSH=meo-laptop PYTOK_ADB='C:\platform-tools\adb.exe' \
+    python examples/phone_example.py therock
+```
+
+Drive several at once by giving each its own `cdp_port`.
+
+**Two limits worth knowing before you plan a crawl around this.** Phones on one WiFi share
+a single egress IP and TikTok's burst limits are largely IP-level, so N handsets do *not*
+give N times the rate-limit headroom — only SIMs or proxies would. And mobile web serves
+one `item_list` page (~35 videos) per profile, with no infinite scroll to drive.
+`user_videos()` logs when it hits that ceiling rather than passing a truncated listing off
+as a complete one. Use this route for breadth across many profiles, not depth on one.
+
+Fetching the next page yourself from inside the page does not work, and the module
+docstring records the measurements in full so nobody re-derives them: TikTok's SDK really
+does re-sign an injected `fetch` (`X-Bogus`/`X-Gnarly` appear on the wire), the request
+headers are identical to the app's own, and `msToken` is not a single-use nonce — yet the
+app's request returns ~82 KB and an identical injected one returns an empty 200. Depth
+needs a logged-in session, not better request forgery.
+
 ## Citation
 
 If you use this library in your research, please cite it using the following BibTeX entry:

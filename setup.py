@@ -32,6 +32,7 @@ setuptools.setup(
         "zendriver",
         "requests",
         "httpx",
+        "websockets",
         "brotli",
         "opencv-python",
         "numpy",

@@ -8,3 +8,5 @@ tqdm
 pyvirtualdisplay
 pandas
 polars
+httpx
+websockets
