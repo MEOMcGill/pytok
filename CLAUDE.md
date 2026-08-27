@@ -41,12 +41,16 @@ conda run -n <env> python <script>
 # Install the test and lint tooling
 pip install -e '.[test,lint]'
 
-# Run tests. Only tests/test_accounts_worker.py is offline; the rest drive a
-# real browser and need a logged-in account from the pool.
+# Run tests. Live tests are marked `live` and deselected by default, so this
+# runs only the offline ones.
 conda run -n <env> pytest tests/
 
-# Run single test
-conda run -n <env> pytest tests/test_user.py::test_user_videos
+# Run a single test. A live test needs `-m live` even when named directly,
+# otherwise the default deselection drops it and nothing runs.
+conda run -n <env> pytest tests/test_user.py::test_user_videos -m live
+
+# Run the live tests (real browser + a logged-in pool account)
+conda run -n <env> pytest tests/ -m live
 
 # Lint
 ruff check pytok/ tests/ examples/
