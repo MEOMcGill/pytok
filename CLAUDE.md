@@ -33,7 +33,7 @@ All operations are async/await based.
 
 ```bash
 # Install
-pip install git+https://github.com/networkdynamics/pytok.git@master
+pip install git+https://github.com/MEOMcGill/pytok.git@master
 
 # Run scripts (using a conda environment)
 conda run -n <env> python <script>

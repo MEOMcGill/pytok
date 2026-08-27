@@ -11,6 +11,10 @@ This is a zendriver based version of David Teacher's unofficial api wrapper for 
 pip install git+https://github.com/MEOMcGill/pytok.git@master
 ```
 
+> [!WARNING]
+> Install from this repository, not from PyPI. The `pytok` name on PyPI belongs to
+> an unrelated project, so `pip install pytok` will get you different software.
+
 ## Quick Start Guide
 
 Scrape as a logged-in account, acquired from an **accounts pool**. Anonymous sessions barely work any more — TikTok returns empty responses to most endpoints without a login — so this is the supported way to use PyTok. Register and log in an account **once** (see [Accounts, login, and persistent sessions](#accounts-login-and-persistent-sessions) below), then every run comes up already authenticated:
@@ -20,7 +24,7 @@ python -m pytok.accounts.cli add   --username you@email.com --password 'your-pas
 python -m pytok.accounts.cli login --username you@email.com
 ```
 
-Here's a quick bit of code to get the videos from a particular user on TikTok. There's more examples in the [examples](https://github.com/networkdynamics/pytok/tree/master/examples) directory.
+Here's a quick bit of code to get the videos from a particular user on TikTok. There's more examples in the [examples](https://github.com/MEOMcGill/pytok/tree/master/examples) directory.
 
 ```py
 import asyncio
@@ -133,7 +137,7 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-`max_workers` is capped to the number of active accounts. Workers rotate/rest accounts and rebuild crashed sessions automatically. See [`examples/worker_pool_example.py`](https://github.com/networkdynamics/pytok/tree/master/examples/worker_pool_example.py).
+`max_workers` is capped to the number of active accounts. Workers rotate/rest accounts and rebuild crashed sessions automatically. See [`examples/worker_pool_example.py`](https://github.com/MEOMcGill/pytok/tree/master/examples/worker_pool_example.py).
 
 Please do not hesitate to make an issue in this repo to get our help with this!
 

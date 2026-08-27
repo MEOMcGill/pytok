@@ -1,10 +1,2 @@
-zendriver
-TikTokApi
-requests
-brotli
-opencv-python
-numpy
-tqdm
-pyvirtualdisplay
-pandas
-polars
+# Dependencies are declared in pyproject.toml; this installs the package itself.
+-e .
