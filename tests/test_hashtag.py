@@ -1,9 +1,9 @@
 import asyncio
 import contextlib
 
-from pytok.tiktok import PyTok
 from pytok.accounts import AccountsPool
 from pytok.exceptions import ApiFailedException, NoContentException
+from pytok.tiktok import PyTok
 
 hashtag_name = 'funny'
 missing_hashtag_name = 'awndoanwoidnawoidnaw'

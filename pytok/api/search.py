@@ -9,10 +9,10 @@ from urllib.parse import parse_qs, urlparse
 
 from zendriver import cdp
 
+from ..exceptions import *
+from .base import Base
 from .user import User
 from .video import Video
-from .base import Base
-from ..exceptions import *
 
 if TYPE_CHECKING:
     from ..tiktok import PyTok

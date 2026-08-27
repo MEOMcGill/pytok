@@ -1,14 +1,8 @@
 from __future__ import annotations
 
-import logging
-from urllib.parse import urlencode
+from typing import TYPE_CHECKING, Iterator, Optional
 
 from .video import Video
-from .sound import Sound
-from .user import User
-from .hashtag import Hashtag
-
-from typing import TYPE_CHECKING, Iterator, Optional
 
 if TYPE_CHECKING:
     from ..tiktok import PyTok

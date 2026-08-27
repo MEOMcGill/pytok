@@ -15,8 +15,8 @@ import asyncio
 import json
 import logging
 
-from pytok.tiktok import PyTok
 from pytok.accounts import AccountsPool
+from pytok.tiktok import PyTok
 
 
 async def scrape_sound(sound_id, count, output, account_username, headless):

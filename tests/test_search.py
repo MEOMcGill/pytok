@@ -1,7 +1,7 @@
 import asyncio
 
-from pytok.tiktok import PyTok
 from pytok.accounts import AccountsPool
+from pytok.tiktok import PyTok
 
 search_term = 'news'
 

@@ -49,6 +49,16 @@ dependencies = [
     "tabulate",
 ]
 
+[project.optional-dependencies]
+test = [
+    "pytest",
+    "pytest-asyncio",
+    "matplotlib",
+]
+lint = [
+    "ruff",
+]
+
 [project.urls]
 Homepage = "https://github.com/MEOMcGill/pytok"
 Repository = "https://github.com/MEOMcGill/pytok"
@@ -56,3 +66,24 @@ Issues = "https://github.com/MEOMcGill/pytok/issues"
 
 [tool.setuptools.packages.find]
 include = ["pytok*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B"]
+ignore = [
+    "E501",  # long lines are pervasive here; reflowing them is churn, not a fix
+    # The api modules re-export via star imports. Cleaning that up is a real
+    # refactor, so the resulting undefined-name noise stays off for now.
+    "F403",
+    "F405",
+    "B904",  # `raise ... from err` inside the API-fallback handlers
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Imports follow a runtime patch that has to be applied first.
+"pytok/tiktok.py" = ["E402"]
