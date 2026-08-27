@@ -40,6 +40,11 @@ def _apostrophe_variants(texts):
 # has grown during a scroll walk.
 CHALLENGE_ITEM_SELECTOR = '[data-e2e=challenge-item]'
 
+# A hashtag listing is only ended by the walk's stall check, so this is a backstop against
+# a feed that never stops producing rather than a budget. It used to be left at
+# scroll_walk's default of 30, which capped a busy tag at ~30 pages however much it held.
+_UNBOUNDED_MAX_ROUNDS = 400
+
 
 class Hashtag(Base):
     """
@@ -582,6 +587,7 @@ class Hashtag(Base):
         """Scroll the loaded hashtag page, yielding videos from each new response."""
         yielded = 0
         walk = self.scroll_walk("api/challenge/item_list", CHALLENGE_ITEM_SELECTOR,
+                                max_rounds=_UNBOUNDED_MAX_ROUNDS,
                                 before_round=self.check_and_wait_for_captcha)
         try:
             async for rnd in walk.rounds():
@@ -597,8 +603,13 @@ class Hashtag(Base):
                         yielded += 1
                         yield self.parent.video(data=video)
 
-                    if 'hasMore' in res:
-                        rnd.stop = not res['hasMore']
+                    # hasMore=0 is counted, never obeyed: TikTok sends it on short pages
+                    # well inside a listing that then keeps serving, so ending the walk on
+                    # it stops a busy tag at a fraction of its depth. The walk's stall
+                    # check costs a handful of quiet rounds and is the only thing here that
+                    # can tell an exhausted listing from a throttled one.
+                    if not res.get('hasMore', 1):
+                        walk.stats['pages_saying_no_more'] += 1
         finally:
             self.parent.logger.info(f"#{self.name}: walked {yielded} videos, {walk.summary()}")
 

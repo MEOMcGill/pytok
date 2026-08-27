@@ -381,11 +381,23 @@ class Base:
         )
 
     async def _is_captcha_visible(self):
-        """Check if any captcha text is visible."""
-        for text in CAPTCHA_TEXTS:
-            if await self._is_text_visible(text):
-                return True
-        return False
+        """Whether any captcha's text is on the page.
+
+        One page.evaluate over the rendered text rather than a DOM search per string.
+        zendriver's find() fetches and walks the document once per call, so on a feed that
+        has scrolled to a few hundred items this check cost seconds -- and a scroll walk
+        charges it to every round. Falls back to the per-string search if the page will not
+        evaluate, which is itself a state worth not guessing about.
+        """
+        js = ("(() => { const t = document.body ? document.body.innerText : ''; "
+              "return %s.some(s => t.includes(s)); })()" % json.dumps(CAPTCHA_TEXTS))
+        try:
+            return bool(await self.parent._page.evaluate(js))
+        except Exception:
+            for text in CAPTCHA_TEXTS:
+                if await self._is_text_visible(text):
+                    return True
+            return False
 
     async def check_initial_call(self, url):
         # For zendriver, we check responses via CDP - wait a bit for navigation
