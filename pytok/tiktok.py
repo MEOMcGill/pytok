@@ -112,7 +112,7 @@ class PyTok:
             This is used to throttle your own requests as you may end up making too
             many requests to TikTok for your IP.
 
-        * num_sessions: Number of browser sessions to create (used by TikTok-Api), optional
+        * num_sessions: Number of browser sessions to create (used by the API client), optional
 
         * user_data_dir: Path to Chrome user data directory for profile persistence, optional
             If not provided, uses a fresh profile each session. Set to your Chrome
@@ -204,7 +204,7 @@ class PyTok:
 
         self.request_cache = {}
 
-        # Create zendriver-based TikTokApi instance for API requests
+        # Create the zendriver-based API client
         self.tiktok_api = ZendriverTikTokApi(
             logging_level=logging_level
         )
@@ -520,7 +520,7 @@ class PyTok:
         return cls(account=account, accounts_pool=accounts_pool, **kwargs)
 
     async def _inject_visibility_into_sessions(self):
-        """Inject visibility API overrides into all TikTok-Api sessions.
+        """Inject visibility API overrides into all API client sessions.
 
         Uses CDP add_script_to_evaluate_on_new_document so overrides apply on
         future navigations. Does NOT call evaluate() on the current page to
@@ -626,7 +626,7 @@ class PyTok:
             refresh_zendriver: If True, navigate the main page back to
                 TikTok.com to refresh cookies. Defaults to True.
         """
-        self.logger.info("Refreshing TikTok-Api session...")
+        self.logger.info("Refreshing API session...")
 
         # Optionally refresh cookies by navigating the main page
         if refresh_zendriver:
@@ -920,7 +920,7 @@ class PyTok:
         return None
 
     async def _refresh_api_tokens(self):
-        """Refresh msToken on TikTok-Api sessions after login.
+        """Refresh msToken on API client sessions after login.
 
         Since the browser is shared, cookies are already shared across all tabs.
         We just need to update each session's ms_token field.

@@ -296,7 +296,7 @@ class Video(Base):
         }
 
         while count is None or amount_yielded < count:
-            self.parent.logger.debug(f"Making TikTok-Api request for related videos")
+            self.parent.logger.debug(f"Making API request for related videos")
             try:
                 res = await self.parent.tiktok_api.make_request(
                     url="https://www.tiktok.com/api/related/item_list/",
@@ -304,10 +304,10 @@ class Video(Base):
                 )
             except Exception as e:
                 self.parent.logger.warning(f"make_request failed for related videos: {e}")
-                raise exceptions.ApiFailedException(f"TikTok-Api make_request failed: {e}")
+                raise exceptions.ApiFailedException(f"API request failed: {e}")
 
             if res is None:
-                raise exceptions.ApiFailedException("TikTok-Api returned None response")
+                raise exceptions.ApiFailedException("API returned None response")
 
             if res.get('type') == 'verify':
                 raise exceptions.ApiFailedException("TikTok API is asking for verification")
@@ -579,7 +579,7 @@ class Video(Base):
             cookie_result = await self.parent._page.send(cdp.network.get_cookies())
             cookies = {cookie.name: cookie.value for cookie in cookie_result}
 
-            # Get headers from TikTok-Api session
+            # Get headers from the API client session
             _, session = self.parent.tiktok_api._get_session()
             headers = dict(session.headers)
 
@@ -637,7 +637,7 @@ class Video(Base):
                 'root_referer': 'https://www.tiktok.com/',
             }
 
-            self.parent.logger.debug(f"Making TikTok-Api request for comments with cursor={cursor}")
+            self.parent.logger.debug(f"Making API request for comments with cursor={cursor}")
             try:
                 res = await self.parent.tiktok_api.make_request(
                     url="https://www.tiktok.com/api/comment/list/",
@@ -645,10 +645,10 @@ class Video(Base):
                 )
             except Exception as e:
                 self.parent.logger.warning(f"make_request failed for comments: {e}")
-                raise exceptions.ApiFailedException(f"TikTok-Api make_request failed: {e}")
+                raise exceptions.ApiFailedException(f"API request failed: {e}")
 
             if res is None:
-                raise exceptions.ApiFailedException("TikTok-Api returned None response")
+                raise exceptions.ApiFailedException("API returned None response")
 
             if res.get('type') == 'verify':
                 raise exceptions.ApiFailedException("TikTok API is asking for verification")
@@ -846,7 +846,7 @@ class Video(Base):
         cookie_result = await self.parent._page.send(cdp.network.get_cookies())
         cookies = {cookie.name: cookie.value for cookie in cookie_result}
 
-        # Get headers from TikTok-Api session
+        # Get headers from the API client session
         _, session = self.parent.tiktok_api._get_session()
         headers = dict(session.headers)
         headers['referer'] = 'https://www.tiktok.com/'

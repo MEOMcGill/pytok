@@ -109,13 +109,13 @@ class User(Base):
         try:
             return await self._info_full_api(**kwargs)
         except ApiFailedException as ex:
-            self.parent.logger.warning(f"TikTok-Api user.info_full() failed: {ex}. Falling back to scraping method.")
+            self.parent.logger.warning(f"API user info request failed: {ex}. Falling back to scraping method.")
             self._used_api_for_info = False
             return await self._info_full_scrape(**kwargs)
 
     async def _info_full_api(self, **kwargs) -> dict:
-        # Call TikTok API directly instead of using TikTok-Api's user.info()
-        # to handle empty/invalid responses ourselves
+        # Call the user detail endpoint directly so empty/invalid responses
+        # are handled here rather than raising from the client
         url_params = {
             "secUid": self.sec_uid if self.sec_uid else "",
             "uniqueId": self.username,
@@ -412,7 +412,7 @@ class User(Base):
             )
 
     async def _iter_videos_inner(self, count=None, batch_size=100, prefer_scraping=False, **kwargs) -> Iterator[Video]:
-        # If user info was obtained via TikTok-Api, use API for videos directly
+        # If user info came from the API, use the API for videos directly
         # If user info was scraped (page already loaded), get initial videos from page first
         amount_yielded = 0
         if not self._used_api_for_info:
@@ -457,7 +457,6 @@ class User(Base):
 
 
     async def _get_videos_api(self, count=None, cursor=0, **kwargs) -> Iterator[Video]:
-        # Use TikTok-Api's make_request method instead of manual requests
         self.parent.logger.debug(f"Starting _get_videos_api with cursor={cursor}, count={count}")
         amount_yielded = 0
 
@@ -469,8 +468,7 @@ class User(Base):
                 'coverFormat': 2,  # Browser sends this parameter
             }
 
-            self.parent.logger.debug(f"Making TikTok-Api request with cursor={cursor}")
-            # Use TikTok-Api's make_request which handles signing and headers
+            self.parent.logger.debug(f"Making API request with cursor={cursor}")
             try:
                 res = await self.parent.tiktok_api.make_request(
                     url="https://www.tiktok.com/api/post/item_list/",
@@ -480,11 +478,11 @@ class User(Base):
                 # Convert any exception from make_request to ApiFailedException
                 # to trigger fallback to scraping method
                 self.parent.logger.warning(f"make_request failed: {e}")
-                raise ApiFailedException(f"TikTok-Api make_request failed: {e}")
-            self.parent.logger.debug(f"TikTok-Api response received with {len(res.get('itemList', []))} videos")
+                raise ApiFailedException(f"API request failed: {e}")
+            self.parent.logger.debug(f"API response received with {len(res.get('itemList', []))} videos")
 
             if res is None:
-                raise ApiFailedException("TikTok-Api returned None response")
+                raise ApiFailedException("API returned None response")
 
             if res.get('type') == 'verify':
                 raise ApiFailedException("TikTok API is asking for verification")
@@ -495,7 +493,7 @@ class User(Base):
                 status_msg = res.get('statusMsg', 'Unknown error')
                 if status_code in (10101, 209002):
                     if await self.parent._is_logged_in():
-                        raise ApiFailedException("TikTok-Api cannot currently use logged in session to access this content")
+                        raise ApiFailedException("API cannot currently use logged in session to access this content")
                     else:
                         raise LoginException(
                             f"TikTok requires login to view this content: statusCode={status_code}"
@@ -838,7 +836,7 @@ class User(Base):
 
         if "userInfo" in keys:
             user_info = data["userInfo"]
-            # TikTok-Api returns data in userInfo.user structure
+            # The API returns data in the userInfo.user structure
             if "user" in user_info:
                 user = user_info["user"]
                 self.__update_id_sec_uid_username(
