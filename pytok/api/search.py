@@ -172,7 +172,7 @@ class Search(Base):
                 )
             except ApiFailedException as ex:
                 self.parent.logger.warning(
-                    f"TikTok-Api search ({obj_type}) failed: {ex}. Falling back to scraping method."
+                    f"API search ({obj_type}) failed: {ex}. Falling back to scraping method."
                 )
 
         # Scraping route. Loading the search page fires the webapp's own search
@@ -266,10 +266,10 @@ class Search(Base):
                     params=params,
                 )
             except Exception as e:
-                raise ApiFailedException(f"TikTok-Api make_request failed: {e}")
+                raise ApiFailedException(f"API request failed: {e}")
 
             if res is None:
-                raise ApiFailedException("TikTok-Api returned None response")
+                raise ApiFailedException("API returned None response")
 
             if res.get('type') == 'verify':
                 raise ApiFailedException("TikTok API is asking for verification")

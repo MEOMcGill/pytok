@@ -764,7 +764,7 @@ class ZendriverTikTokApi:
                 )
 
                 if result is None:
-                    raise Exception("TikTokApi.run_fetch_script returned None")
+                    raise Exception("run_fetch_script returned None")
 
                 if result == "":
                     raise EmptyResponseException(

@@ -94,7 +94,7 @@ class Sound(Base):
             return await self._info_full_api(**kwargs)
         except ApiFailedException as ex:
             self.parent.logger.warning(
-                f"TikTok-Api sound.info_full() failed: {ex}. Falling back to scraping method."
+                f"API sound info request failed: {ex}. Falling back to scraping method."
             )
             return await self._info_full_scrape(**kwargs)
 
@@ -113,7 +113,7 @@ class Sound(Base):
         except EmptyResponseException:
             raise ApiFailedException("TikTok API returned empty response")
         except Exception as e:
-            raise ApiFailedException(f"TikTok-Api make_request failed: {e}")
+            raise ApiFailedException(f"API request failed: {e}")
 
         if resp is None:
             raise ApiFailedException("TikTok returned None response")
@@ -271,7 +271,7 @@ class Sound(Base):
                 )
             except ApiFailedException as ex:
                 self.parent.logger.warning(
-                    f"TikTok-Api sound.videos() failed: {ex}. Falling back to scraping method."
+                    f"API sound videos request failed: {ex}. Falling back to scraping method."
                 )
 
         # Scraping route. Loading the sound page fires the webapp's own
@@ -325,10 +325,10 @@ class Sound(Base):
                     params=params,
                 )
             except Exception as e:
-                raise ApiFailedException(f"TikTok-Api make_request failed: {e}")
+                raise ApiFailedException(f"API request failed: {e}")
 
             if res is None:
-                raise ApiFailedException("TikTok-Api returned None response")
+                raise ApiFailedException("API returned None response")
 
             if res.get('type') == 'verify':
                 raise ApiFailedException("TikTok API is asking for verification")

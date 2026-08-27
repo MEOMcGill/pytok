@@ -24,7 +24,7 @@ early" is useful. Appending how many handles that affected on a given day is not
 ## Project Overview
 
 PyTok is a TikTok web scraping library using a dual-approach architecture:
-- **Primary**: Uses the TikTok-Api library for API requests
+- **Primary**: Signed requests to TikTok's web API, issued from the browser session (`tiktok_api.py`)
 - **Fallback**: Automatically falls back to browser automation (zendriver) when API fails
 
 All operations are async/await based.
@@ -50,7 +50,7 @@ conda run -n <env> pytest tests/test_user.py::test_user_videos
 ```
 PyTok (tiktok.py)
 ├── zendriver browser - CDP network response tracking
-├── TikTok-Api client - API requests with msToken from browser cookies
+├── ZendriverTikTokApi client - API requests with msToken from browser cookies
 └── Request cache - stores recent API responses
 
 API Classes (api/*.py) - all inherit from Base
