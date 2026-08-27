@@ -1,7 +1,11 @@
 import asyncio
 
-from pytok.tiktok import PyTok
+import pytest
+
 from pytok.accounts import AccountsPool
+from pytok.tiktok import PyTok
+
+pytestmark = pytest.mark.live
 
 # A sound with plenty of videos. Sounds do get taken down — if this test starts
 # returning nothing, grab a fresh id from any video's `music` dict.

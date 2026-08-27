@@ -7,7 +7,7 @@ name = "pytok"
 version = "0.2.0"
 description = "TikTok scraper with automatic captcha solving using zendriver browser automation."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Ben Steel", email = "bendavidsteel@gmail.com" }]
@@ -29,7 +29,6 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
     "Topic :: Scientific/Engineering :: Information Analysis",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -49,6 +48,16 @@ dependencies = [
     "tabulate",
 ]
 
+[project.optional-dependencies]
+test = [
+    "pytest",
+    "pytest-asyncio",
+    "matplotlib",
+]
+lint = [
+    "ruff",
+]
+
 [project.urls]
 Homepage = "https://github.com/MEOMcGill/pytok"
 Repository = "https://github.com/MEOMcGill/pytok"
@@ -56,3 +65,30 @@ Issues = "https://github.com/MEOMcGill/pytok/issues"
 
 [tool.setuptools.packages.find]
 include = ["pytok*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+# Live tests drive a real browser and need a logged-in pool account, so they are
+# excluded by default. Run them with `pytest -m live`.
+addopts = "-m 'not live'"
+markers = [
+    "live: needs a real browser and a logged-in account from the pool",
+]
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B"]
+ignore = [
+    "E501",  # long lines are pervasive here; reflowing them is churn, not a fix
+    # The api modules re-export via star imports. Cleaning that up is a real
+    # refactor, so the resulting undefined-name noise stays off for now.
+    "F403",
+    "F405",
+    "B904",  # `raise ... from err` inside the API-fallback handlers
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Imports follow a runtime patch that has to be applied first.
+"pytok/tiktok.py" = ["E402"]

@@ -1,7 +1,11 @@
 import asyncio
 
-from pytok.tiktok import PyTok
+import pytest
+
 from pytok.accounts import AccountsPool
+from pytok.tiktok import PyTok
+
+pytestmark = pytest.mark.live
 
 # username = "brianjordanalvarez"
 username = 'marierenaudstab'
@@ -16,9 +20,9 @@ async def test_user_videos():
     pool = AccountsPool()
     async with await PyTok.from_pool(pool) as api:
         user = api.user(username=username)
-        user_data = await user.info()
+        await user.info()
         count = 0
-        async for video in api.user(username=username).videos(count=COUNT):
+        async for _ in api.user(username=username).videos(count=COUNT):
             count += 1
 
         assert count >= COUNT

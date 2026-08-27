@@ -12,16 +12,16 @@ import logging
 import random
 import time
 from typing import Any, Optional
-from urllib.parse import urlencode, quote, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 from zendriver import cdp
 from zendriver.core.connection import ProtocolException
 
 from .exceptions import (
-    InvalidJSONException,
     EmptyResponseException,
-    ResponseValidationException,
+    InvalidJSONException,
     NoTemplateException,
+    ResponseValidationException,
 )
 
 

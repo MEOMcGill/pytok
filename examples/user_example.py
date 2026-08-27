@@ -9,8 +9,8 @@ import asyncio
 import json
 import logging
 
-from pytok.tiktok import PyTok
 from pytok.accounts import AccountsPool
+from pytok.tiktok import PyTok
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,7 +25,7 @@ async def main():
     async with await PyTok.from_pool(pool, logging_level=logging.INFO) as api:
         for username in users:
             user = api.user(username=username)
-            user_data = await user.info()
+            await user.info()
 
             videos = []
             async for video in user.videos(count=30):

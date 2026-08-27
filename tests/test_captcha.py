@@ -1,18 +1,17 @@
-import base64
 import json
 import os
 
-import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 
 from pytok import captcha_solver
 
+
 def main():
     this_dir_path = os.path.dirname(os.path.realpath(__file__))
     with open(os.path.join(this_dir_path, 'captcha_examples.json'), 'r') as f:
         data = json.load(f)
-    for type, examples in data.items():
+    for _puzzle_type, examples in data.items():
         for example in examples:
             puzzle_b64 = example['puzzle'].strip("b'")
             piece_b64 = example['piece'].strip("b'")
@@ -45,7 +44,7 @@ def main():
             ax[5].imshow(np.repeat(np.roll(piece_edge / 255, best_angle, axis=0)[np.newaxis, :, :], 50, axis=0))
             ax[6].plot(matches)
             plt.show()
-            
+
 
 if __name__ == '__main__':
     main()

@@ -1,4 +1,7 @@
 
+[![CI](https://github.com/MEOMcGill/pytok/actions/workflows/ci.yml/badge.svg)](https://github.com/MEOMcGill/pytok/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![DOI](https://zenodo.org/badge/555492190.svg)](https://zenodo.org/doi/10.5281/zenodo.12802713)
 
 # pytok

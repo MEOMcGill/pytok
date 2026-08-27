@@ -1,12 +1,12 @@
 import asyncio
-from collections import Counter
-from datetime import datetime
 import json
 import random
+from collections import Counter
+from datetime import datetime
 
 from zendriver import cdp
 
-from .. import exceptions, captcha_solver
+from .. import captcha_solver, exceptions
 from ..helpers import extract_tag_contents
 
 TOK_DELAY = 20
@@ -397,7 +397,6 @@ class Base:
                 raise exceptions.NotAvailableException("Content is not available")
 
     async def wait_for_content_or_captcha(self, content_tag):
-        page = self.parent._page
 
         max_tries = 10
         tries = 0
@@ -636,7 +635,7 @@ class Base:
         content_is_visible = await self._is_selector_visible(content_tag)
         if content_is_visible:
             return
-        
+
         while not content_is_visible and tries < max_tries:
             await asyncio.sleep(1)
             await self.check_and_resolve_refresh_button()
@@ -644,7 +643,7 @@ class Base:
             content_is_visible = await self._is_selector_visible(content_tag)
             if content_is_visible:
                 return
-            
+
         # now try some other behaviour
         page = self.parent._page
         current_url = page.url
@@ -803,7 +802,6 @@ class Base:
                 break
 
     async def wait_until_not_skeleton_or_captcha(self, skeleton_tag):
-        page = self.parent._page
         selector = f'[data-e2e={skeleton_tag}]'
         # Wait for skeleton to disappear
         for _ in range(TOK_DELAY * 2):

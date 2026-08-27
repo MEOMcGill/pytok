@@ -23,7 +23,7 @@ queue; the pool returns a Future per task (or gathers a batch via ``run``).
 
 import asyncio
 import logging
-from typing import Any, Awaitable, Callable, List, Optional
+from typing import Any, List, Optional
 
 from .pool import AccountsPool, NoAccountError
 from .worker import PyTokTask, Worker
