@@ -227,7 +227,7 @@ class User(Base):
 
         self.parent.logger.debug(f"Loading page: {url}")
         await page.send(cdp.page.navigate(url))
-        self.parent.logger.debug(f"Navigate sent, waiting for the profile's data")
+        self.parent.logger.debug("Navigate sent, waiting for the profile's data")
         # Wait for the data rather than for readyState 'complete': the tag is parseable
         # long before the page finishes pulling in its media, and on a heavy profile
         # 'complete' may never arrive. Either delivery route ends the wait -- embedded in
@@ -433,12 +433,12 @@ class User(Base):
                         return
 
                 if finished:
-                    self.parent.logger.info(f"Finished after initial videos")
+                    self.parent.logger.info("Finished after initial videos")
                     # the page's own item_list responses carried hasMore=false
                     self._listing_exhausted = True
                     return
 
-                self.parent.logger.info(f"Continuing with _get_videos_api to get more videos")
+                self.parent.logger.info("Continuing with _get_videos_api to get more videos")
 
         remaining = None if count is None else count - amount_yielded
         if prefer_scraping:
@@ -521,7 +521,7 @@ class User(Base):
 
             cursor = res.get('cursor', cursor)
             await self.parent.request_delay()
-        
+
 
     async def _get_videos_scraping(self, count):
         page = self.parent._page
@@ -529,13 +529,13 @@ class User(Base):
         url = f"https://www.tiktok.com/@{self.username}"
         self.parent.logger.debug(f"Loading page: {url}")
         await page.send(cdp.page.navigate(url))
-        self.parent.logger.debug(f"Navigate sent, waiting for ready state")
+        self.parent.logger.debug("Navigate sent, waiting for ready state")
         # Not fatal if 'complete' never lands: the wait for the video grid below is the
         # real readiness gate, and a profile heavy enough to never finish loading is
         # still perfectly scrapeable once its grid is up.
         await self._wait_for_page_load(page, f"@{self.username}", required=False)
         await asyncio.sleep(3)  # Brief wait for dynamic content
-        self.parent.logger.debug(f"Page loaded for scraping videos")
+        self.parent.logger.debug("Page loaded for scraping videos")
 
         # Bank what the page has fetched so far. Draining it instead would throw away this
         # page's own listing response, which on a profile whose grid fits in one page is

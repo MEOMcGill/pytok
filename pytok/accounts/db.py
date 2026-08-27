@@ -6,12 +6,11 @@ accounts table stores a login identifier plus the resolved on-platform identity
 """
 
 import asyncio
+import logging
 import os.path
 import random
 import sqlite3
 from collections import defaultdict
-
-import logging
 
 import aiosqlite
 

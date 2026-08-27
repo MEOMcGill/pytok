@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-
 from typing import TYPE_CHECKING, Iterator, Optional
 from urllib.parse import parse_qs, urlparse
 
@@ -13,9 +12,9 @@ if TYPE_CHECKING:
     from ..tiktok import PyTok
     from .video import Video
 
-from .base import Base
 from ..exceptions import *
 from ..helpers import extract_tag_contents
+from .base import Base
 
 # challenge/detail statusCode TikTok returns for a hashtag that doesn't exist.
 HASHTAG_NOT_FOUND_STATUS_CODES = (10205,)

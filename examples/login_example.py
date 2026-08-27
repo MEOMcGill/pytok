@@ -20,8 +20,8 @@ import os
 
 from dotenv import load_dotenv
 
-from pytok.tiktok import PyTok
 from pytok.accounts import AccountsPool
+from pytok.tiktok import PyTok
 
 load_dotenv()
 

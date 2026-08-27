@@ -38,11 +38,18 @@ pip install git+https://github.com/MEOMcGill/pytok.git@master
 # Run scripts (using a conda environment)
 conda run -n <env> python <script>
 
-# Run tests
+# Install the test and lint tooling
+pip install -e '.[test,lint]'
+
+# Run tests. Only tests/test_accounts_worker.py is offline; the rest drive a
+# real browser and need a logged-in account from the pool.
 conda run -n <env> pytest tests/
 
 # Run single test
 conda run -n <env> pytest tests/test_user.py::test_user_videos
+
+# Lint
+ruff check pytok/ tests/ examples/
 ```
 
 ## Architecture

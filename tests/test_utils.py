@@ -4,6 +4,7 @@ import pytest
 
 from pytok import utils
 
+
 @pytest.mark.parametrize("json_file_path", [os.path.join(".", "tests", "data", "20230915-200856_error_videos.json")])
 def test_get_video_df(json_file_path):
     csv_file_path = json_file_path.replace(".json", ".csv")

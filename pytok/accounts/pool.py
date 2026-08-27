@@ -13,9 +13,9 @@ import sqlite3
 import uuid
 from datetime import datetime
 
+from ._utils import default_db_path, get_env_bool, parse_cookies, utc
 from .account import Account
 from .db import execute, fetchall, fetchone
-from ._utils import default_db_path, get_env_bool, parse_cookies, utc
 
 logger = logging.getLogger("PyTok")
 

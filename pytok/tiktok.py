@@ -4,15 +4,14 @@ import contextlib
 import json
 import logging
 import os
+import random
 import re
 import time
 from typing import Optional
-
 from urllib.parse import parse_qs, urlparse
 
 import zendriver as zd
 from zendriver import cdp
-import random
 
 from ._cdp_patches import apply_cdp_patches
 from .tiktok_api import ZendriverTikTokApi
@@ -20,13 +19,12 @@ from .tiktok_api import ZendriverTikTokApi
 # Patch zendriver's CDP bindings for Chrome 149+ before any browser is started.
 apply_cdp_patches()
 
-from .api.sound import Sound
-from .api.user import User
-from .api.search import Search
 from .api.hashtag import Hashtag
-from .api.video import Video
+from .api.search import Search
+from .api.sound import Sound
 from .api.trending import Trending
-
+from .api.user import User
+from .api.video import Video
 from .exceptions import *
 from .utils import LOGGER_NAME
 
@@ -514,7 +512,7 @@ class PyTok:
             account = await accounts_pool.get_available()
         if account is None:
             raise NoAccountError(
-                f"No account available"
+                "No account available"
                 + (f" for username {username}" if username else "")
             )
         return cls(account=account, accounts_pool=accounts_pool, **kwargs)

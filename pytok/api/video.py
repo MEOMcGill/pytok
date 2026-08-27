@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from datetime import datetime
-import logging
 import json
+import logging
 import time
-from urllib import parse as url_parsers
+from datetime import datetime
 from typing import TYPE_CHECKING, Optional
+from urllib import parse as url_parsers
 
 import brotli
 import httpx
@@ -15,13 +15,18 @@ import requests
 
 if TYPE_CHECKING:
     from ..tiktok import PyTok
-    from .user import User
-    from .sound import Sound
     from .hashtag import Hashtag
+    from .sound import Sound
+    from .user import User
 
-from .base import Base
-from ..helpers import extract_tag_contents, edit_url, extract_video_id_from_url, extract_user_id_from_url
 from .. import exceptions
+from ..helpers import (
+    edit_url,
+    extract_tag_contents,
+    extract_user_id_from_url,
+    extract_video_id_from_url,
+)
+from .base import Base
 
 logger = logging.getLogger("pytok.api.video")
 
@@ -102,13 +107,13 @@ class Video(Base):
             except Exception as ex:
                 self.parent.logger.debug(f"API info fetch failed with exception: {ex}, falling back to scraping")
                 video_data = await self._info_scraping(**kwargs)
-                
+
             self.as_dict = video_data
         else:
             video_data = self.as_dict
 
         return video_data
-    
+
     async def _info_api(self, **kwargs) -> dict:
         url = self._get_url()
         _, session = self.parent.tiktok_api._get_session()
@@ -136,7 +141,7 @@ class Video(Base):
                     "Could not extract video info from response"
                 )
         return video_info
-    
+
     async def _info_scraping(self, **kwargs) -> dict:
         url = self._get_url()
         page = self.parent._page
@@ -244,7 +249,7 @@ class Video(Base):
 
         # Check for unavailable content
         await self.wait_for_content_or_unavailable('[id="main-content-video_detail"]', 'Video currently unavailable')
-        
+
     async def _related_videos(self, counter, count=20):
         data_request_path = "api/related/item_list"
         # Process pending responses via CDP
@@ -296,7 +301,7 @@ class Video(Base):
         }
 
         while count is None or amount_yielded < count:
-            self.parent.logger.debug(f"Making API request for related videos")
+            self.parent.logger.debug("Making API request for related videos")
             try:
                 res = await self.parent.tiktok_api.make_request(
                     url="https://www.tiktok.com/api/related/item_list/",
@@ -798,7 +803,7 @@ class Video(Base):
 
             if len(data_responses) == 0:
                 if tries > 5:
-                    logger.debug(f"Not sending anymore!")
+                    logger.debug("Not sending anymore!")
                     break
                 tries += 1
 
@@ -833,7 +838,7 @@ class Video(Base):
                             "TikTok isn't sending more TikToks beyond this point."
                         )
                         return
-                except Exception as e:
+                except Exception:
                     processed_urls.append(data_response.get('url', ''))
 
     async def _get_comments_via_requests(self, count, cursor, data_request):

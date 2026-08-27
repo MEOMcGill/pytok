@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-
 from typing import TYPE_CHECKING, Iterator, Optional
 from urllib.parse import urlparse
 
@@ -14,10 +13,9 @@ if TYPE_CHECKING:
     from .user import User
     from .video import Video
 
-from .base import Base
 from ..exceptions import *
 from ..helpers import extract_tag_contents
-
+from .base import Base
 
 # The sound feed's items, used both to wait for the feed and to report how far it has
 # grown during a scroll walk.
