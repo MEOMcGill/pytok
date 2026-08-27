@@ -1,7 +1,11 @@
 import asyncio
 
+import pytest
+
 from pytok.accounts import AccountsPool
 from pytok.tiktok import PyTok
+
+pytestmark = pytest.mark.live
 
 search_term = 'news'
 

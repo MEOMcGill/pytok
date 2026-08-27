@@ -7,7 +7,7 @@ name = "pytok"
 version = "0.2.0"
 description = "TikTok scraper with automatic captcha solving using zendriver browser automation."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Ben Steel", email = "bendavidsteel@gmail.com" }]
@@ -29,7 +29,6 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
     "Topic :: Scientific/Engineering :: Information Analysis",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -69,9 +68,15 @@ include = ["pytok*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Live tests drive a real browser and need a logged-in pool account, so they are
+# excluded by default. Run them with `pytest -m live`.
+addopts = "-m 'not live'"
+markers = [
+    "live: needs a real browser and a logged-in account from the pool",
+]
 
 [tool.ruff]
-target-version = "py39"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B"]
