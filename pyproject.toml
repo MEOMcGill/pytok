@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pytok"
+version = "0.2.0"
+description = "TikTok scraper with automatic captcha solving using zendriver browser automation."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Ben Steel", email = "bendavidsteel@gmail.com" }]
+keywords = [
+    "tiktok",
+    "tiktok-scraper",
+    "tiktok-api",
+    "web-scraping",
+    "social-media",
+    "data-collection",
+    "browser-automation",
+    "captcha-solver",
+    "async",
+    "research",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "zendriver",
+    "requests",
+    "httpx",
+    "brotli",
+    "opencv-python",
+    "numpy",
+    "tqdm",
+    "pandas",
+    "polars",
+    "aiosqlite",
+    "click",
+    "tabulate",
+]
+
+[project.urls]
+Homepage = "https://github.com/MEOMcGill/pytok"
+Repository = "https://github.com/MEOMcGill/pytok"
+Issues = "https://github.com/MEOMcGill/pytok/issues"
+
+[tool.setuptools.packages.find]
+include = ["pytok*"]
