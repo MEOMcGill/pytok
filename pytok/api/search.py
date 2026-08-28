@@ -455,14 +455,17 @@ class Search(Base):
                         yielded += 1
                         yield result
 
-                    # Only a short page is trusted when it says the listing is over (see
-                    # _note_page_size). An empty or exactly-full page saying the same is as
-                    # likely to be TikTok stalling us, so leave those to the walk's stall
-                    # check, which gives the page a few more scrolls to recover.
-                    short_page = self._note_page_size(len(results))
-                    if not res.get("has_more", 0) and short_page:
-                        self._exhausted_listing = True
-                        rnd.stop = True
+                    # has_more=0 is counted, never obeyed. A short page carrying it looks
+                    # like the end of the listing and is not: TikTok sends one well inside
+                    # a search that then keeps serving results for another two hundred, so
+                    # stopping here ends the walk at a fraction of its depth. This is the
+                    # last route, so there is nothing to fall back to and nothing gained by
+                    # believing it -- the walk's stall check spends a handful of quiet
+                    # rounds and is the only thing that can tell an exhausted listing from
+                    # a throttled one.
+                    self._note_page_size(len(results))
+                    if not res.get("has_more", 0):
+                        walk.stats['pages_saying_no_more'] += 1
         finally:
             self.parent.logger.info(
                 f"search {obj_type} '{self.search_term}': walked {yielded} results, "
