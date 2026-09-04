@@ -9,9 +9,9 @@ authors:
   - family-names: "Abrahams"
     given-names: "Alexei"
     orcid: "https://orcid.org/0000-0002-6547-072X"
-version: 0.2.0
+version: 0.3.0
 doi: 10.5281/zenodo.12802713
-date-released: 2026-08-27
+date-released: 2026-09-04
 url: "https://github.com/MEOMcGill/pytok"
 repository-code: "https://github.com/MEOMcGill/pytok"
 license: PolyForm-Noncommercial-1.0.0
