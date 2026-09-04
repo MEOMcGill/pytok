@@ -1,12 +1,12 @@
 
 [![CI](https://github.com/MEOMcGill/pytok/actions/workflows/ci.yml/badge.svg)](https://github.com/MEOMcGill/pytok/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: PolyForm Noncommercial](https://img.shields.io/badge/License-PolyForm%20Noncommercial%201.0.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![DOI](https://zenodo.org/badge/555492190.svg)](https://zenodo.org/doi/10.5281/zenodo.12802713)
 
 # pytok
 
-This is a zendriver based version of David Teacher's unofficial api wrapper for TikTok.com in python. It re-implements a set of features from the original library, with a shifted focus on using browser automation to allow automatic captcha solves with a hopefully minor trade-off in performance.
+This is a zendriver based version of David Teather's unofficial api wrapper for TikTok.com in python. It re-implements a set of features from the original library, with a shifted focus on using browser automation to allow automatic captcha solves with a hopefully minor trade-off in performance.
 
 ## Installation
 

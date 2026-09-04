@@ -8,7 +8,7 @@ version = "0.2.0"
 description = "TikTok scraper with automatic captcha solving using zendriver browser automation."
 readme = "README.md"
 requires-python = ">=3.10"
-license = "MIT"
+license = "PolyForm-Noncommercial-1.0.0 AND MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Ben Steel", email = "bendavidsteel@gmail.com" }]
 keywords = [
