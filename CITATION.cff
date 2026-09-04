@@ -14,7 +14,7 @@ doi: 10.5281/zenodo.12802713
 date-released: 2026-08-27
 url: "https://github.com/MEOMcGill/pytok"
 repository-code: "https://github.com/MEOMcGill/pytok"
-license: MIT
+license: PolyForm-Noncommercial-1.0.0
 keywords:
   - tiktok
   - web-scraping
