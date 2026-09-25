@@ -16,9 +16,9 @@ class Account:
     username) and the pool's primary key. It is *not* necessarily the public
     @handle — that is `unique_id`, resolved from the app-context after the
     first successful login. `user_id` (TikTok uid) is the ground-truth identity
-    used to verify a Chrome profile is logged into the right account.
+    used to verify a browser profile is logged into the right account.
 
-    `profile_dir` is a persistent Chrome user_data_dir (the working session).
+    `profile_dir` is a persistent Firefox profile dir (the working session).
     `cookies` is a JSON backup snapshot used to repair a logged-out / wrong
     profile without a manual re-login, and to answer "is this account active?"
     without launching a browser.

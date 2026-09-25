@@ -25,7 +25,7 @@ early" is useful. Appending how many handles that affected on a given day is not
 
 PyTok is a TikTok web scraping library using a dual-approach architecture:
 - **Primary**: Signed requests to TikTok's web API, issued from the browser session (`tiktok_api.py`)
-- **Fallback**: Automatically falls back to browser automation (zendriver) when API fails
+- **Fallback**: Automatically falls back to browser automation (camoufox, a hardened Firefox driven through Playwright) when API fails
 
 All operations are async/await based.
 
@@ -40,6 +40,9 @@ conda run -n <env> python <script>
 
 # Install the test and lint tooling
 pip install -e '.[test,lint]'
+
+# Download the camoufox browser (otherwise fetched on first launch)
+python -m camoufox fetch
 
 # Run tests. Live tests are marked `live` and deselected by default, so this
 # runs only the offline ones.
@@ -60,8 +63,8 @@ ruff check pytok/ tests/ examples/
 
 ```
 PyTok (tiktok.py)
-├── zendriver browser - CDP network response tracking
-├── ZendriverTikTokApi client - API requests with msToken from browser cookies
+├── camoufox browser - Playwright network response tracking
+├── TikTokApiClient - in-page fetches that TikTok's own SDK signs
 └── Request cache - stores recent API responses
 
 API Classes (api/*.py) - all inherit from Base
@@ -82,27 +85,41 @@ except ApiFailedException:
     # Fallback to browser scraping
 ```
 
-### CDP Network Tracking
+### Network Tracking and Signing
 
-PyTok tracks network responses via Chrome DevTools Protocol:
+PyTok tracks network responses via Playwright's request events:
 - Captures responses matching `/api/`, `video/tos`, `v16-webapp`, `v19-webapp` URL patterns
-- Stores response bodies before Chrome garbage collects them
+- Reads each body as its request finishes, into `_collected_responses`
 - Used to extract video bytes and API data from page loads
+
+TikTok's webmssdk wraps the page's `fetch`/XHR and signs every API request made through
+them, so the API client just fetches from the page's main world (camoufox's `mw:` prefix)
+and the request goes out signed. Everything else evaluates in Playwright's isolated
+world, which the page's scripts cannot see.
 
 ### Captcha Handling
 
-- Automatic solving via OpenCV image matching (`captcha_solver.py`)
-- Supports slide and whirl puzzle types
+- Automatic solving via OpenCV image matching (`captcha_solver.py`), dragging the slider through the Playwright page
+- Supports slide and whirl puzzle types; not yet confirmed to solve a live captcha
 - Manual solving available with `manual_captcha_solves=True`
+
+### Accounts and Profiles
+
+Each pool account has a persistent Firefox profile (`~/.pytok/firefox-profiles/<user>`)
+that pins the camoufox fingerprint preset it was first given (`pytok-fingerprint.json`),
+plus a cookie backup in the accounts DB. A session that finds its profile logged out is
+repaired from that backup before falling back to a login flow.
 
 ## Key Files
 
-- `tiktok.py` - Main entry point, manages browser and API client
+- `tiktok.py` - Main entry point, manages the camoufox browser, network capture and account login
+- `tiktok_api.py` - API client: signed in-page fetches using captured per-endpoint param templates
 - `api/base.py` - Base class with DOM interaction, captcha detection, scrolling
 - `api/user.py` - User data and video fetching
 - `api/video.py` - Video metadata, bytes download, comments
 - `helpers.py` - HTML parsing, extracts `__UNIVERSAL_DATA_FOR_REHYDRATION__` JSON from pages
 - `utils.py` - DataFrame conversion helpers (`get_video_df`, `get_comment_df`, `get_user_df`)
+- `accounts/` - Accounts pool (SQLite), CLI, and `WorkerPool` for concurrent sessions
 
 ## PyTok Constructor Options
 
@@ -110,7 +127,9 @@ PyTok tracks network responses via Chrome DevTools Protocol:
 PyTok(
     logging_level=None,        # this session's logger, a child of "PyTok"; None inherits
     request_delay=0,           # seconds between requests
-    headless=False,            # headless doesn't work reliably
+    headless=False,            # True is flagged more often; on Linux prefer "virtual" (Xvfb)
+    user_data_dir=None,        # persistent Firefox profile; set from the account when using the pool
+    page_load_timeout=30,      # seconds a navigation may take to load
     manual_captcha_solves=False,
     log_captcha_solves=False,  # save captcha data to JSON files
 )

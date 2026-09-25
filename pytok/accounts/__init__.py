@@ -1,6 +1,6 @@
 """Multi-account support for PyTok.
 
-A SQLite-backed pool of TikTok accounts, each with a persistent Chrome profile
+A SQLite-backed pool of TikTok accounts, each with a persistent Firefox profile
 directory and a cookie backup, so multiple scraping sessions can run under
 different identities. See pool.AccountsPool and account.Account.
 """

@@ -2,7 +2,7 @@
 
 Ported from igscrape's db.py (twscrape lineage), adapted for TikTok: the
 accounts table stores a login identifier plus the resolved on-platform identity
-(user_id / sec_uid / unique_id) and a per-account Chrome profile directory.
+(user_id / sec_uid / unique_id) and a per-account browser profile directory.
 """
 
 import asyncio
@@ -43,6 +43,7 @@ async def migrate(db: aiosqlite.Connection):
 
     MIGRATIONS = [
         (1, migrate_v1),
+        (2, migrate_v2),
     ]
 
     for version, migration_fn in MIGRATIONS:
@@ -60,7 +61,7 @@ async def migrate_v1(db: aiosqlite.Connection):
     username) and the pool key. `user_id` (TikTok uid) is the ground-truth
     on-platform identity, captured at first successful login and used to verify
     a profile is logged into the account we think it is. `profile_dir` is the
-    persistent Chrome user_data_dir; `cookies` is a JSON backup snapshot.
+    persistent browser profile dir; `cookies` is a JSON backup snapshot.
     """
     qs = """
     CREATE TABLE IF NOT EXISTS accounts (
@@ -94,6 +95,15 @@ async def migrate_v1(db: aiosqlite.Connection):
     await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_accounts_user_id ON accounts(user_id) WHERE user_id IS NOT NULL"
     )
+
+
+async def migrate_v2(db: aiosqlite.Connection):
+    """Forget stored profile dirs, which point at Chrome profiles.
+
+    Firefox cannot open a Chrome profile, so each account falls back to its default
+    Firefox profile dir, which starts empty and is logged in from the cookie backup.
+    """
+    await db.execute("UPDATE accounts SET profile_dir = NULL")
 
 
 class DB:

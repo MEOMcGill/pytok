@@ -149,7 +149,7 @@ class Video(Base):
             await self.view()
 
         # Get video data from page HTML
-        html_body = await page.get_content()
+        html_body = await page.content()
         contents = extract_tag_contents(html_body)
 
         if not contents:
@@ -190,13 +190,7 @@ class Video(Base):
             raise Exception("No responses found for video page")
 
         resp = responses[-1]
-        cdp_response = resp.get('response')
-
-        network_info = {}
-        if cdp_response:
-            network_info['server_addr'] = getattr(cdp_response, 'remote_ip_address', None)
-            network_info['headers'] = getattr(cdp_response, 'headers', {})
-        return network_info
+        return {'server_addr': resp.get('server_addr'), 'headers': resp.get('headers', {})}
 
     async def bytes_network_info(self, **kwargs) -> dict:
         """
@@ -212,15 +206,8 @@ class Video(Base):
         if not responses:
             raise Exception("No responses found for video bytes")
 
-        for resp in responses:
-            cdp_response = resp.get('response')
-            if cdp_response:
-                network_info = {}
-                network_info['server_addr'] = getattr(cdp_response, 'remote_ip_address', None)
-                network_info['headers'] = getattr(cdp_response, 'headers', {})
-                return network_info
-
-        raise Exception("Failed to get video bytes network info")
+        resp = responses[0]
+        return {'server_addr': resp.get('server_addr'), 'headers': resp.get('headers', {})}
 
     def _get_url(self) -> str:
         if self.username is not None:
@@ -244,7 +231,7 @@ class Video(Base):
             return
 
         self.parent.logger.debug(f"Loading video page: {url}")
-        await page.get(url)
+        await self.parent.navigate(url, wait_until="domcontentloaded")
         await asyncio.sleep(5)  # Wait for page to fully load
 
         # Check for unavailable content
@@ -252,7 +239,6 @@ class Video(Base):
 
     async def _related_videos(self, counter, count=20):
         data_request_path = "api/related/item_list"
-        # Process pending responses via CDP
         responses = await self.parent.process_pending_responses(data_request_path)
 
         for resp in responses:
@@ -352,8 +338,7 @@ class Video(Base):
         # get via scroll / solve captcha if necessary
         if counter.get() == 0:
             await self.check_and_wait_for_captcha()
-            # Reload page using nodriver pattern
-            await page.get(url)
+            await self.parent.navigate(url, wait_until="domcontentloaded")
             await asyncio.sleep(5)
             await self.parent.process_pending_responses()
             async for video in self._related_videos(counter, count=count):
@@ -398,7 +383,7 @@ class Video(Base):
         #
         # Prefer a direct httpx download carrying the browser's session cookies: it's much
         # faster for large files than the in-browser fetch, which has to base64-encode the
-        # whole video and ship it back over the CDP websocket. Fall back to the in-browser
+        # whole video and ship it back through the browser driver. Fall back to the in-browser
         # fetch() only if the direct request is rejected (e.g. the CDN ever tightens checks).
         req_exceptions = []
         for fetcher_name, fetcher in (("httpx", self._httpx_fetch_bytes),
@@ -413,8 +398,8 @@ class Video(Base):
                     # this whole list read as ['httpx: ', 'browser: ', ...] -- saying
                     # nothing about what went wrong. Name it outright. Landing here rather
                     # than on httpx's own ReadTimeout is a signal in itself: it points at
-                    # the CDP round trip (cookie read, in-page eval), which has no timeout
-                    # of its own, rather than at the CDN download.
+                    # the browser round trip (cookie read, in-page eval) rather than at the
+                    # CDN download.
                     req_exceptions.append(f"{label}: timed out after {timeout}s")
                 except Exception as ex:
                     # never interpolate a bare exception -- plenty of them stringify to ''
@@ -455,7 +440,7 @@ class Video(Base):
         return f"returned {len(body)} bytes but no ftyp box, not a progressive MP4 ({head!r})"
 
     def _find_cached_bytes(self, paths) -> Optional[bytes]:
-        """Return video bytes from the CDP response cache if present, else None."""
+        """Return video bytes from the captured response cache if present, else None."""
         for path in paths:
             for res in self.get_responses(path):
                 if res.get('body'):
@@ -471,11 +456,9 @@ class Video(Base):
     async def _httpx_fetch_bytes(self, bytes_url) -> bytes:
         """Download the signed CDN URL directly with httpx, carrying the browser's session
         cookies (the CDN authorizes by cookie) and the browser session's headers. Avoids the
-        base64-over-CDP round trip of the in-browser fetch, so it's much faster for large files
+        base64 round trip of the in-browser fetch, so it's much faster for large files
         and can run concurrently with browser activity."""
-        from zendriver import cdp
-        cookie_result = await self.parent._page.send(cdp.network.get_cookies([bytes_url]))
-        cookies = {cookie.name: cookie.value for cookie in cookie_result}
+        cookies = {c['name']: c['value'] for c in await self.parent._context.cookies([bytes_url])}
         _, session = self.parent.tiktok_api._get_session()
         headers = dict(session.headers)
         headers['Referer'] = 'https://www.tiktok.com/'
@@ -486,7 +469,7 @@ class Video(Base):
         return resp.content
 
     async def _browser_fetch_bytes(self, bytes_url) -> bytes:
-        """Fetch the video via an in-page fetch() so the request goes through Chrome's network
+        """Fetch the video via an in-page fetch() so the request goes through the browser's network
         stack with the session cookies (credentials:'include'), then ship the bytes back
         base64-encoded. The CDN authorizes by cookie, so credentials are required."""
         js = (
@@ -500,7 +483,8 @@ class Video(Base):
             "  return JSON.stringify({ok: true, b64: btoa(binary)});"
             "} catch (e) { return JSON.stringify({ok: false, error: String(e)}); } })()"
         )
-        result = await self.parent.tiktok_api._evaluate(self.parent._page, js, await_promise=True)
+        # In the main world: the isolated one can't read the page's ArrayBuffer.
+        result = await self.parent.tiktok_api.evaluate_main_world(self.parent._page, js)
         if not result:
             raise Exception("In-browser byte fetch returned no result")
         data = json.loads(result)
@@ -511,7 +495,6 @@ class Video(Base):
     async def _get_comments_and_req(self, count):
         # get request
         data_request_path = "api/comment/list"
-        # Process pending responses via CDP
         data_responses = await self.parent.process_pending_responses(data_request_path)
 
         amount_yielded = 0
@@ -529,10 +512,7 @@ class Video(Base):
                 res = json.loads(body) if isinstance(body, str) else body
 
                 # Store the URL and response info for later use
-                self.parent.request_cache['comments'] = {
-                    'url': url,
-                    'response': data_response.get('response')
-                }
+                self.parent.request_cache['comments'] = {'url': url}
 
                 processed_urls.append(url)
 
@@ -579,10 +559,7 @@ class Video(Base):
             url_path = url_parsed.path.replace("api/comment/list", "api/comment/list/reply")
             next_url = f"{url_parsed.scheme}://{url_parsed.netloc}{url_path}?{url_parsers.urlencode(params, doseq=True)}"
 
-            # Get cookies via CDP
-            from zendriver import cdp
-            cookie_result = await self.parent._page.send(cdp.network.get_cookies())
-            cookies = {cookie.name: cookie.value for cookie in cookie_result}
+            cookies = {c['name']: c['value'] for c in await self.parent._context.cookies()}
 
             # Get headers from the API client session
             _, session = self.parent.tiktok_api._get_session()
@@ -745,11 +722,10 @@ class Video(Base):
             await self.view()
 
             # Comments may not auto-load; click the comment icon to open the panel
-            page = self.parent._page
             try:
-                comment_icon = await page.select('[data-e2e="comment-icon"]', timeout=3)
+                comment_icon = await self._find_element_by_selector('[data-e2e="comment-icon"]', timeout=3)
                 if comment_icon:
-                    await comment_icon.mouse_click()
+                    await comment_icon.click(timeout=3000)
                     await asyncio.sleep(2)
             except Exception:
                 pass
@@ -797,7 +773,6 @@ class Video(Base):
             await self.check_and_wait_for_captcha()
             await self.check_and_close_signin()
 
-            # Process pending responses via CDP
             data_responses = await self.parent.process_pending_responses(data_request_path)
             data_responses = [resp for resp in data_responses if resp.get('url', '') not in processed_urls]
 
@@ -846,10 +821,7 @@ class Video(Base):
         cached_url = data_request.get('url', '') if isinstance(data_request, dict) else getattr(data_request, 'url', '')
         next_url = edit_url(cached_url, {'count': count, 'cursor': cursor, 'aweme_id': self.id})
 
-        # Get cookies via CDP
-        from zendriver import cdp
-        cookie_result = await self.parent._page.send(cdp.network.get_cookies())
-        cookies = {cookie.name: cookie.value for cookie in cookie_result}
+        cookies = {c['name']: c['value'] for c in await self.parent._context.cookies()}
 
         # Get headers from the API client session
         _, session = self.parent.tiktok_api._get_session()

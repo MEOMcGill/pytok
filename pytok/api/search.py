@@ -9,8 +9,6 @@ import urllib.parse
 from typing import TYPE_CHECKING, Iterator, Optional
 from urllib.parse import parse_qs, urlparse
 
-from zendriver import cdp
-
 from ..exceptions import *
 from .base import Base
 from .user import User
@@ -185,7 +183,7 @@ class Search(Base):
 
             # Scraping route. Loading the search page fires the webapp's own search
             # request, which fills the param template for that endpoint
-            # (PyTok._on_request_will_be_sent -> cache_api_params). So we harvest that
+            # (PyTok._on_request -> cache_api_params). So we harvest that
             # first page off the wire and then resume paginating through the API from
             # its cursor and search_id, instead of scrolling for every page.
             route = "search page"
@@ -358,7 +356,6 @@ class Search(Base):
 
     async def _load_search_page(self, obj_type):
         """Navigate to the search results page so its search request fires."""
-        page = self.parent._page
 
         # Drop anything captured for earlier operations first, so what we harvest
         # after the navigation belongs to this search.
@@ -367,9 +364,8 @@ class Search(Base):
         subpath = "user" if obj_type == "user" else "video"
         url = f"https://www.tiktok.com/search/{subpath}?q={urllib.parse.quote(self.search_term)}"
         self.parent.logger.debug(f"Loading page: {url}")
-        await page.send(cdp.page.navigate(url))
-        async with asyncio.timeout(30):
-            await page.wait_for_ready_state(until='complete', timeout=31)
+        await self.parent.navigate(url)
+        await self.parent.wait_for_load(30)
         await asyncio.sleep(3)
 
         await self.check_and_wait_for_captcha()

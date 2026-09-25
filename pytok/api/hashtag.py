@@ -6,8 +6,6 @@ import re
 from typing import TYPE_CHECKING, Iterator, Optional
 from urllib.parse import parse_qs, urlparse
 
-from zendriver import cdp
-
 if TYPE_CHECKING:
     from ..tiktok import PyTok
     from .video import Video
@@ -195,7 +193,7 @@ class Hashtag(Base):
         if challenge_info is None:
             # Anonymous sessions get the same object inlined in the page.
             challenge_info = self._challenge_info_from_html(
-                await self.parent._page.get_content()
+                await self.parent._page.content()
             )
 
         if challenge_info is None and page_challenge_id is not None:
@@ -259,7 +257,7 @@ class Hashtag(Base):
         in the page's meta tags, and the challengeID on the feed request the page
         did fire, both name the hashtag even though nothing fetched its details.
         """
-        html = await self.parent._page.get_content()
+        html = await self.parent._page.content()
         match = re.search(r'challenge/detail/(\d+)', html)
         if match:
             return match.group(1)
@@ -302,7 +300,7 @@ class Hashtag(Base):
                         f"TikTok has no hashtag '{self.name}': page says '{text}'"
                     )
 
-        detail = self._challenge_detail_from_html(await self.parent._page.get_content())
+        detail = self._challenge_detail_from_html(await self.parent._page.content())
         if detail is None:
             return
         status_code = max(detail.get('statusCode', 0), detail.get('status_code', 0))
@@ -396,7 +394,7 @@ class Hashtag(Base):
 
         # Scraping route. Loading the hashtag page fires the webapp's own
         # challenge/item_list request, which fills the param template for that
-        # endpoint (PyTok._on_request_will_be_sent -> cache_api_params). So we
+        # endpoint (PyTok._on_request -> cache_api_params). So we
         # harvest that first page off the wire and then resume paginating through
         # the API from its cursor, instead of scrolling for every page.
         await self._load_hashtag_page()
@@ -480,9 +478,8 @@ class Hashtag(Base):
 
         The page load fires the webapp's own challenge/detail and
         challenge/item_list requests, which fill the param templates for those
-        endpoints (PyTok._on_request_will_be_sent -> cache_api_params).
+        endpoints (PyTok._on_request -> cache_api_params).
         """
-        page = self.parent._page
 
         # Drop anything captured for earlier operations first, so what we harvest
         # after the navigation belongs to this hashtag.
@@ -490,9 +487,8 @@ class Hashtag(Base):
 
         url = f"https://www.tiktok.com/tag/{self.name}"
         self.parent.logger.debug(f"Loading page: {url}")
-        await page.send(cdp.page.navigate(url))
-        async with asyncio.timeout(30):
-            await page.wait_for_ready_state(until='complete', timeout=31)
+        await self.parent.navigate(url)
+        await self.parent.wait_for_load(30)
         await asyncio.sleep(3)
 
     async def _load_hashtag_page(self):
