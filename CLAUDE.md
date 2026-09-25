@@ -41,6 +41,9 @@ conda run -n <env> python <script>
 # Install the test and lint tooling
 pip install -e '.[test,lint]'
 
+# Download the camoufox browser (otherwise fetched on first launch)
+python -m camoufox fetch
+
 # Run tests. Live tests are marked `live` and deselected by default, so this
 # runs only the offline ones.
 conda run -n <env> pytest tests/
@@ -96,18 +99,27 @@ world, which the page's scripts cannot see.
 
 ### Captcha Handling
 
-- Automatic solving via OpenCV image matching (`captcha_solver.py`)
-- Supports slide and whirl puzzle types
+- Automatic solving via OpenCV image matching (`captcha_solver.py`), dragging the slider through the Playwright page
+- Supports slide and whirl puzzle types; not yet confirmed to solve a live captcha
 - Manual solving available with `manual_captcha_solves=True`
+
+### Accounts and Profiles
+
+Each pool account has a persistent Firefox profile (`~/.pytok/firefox-profiles/<user>`)
+that pins the camoufox fingerprint preset it was first given (`pytok-fingerprint.json`),
+plus a cookie backup in the accounts DB. A session that finds its profile logged out is
+repaired from that backup before falling back to a login flow.
 
 ## Key Files
 
-- `tiktok.py` - Main entry point, manages browser and API client
+- `tiktok.py` - Main entry point, manages the camoufox browser, network capture and account login
+- `tiktok_api.py` - API client: signed in-page fetches using captured per-endpoint param templates
 - `api/base.py` - Base class with DOM interaction, captcha detection, scrolling
 - `api/user.py` - User data and video fetching
 - `api/video.py` - Video metadata, bytes download, comments
 - `helpers.py` - HTML parsing, extracts `__UNIVERSAL_DATA_FOR_REHYDRATION__` JSON from pages
 - `utils.py` - DataFrame conversion helpers (`get_video_df`, `get_comment_df`, `get_user_df`)
+- `accounts/` - Accounts pool (SQLite), CLI, and `WorkerPool` for concurrent sessions
 
 ## PyTok Constructor Options
 
@@ -115,7 +127,9 @@ world, which the page's scripts cannot see.
 PyTok(
     logging_level=None,        # this session's logger, a child of "PyTok"; None inherits
     request_delay=0,           # seconds between requests
-    headless=False,            # headless doesn't work reliably
+    headless=False,            # True is flagged more often; on Linux prefer "virtual" (Xvfb)
+    user_data_dir=None,        # persistent Firefox profile; set from the account when using the pool
+    page_load_timeout=30,      # seconds a navigation may take to load
     manual_captcha_solves=False,
     log_captcha_solves=False,  # save captcha data to JSON files
 )

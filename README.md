@@ -123,6 +123,16 @@ if __name__ == "__main__":
 
 Other useful CLI commands: `info <username>`, `stats`, `activate`/`deactivate`, `release` (recover an account left in-use by a crashed run), `unlock`, and `delete`. Run `python -m pytok.accounts.cli --help` for the full list.
 
+Each account's browser profile lives in `~/.pytok/firefox-profiles/<username>`, alongside a `pytok-fingerprint.json` holding the browser fingerprint that profile was first given. Every later session reuses it, so the account keeps appearing from the same device. `login --seed-profile <dir>` copies a warmed Firefox profile into a new account's profile dir first; the source's fingerprint file is not copied, so the new account gets its own.
+
+### Upgrading from the zendriver (Chrome) version
+
+Earlier versions kept a Chrome profile per account, which Firefox cannot open. The first time this version opens an accounts database, it forgets those profile dirs (leaving them on disk). Each account then starts a fresh Firefox profile and logs in from its stored cookie backup. If that backup has gone stale, log the account in again with `python -m pytok.accounts.cli login --username ...`. An older PyTok sharing the same database keeps working, since it falls back to its default Chrome profile location.
+
+## Running headless
+
+`PyTok(headless=True)` runs Firefox without a window, but TikTok treats true headless browsers with more suspicion. On Linux, prefer `headless="virtual"`, which runs a normal browser inside a virtual display (needs `Xvfb` installed).
+
 ## Scraping concurrently across accounts
 
 `WorkerPool` runs many sessions at once — each worker owns one account and its own isolated Firefox profile, so N accounts means N concurrent scrapers. Tasks are plain async callables `async def task(api) -> result` distributed across a shared queue:
