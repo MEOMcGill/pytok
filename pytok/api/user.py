@@ -5,8 +5,6 @@ import inspect
 import json
 from typing import TYPE_CHECKING, Iterator, Optional
 
-from zendriver import cdp
-
 from ..exceptions import *
 from ..helpers import extract_tag_contents
 
@@ -226,7 +224,7 @@ class User(Base):
         page = self.parent._page
 
         self.parent.logger.debug(f"Loading page: {url}")
-        await page.send(cdp.page.navigate(url))
+        await self.parent.navigate(url)
         self.parent.logger.debug("Navigate sent, waiting for the profile's data")
         # Wait for the data rather than for readyState 'complete': the tag is parseable
         # long before the page finishes pulling in its media, and on a heavy profile
@@ -244,13 +242,13 @@ class User(Base):
         )
         # The grid's own listing response has landed by now, and nothing reads it until the
         # caller asks for videos -- which may be a captcha solve and a page of work away.
-        # Bank it here so it is ours rather than Chrome's for that whole gap.
+        # Bank it here so it is in hand for that whole gap.
         await self.parent.collect_pending_response_bodies()
 
         user = None
 
         # Get user info from page HTML (like the working example)
-        html_body = await page.get_content()
+        html_body = await page.content()
         try:
             tag_contents = extract_tag_contents(html_body)
         except NotAvailableException:
@@ -528,7 +526,7 @@ class User(Base):
 
         url = f"https://www.tiktok.com/@{self.username}"
         self.parent.logger.debug(f"Loading page: {url}")
-        await page.send(cdp.page.navigate(url))
+        await self.parent.navigate(url)
         self.parent.logger.debug("Navigate sent, waiting for ready state")
         # Not fatal if 'complete' never lands: the wait for the video grid below is the
         # real readiness gate, and a profile heavy enough to never finish loading is
@@ -556,7 +554,7 @@ class User(Base):
         seen_ids = set()
         has_more = True
 
-        html = await page.get_content()
+        html = await page.content()
         try:
             tag_contents = extract_tag_contents(html)
         except NotAvailableException:
@@ -627,7 +625,7 @@ class User(Base):
         finished = False
 
         cursor = 0
-        # Process pending responses for video list API using CDP
+        # Process pending responses for the video list API
         video_responses = await self.parent.process_pending_responses('api/post/item_list')
         video_responses = [res for res in video_responses if f"secUid={self.sec_uid}" in res.get('url', '')]
         self.parent.logger.debug(f"Found {len(video_responses)} video responses in page")
@@ -667,7 +665,7 @@ class User(Base):
 
         if len(video_responses) == 0:
             # Check HTML data for status codes before failing
-            html = await self.parent._page.get_content()
+            html = await self.parent._page.content()
             try:
                 tag_contents = extract_tag_contents(html)
             except NotAvailableException:
@@ -700,9 +698,8 @@ class User(Base):
         conditions used to be indistinguishable from reaching the end of a profile; only this
         loop knows which one fired, so it records that in `_listing_exhausted`.
 
-        Each round is one page.evaluate and a wait for the response that scroll asked for.
-        Nothing here may reach for zendriver's element API: its cost grows with the square
-        of the grid, which set the real ceiling on how deep a walk could get (see
+        Each round is one page.evaluate and a wait for the response that scroll asked for,
+        so a round costs the same however large the grid has grown (see
         base._SCROLL_FEED_JS). Waiting for the response rather than sleeping a flat
         interval is what makes a round cost what the network costs, and it also says
         whether the page asked for a page at all -- a feed that stopped asking needs

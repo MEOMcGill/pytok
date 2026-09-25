@@ -23,7 +23,7 @@ def run_async(coro):
 
 
 def _seed_profile_dir(src: str, dst: str):
-    """Copy a warmed Chrome profile at `src` into the account's profile dir `dst`.
+    """Copy a warmed Firefox profile at `src` into the account's profile dir `dst`.
 
     Gives the login browser a warmed profile (history/state) while still capturing
     fresh cookies from the login flow. Refuses to clobber an already-populated
@@ -38,7 +38,11 @@ def _seed_profile_dir(src: str, dst: str):
             f"Profile dir already populated: {dst}. Refusing to overwrite a warmed/logged-in "
             f"profile — delete it (or add a fresh account) before seeding."
         )
-    shutil.copytree(src, dst, dirs_exist_ok=True)
+    from ..tiktok import PyTok
+
+    # The fingerprint stays behind so the new account gets one of its own.
+    shutil.copytree(src, dst, dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns(PyTok._FINGERPRINT_FILE))
 
 
 @click.group()
@@ -57,7 +61,7 @@ def cli(ctx, db):
 @click.option("--email-password", default=None, help="Email password")
 @click.option("--phone", default=None, help="Optional phone on file")
 @click.option("--cookies", default=None, help="Cookies JSON string, header string, or file path")
-@click.option("--profile-dir", default=None, help="Chrome profile dir (defaults to ~/.pytok/profiles/<user>)")
+@click.option("--profile-dir", default=None, help="Firefox profile dir (defaults to ~/.pytok/firefox-profiles/<user>)")
 @click.pass_context
 def add(ctx, username, password, email, email_password, phone, cookies, profile_dir):
     """Add a new account."""
@@ -101,7 +105,7 @@ def delete(ctx, username, delete_all):
             if not accounts:
                 click.echo("No accounts")
                 return
-            if not click.confirm(f"Delete ALL {len(accounts)} accounts? (Chrome profiles are left on disk)"):
+            if not click.confirm(f"Delete ALL {len(accounts)} accounts? (browser profiles are left on disk)"):
                 return
             await pool.delete_account([a.username for a in accounts])
             click.echo(f"Deleted {len(accounts)}")
@@ -280,7 +284,7 @@ def release(ctx, username):
 @click.option("--username", required=True, help="Login identifier to log in")
 @click.option("--headless", is_flag=True, help="Run headless (not recommended for login)")
 @click.option("--seed-profile", default=None,
-              help="Path to a warmed Chrome profile to copy into this account's profile dir "
+              help="Path to a warmed Firefox profile to copy into this account's profile dir "
                    "before login. Gives a warmed browser (history/state) while the login flow "
                    "still captures fresh cookies. Refuses to overwrite a populated profile dir; "
                    "the source template is copied, never mutated.")
@@ -298,11 +302,11 @@ def release(ctx, username):
 def login(ctx, username, headless, seed_profile, force_relogin, manual_login, timeout):
     """Open a browser for this account, log in, and capture identity + cookies.
 
-    Use this once per new account: it launches the account's persistent Chrome
+    Use this once per new account: it launches the account's persistent Firefox
     profile, runs the login/verification flow, then stores the resolved TikTok
     identity and a cookie backup so future sessions start already logged in.
 
-    Pass --seed-profile to copy a warmed Chrome profile into this account's
+    Pass --seed-profile to copy a warmed Firefox profile into this account's
     profile dir first, so the login runs in a browser that already looks
     used (helps avoid new-profile bot detection) while still logging in fresh.
 

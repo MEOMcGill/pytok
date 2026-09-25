@@ -3,7 +3,7 @@
 The new multi-account pattern replaces per-script ``api.login(...)`` calls: you
 register each account in a SQLite-backed pool once, log in interactively a single
 time, and thereafter every session comes up already authenticated from the
-account's persistent Chrome profile (repairing from the cookie backup if needed).
+account's persistent Firefox profile (repairing from the cookie backup if needed).
 
 This is the programmatic equivalent of the CLI:
 

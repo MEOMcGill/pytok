@@ -3,8 +3,7 @@ import json
 import random
 from collections import Counter
 from datetime import datetime
-
-from zendriver import cdp
+from types import SimpleNamespace
 
 from .. import captcha_solver, exceptions
 from ..helpers import extract_tag_contents
@@ -64,14 +63,8 @@ _CLICK_REFRESH_JS = "(() => {%s  return refreshClicked;\n})()" % _CLICK_REFRESH_
 
 # One round trip that does everything a scroll round needs from the page: clear whatever
 # TikTok has put over the feed, scroll the element that actually scrolls, and report where
-# that got us.
-#
-# It deliberately goes through page.evaluate rather than zendriver's element API. select_all()
-# fetches the whole DOM tree over CDP and then walks that tree once per match, so its cost
-# grows with the square of the feed: on a grid of a thousand items a single 'is the Refresh
-# button there?' check costs seconds, and it was charged once per round -- which capped how
-# deep any walk could get before the loop was spending all its time on bookkeeping. The same
-# work in JS is a millisecond at any feed size.
+# that got us. In one page.evaluate so a round costs a single round trip to the browser
+# however large the feed has grown.
 _SCROLL_FEED_JS = """
 (() => {
   const itemSel = %(items)s;
@@ -269,51 +262,58 @@ class Base:
                           before_round=before_round)
 
     async def _find_element_by_selector(self, selector, timeout=5):
-        """Find element by CSS selector, returns None if not found."""
-        page = self.parent._page
+        """Locator for the first element matching selector, or None if none appears."""
+        element = self.parent._page.locator(selector).first
         try:
-            element = await page.select(selector, timeout=timeout)
+            await element.wait_for(state="attached", timeout=timeout * 1000)
             return element
         except Exception:
             return None
 
     async def _find_element_by_text(self, text, timeout=5):
-        """Find element containing text, returns None if not found."""
-        page = self.parent._page
+        """Locator for the first element containing text, or None if none appears."""
+        element = self.parent._page.get_by_text(text).first
         try:
-            element = await page.find(text, timeout=timeout)
+            await element.wait_for(state="attached", timeout=timeout * 1000)
             return element
         except Exception:
             return None
 
+    async def _click_text(self, text, timeout=1):
+        """Click the first element containing text, if there is one. Returns whether it did."""
+        element = await self._find_element_by_text(text, timeout=timeout)
+        if element is None:
+            return False
+        try:
+            await element.click(timeout=timeout * 1000)
+            return True
+        except Exception:
+            return False
+
     async def _is_text_visible(self, text):
         """Check if text is visible on the page."""
-        page = self.parent._page
+        return await self._any_text_visible([text])
+
+    async def _any_text_visible(self, texts):
+        js = ("(() => { const t = document.body ? document.body.innerText : ''; "
+              "return %s.some(s => t.includes(s)); })()" % json.dumps(texts))
         try:
-            element = await page.find(text, timeout=1)
-            return element is not None
+            return bool(await self.parent._page.evaluate(js))
         except Exception:
             return False
 
     async def _find_p_element_by_text(self, text, timeout=5):
-        """Find a p element containing the specified text, returns None if not found."""
-        page = self.parent._page
+        """Locator for the first p element containing text, or None if none appears."""
+        element = self.parent._page.locator("p", has_text=text).first
         try:
-            p_elements = await page.select_all('p', timeout=timeout)
-            for p in p_elements:
-                if hasattr(p, 'text') and p.text and text in p.text:
-                    return p
-            return None
+            await element.wait_for(state="attached", timeout=timeout * 1000)
+            return element
         except Exception:
             return None
 
     async def _is_selector_visible(self, selector):
-        """Check if selector is visible on the page."""
-        try:
-            element = await self._find_element_by_selector(selector, timeout=1)
-            return element is not None
-        except Exception:
-            return False
+        """Check if selector is on the page."""
+        return await self._find_element_by_selector(selector, timeout=1) is not None
 
     async def _wait_for_page_load(self, page, what, required=True):
         """Wait for the current navigation to reach readyState 'complete'.
@@ -334,9 +334,8 @@ class Base:
         """
         timeout = getattr(self.parent, '_page_load_timeout', 45)
         try:
-            async with asyncio.timeout(timeout):
-                await page.wait_for_ready_state(until='complete', timeout=timeout + 1)
-        except (asyncio.TimeoutError, TimeoutError) as ex:
+            await self.parent.wait_for_load(timeout)
+        except TimeoutError as ex:
             msg = f"{what} did not reach readyState 'complete' within {timeout}s"
             if required:
                 raise exceptions.TimeoutException(msg) from ex
@@ -349,7 +348,7 @@ class Base:
         readyState 'complete' can be tens of seconds later on a heavy page -- so gating
         on 'complete' fails pages whose data has been sitting in the document the whole
         time. Polls rather than sleeping a fixed interval, because for the first moments
-        after a navigation get_content() returns a half-built document with no tag in it.
+        after a navigation content() returns a half-built document with no tag in it.
 
         `fallback` is an optional coroutine for callers whose data can arrive by another
         route: TikTok also serves these pages client-rendered, as a shell whose script
@@ -361,15 +360,11 @@ class Base:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         while loop.time() < deadline:
-            # A response body only lives in Chrome until it decides to drop it, so bank
-            # them as they finish rather than at the end of the wait: the listing the page
-            # fetches on load is often the only copy there is, and this wait can run for
-            # tens of seconds beside it.
             await self.parent.collect_pending_response_bodies()
             if fallback is not None and await fallback():
                 return
             try:
-                html = await page.get_content()
+                html = await page.content()
                 if html and extract_tag_contents(html):
                     return
             except Exception:
@@ -381,31 +376,14 @@ class Base:
         )
 
     async def _is_captcha_visible(self):
-        """Whether any captcha's text is on the page.
-
-        One page.evaluate over the rendered text rather than a DOM search per string.
-        zendriver's find() fetches and walks the document once per call, so on a feed that
-        has scrolled to a few hundred items this check cost seconds -- and a scroll walk
-        charges it to every round. Falls back to the per-string search if the page will not
-        evaluate, which is itself a state worth not guessing about.
-        """
-        js = ("(() => { const t = document.body ? document.body.innerText : ''; "
-              "return %s.some(s => t.includes(s)); })()" % json.dumps(CAPTCHA_TEXTS))
-        try:
-            return bool(await self.parent._page.evaluate(js))
-        except Exception:
-            for text in CAPTCHA_TEXTS:
-                if await self._is_text_visible(text):
-                    return True
-            return False
+        """Whether any captcha's text is on the page."""
+        return await self._any_text_visible(CAPTCHA_TEXTS)
 
     async def check_initial_call(self, url):
-        # For zendriver, we check responses via CDP - wait a bit for navigation
         await asyncio.sleep(2)
         responses = await self.parent.process_pending_responses(url)
         for resp in responses:
-            status = resp.get('response', {})
-            if hasattr(status, 'status') and status.status >= 300:
+            if resp.get('status', 0) >= 300:
                 raise exceptions.NotAvailableException("Content is not available")
 
     async def wait_for_content_or_captcha(self, content_tag):
@@ -465,22 +443,18 @@ class Base:
         if tries >= max_tries:
             # try some other behaviour
             current_url = page.url
-            # Bounce off the page only after banking what it already fetched:
-            # response bodies are read lazily and their request ids die with the
-            # page (see PyTok.collect_pending_response_bodies).
+            # Bounce off the page only after banking what it already fetched.
             await self.parent.collect_pending_response_bodies()
-            await page.get("https://www.tiktok.com")
+            await self.parent.navigate("https://www.tiktok.com", wait_until="domcontentloaded")
             await asyncio.sleep(5)
-            await page.get(current_url)
+            await self.parent.navigate(current_url, wait_until="domcontentloaded")
 
         return await self._find_element_by_selector(content_tag, timeout=1)
 
     async def check_and_resolve_refresh_button(self):
         """Click TikTok's 'Refresh' panel if it is up.
 
-        In one page.evaluate rather than through select_all('p'), which fetches the whole
-        DOM tree and then walks it once per match -- fine on a freshly loaded page, seconds
-        on a feed that has been scrolled (see _SCROLL_FEED_JS).
+        In one page.evaluate, so the check costs the same however far a feed has scrolled.
         """
         self.parent.logger.debug("Checking for refresh button")
         try:
@@ -511,7 +485,7 @@ class Base:
                     try:
                         login_close = await self._find_element_by_selector(selector, timeout=1)
                         if login_close:
-                            await login_close.click()
+                            await login_close.click(timeout=1000)
                             await asyncio.sleep(1)
                             closed = True
                             self.parent.logger.debug(f"Closed login popup with selector: {selector}")
@@ -659,11 +633,9 @@ class Base:
         # now try some other behaviour
         page = self.parent._page
         current_url = page.url
-        # Bank the bodies of anything this page already fetched before leaving it:
-        # their request ids stop resolving once the page is gone (see
-        # PyTok.collect_pending_response_bodies).
+        # Bank the bodies of anything this page already fetched before leaving it.
         await self.parent.collect_pending_response_bodies()
-        await page.send(cdp.page.navigate("https://www.tiktok.com"))
+        await self.parent.navigate("https://www.tiktok.com")
         await asyncio.sleep(3)
 
         # do some scrolling
@@ -671,11 +643,11 @@ class Base:
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
             await asyncio.sleep(2)
 
-        await page.send(cdp.page.navigate(current_url))
+        await self.parent.navigate(current_url)
 
         # Poll for the content instead of reading once after a fixed sleep. A page's
         # embedded data tag and its content grid land seconds apart, and for the first
-        # few seconds get_content() returns a half-built document with no tag at all --
+        # few seconds content() returns a half-built document with no tag at all --
         # so a caller that returns here on a short sleep hands back a page whose data
         # the caller then fails to parse, reported as if the page had no data.
         loop = asyncio.get_running_loop()
@@ -688,8 +660,6 @@ class Base:
         raise exceptions.TimeoutException("Content did not become visible in time")
 
     async def check_for_unavailable_or_captcha(self, unavailable_text):
-        page = self.parent._page
-
         captcha_visible = await self._is_captcha_visible()
         if captcha_visible:
             num_tries = 0
@@ -714,13 +684,8 @@ class Base:
 
         # Check for login close buttons
         for login_text in LOGIN_CLOSE_TEXTS:
-            try:
-                login_element = await page.find(login_text, timeout=1)
-                if login_element:
-                    await login_element.click()
-                    break
-            except Exception as e:
-                print(f"Failed to close login with error: {e}, continuing anyway...")
+            if await self._click_text(login_text):
+                break
 
         if await self._is_text_visible(unavailable_text):
             raise exceptions.NotAvailableException(f"Content is not available with message: '{unavailable_text}'")
@@ -730,15 +695,9 @@ class Base:
             raise exceptions.NotAvailableException(f"Content is not available with message: '{unavailable_text}'")
 
     async def check_for_reload_button(self):
-        try:
-            reload_button = await self._find_element_by_text('Refresh', timeout=1)
-            if reload_button:
-                await reload_button.click()
-        except Exception:
-            pass
+        await self._click_text('Refresh')
 
     async def wait_for_requests(self, api_path, timeout=TOK_DELAY):
-        # With zendriver, we use CDP events - wait and process
         for _ in range(timeout * 2):
             responses = await self.parent.process_pending_responses(api_path)
             if responses:
@@ -747,7 +706,7 @@ class Base:
         raise exceptions.TimeoutException(f"Timeout waiting for request: {api_path}")
 
     def get_requests(self, api_path):
-        """Get pending requests matching the API path from CDP tracking."""
+        """Get pending requests matching the API path."""
         return [
             info for info in self.parent._pending_requests.values()
             if api_path in info.get('url', '')
@@ -834,15 +793,9 @@ class Base:
             await asyncio.sleep(1)
 
     async def check_and_close_signin(self):
-        page = self.parent._page
         for login_text in LOGIN_CLOSE_TEXTS:
-            try:
-                signin_element = await page.find(login_text, timeout=1)
-                if signin_element:
-                    await signin_element.click()
-                    return
-            except Exception:
-                pass
+            if await self._click_text(login_text):
+                return
 
     async def solve_captcha(self):
         if self.parent._manual_captcha_solves:
@@ -856,7 +809,6 @@ class Base:
                         f.write(body)
             return
 
-        # Get captcha data from CDP responses
         captcha_responses = await self.parent.process_pending_responses('/captcha/get')
         if not captcha_responses:
             raise exceptions.EmptyResponseException("No captcha response found")
@@ -878,7 +830,6 @@ class Base:
         if captcha_type not in ['slide', 'whirl']:
             raise exceptions.CaptchaException(f"Unsupported captcha type: {captcha_type}")
 
-        # Get puzzle image from CDP responses
         puzzle_url = captcha_data['question']['url1']
         puzzle_responses = await self.parent.process_pending_responses(puzzle_url)
         if not puzzle_responses:
@@ -890,7 +841,6 @@ class Base:
         if not puzzle:
             raise exceptions.CaptchaException("Puzzle was not found in response")
 
-        # Get puzzle piece image from CDP responses
         piece_url = captcha_data['question']['url2']
         piece_responses = await self.parent.process_pending_responses(piece_url)
         if not piece_responses:
@@ -902,11 +852,12 @@ class Base:
         if not piece:
             raise exceptions.CaptchaException("Piece was not found in response")
 
-        # Solve captcha using the solver
-        page = self.parent._page
-        # Create a response-like object for the captcha solver
-        captcha_response_obj = type('Response', (), {'json': lambda: captcha_json})()
-        solver = captcha_solver.CaptchaSolver(captcha_response_obj, puzzle, piece, page=page)
+        async def challenge_json():
+            return captcha_json
+
+        # The solver only reads the challenge and drags on the page; it never posts back.
+        captcha_response_obj = SimpleNamespace(request=None, json=challenge_json)
+        solver = captcha_solver.CaptchaSolver(captcha_response_obj, puzzle, piece, page=self.parent._page)
         await solver.solve_and_drag()
 
         if self.parent._log_captcha_solves:

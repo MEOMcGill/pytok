@@ -25,7 +25,7 @@ early" is useful. Appending how many handles that affected on a given day is not
 
 PyTok is a TikTok web scraping library using a dual-approach architecture:
 - **Primary**: Signed requests to TikTok's web API, issued from the browser session (`tiktok_api.py`)
-- **Fallback**: Automatically falls back to browser automation (zendriver) when API fails
+- **Fallback**: Automatically falls back to browser automation (camoufox, a hardened Firefox driven through Playwright) when API fails
 
 All operations are async/await based.
 
@@ -60,8 +60,8 @@ ruff check pytok/ tests/ examples/
 
 ```
 PyTok (tiktok.py)
-├── zendriver browser - CDP network response tracking
-├── ZendriverTikTokApi client - API requests with msToken from browser cookies
+├── camoufox browser - Playwright network response tracking
+├── TikTokApiClient - in-page fetches that TikTok's own SDK signs
 └── Request cache - stores recent API responses
 
 API Classes (api/*.py) - all inherit from Base
@@ -82,12 +82,17 @@ except ApiFailedException:
     # Fallback to browser scraping
 ```
 
-### CDP Network Tracking
+### Network Tracking and Signing
 
-PyTok tracks network responses via Chrome DevTools Protocol:
+PyTok tracks network responses via Playwright's request events:
 - Captures responses matching `/api/`, `video/tos`, `v16-webapp`, `v19-webapp` URL patterns
-- Stores response bodies before Chrome garbage collects them
+- Reads each body as its request finishes, into `_collected_responses`
 - Used to extract video bytes and API data from page loads
+
+TikTok's webmssdk wraps the page's `fetch`/XHR and signs every API request made through
+them, so the API client just fetches from the page's main world (camoufox's `mw:` prefix)
+and the request goes out signed. Everything else evaluates in Playwright's isolated
+world, which the page's scripts cannot see.
 
 ### Captcha Handling
 

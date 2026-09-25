@@ -6,8 +6,6 @@ import re
 from typing import TYPE_CHECKING, Iterator, Optional
 from urllib.parse import urlparse
 
-from zendriver import cdp
-
 if TYPE_CHECKING:
     from ..tiktok import PyTok
     from .user import User
@@ -126,9 +124,8 @@ class Sound(Base):
     async def _info_full_scrape(self, **kwargs) -> dict:
         await self._navigate_to_sound_page()
 
-        # Read the detail response the page fired on load straight away: Chrome
-        # garbage-collects response bodies, and the DOM waits below can easily
-        # outlast this one.
+        # Read the detail response the page fired on load straight away, before the
+        # DOM waits below.
         music_info = await self._read_music_detail_responses()
 
         if music_info is None:
@@ -146,17 +143,17 @@ class Sound(Base):
                 await asyncio.sleep(1.5)
 
         if music_info is None:
-            # Chrome can garbage-collect a response body before we read it. The
+            # The detail response may never have been captured. The
             # music page doesn't normally ship a music-detail rehydration scope
             # the way the hashtag page does, but check anyway in case TikTok
             # server-renders it for this visitor.
             music_info = self._music_info_from_html(
-                await self.parent._page.get_content()
+                await self.parent._page.content()
             )
 
         if music_info is None:
             # The page load has now filled the param template for music/detail
-            # (PyTok._on_request_will_be_sent -> cache_api_params), so the API
+            # (PyTok._on_request -> cache_api_params), so the API
             # route can have another go — the first attempt may simply have had
             # no template to replay.
             try:
@@ -274,7 +271,7 @@ class Sound(Base):
 
         # Scraping route. Loading the sound page fires the webapp's own
         # music/item_list request, which fills the param template for that
-        # endpoint (PyTok._on_request_will_be_sent -> cache_api_params). So we
+        # endpoint (PyTok._on_request -> cache_api_params). So we
         # harvest that first page off the wire and then resume paginating through
         # the API from its cursor, instead of scrolling for every page.
         await self._load_sound_page()
@@ -369,9 +366,8 @@ class Sound(Base):
 
         The page load fires the webapp's own music/detail and music/item_list
         requests, which fill the param templates for those endpoints
-        (PyTok._on_request_will_be_sent -> cache_api_params).
+        (PyTok._on_request -> cache_api_params).
         """
-        page = self.parent._page
 
         # Drop anything captured for earlier operations first, so what we harvest
         # after the navigation belongs to this sound.
@@ -379,9 +375,8 @@ class Sound(Base):
 
         url = self._page_url
         self.parent.logger.debug(f"Loading page: {url}")
-        await page.send(cdp.page.navigate(url))
-        async with asyncio.timeout(30):
-            await page.wait_for_ready_state(until='complete', timeout=31)
+        await self.parent.navigate(url)
+        await self.parent.wait_for_load(30)
         await asyncio.sleep(3)
 
     async def _load_sound_page(self):

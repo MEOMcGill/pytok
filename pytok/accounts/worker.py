@@ -1,8 +1,8 @@
-"""Worker: owns one account + its PyTok/Chrome session, runs tasks on it.
+"""Worker: owns one account + its PyTok/browser session, runs tasks on it.
 
 A *task* is a user callable ``async def task(api: PyTok) -> result``. The worker
 acquires an account from the pool, lazily builds and enters a PyTok bound to it
-(persistent Chrome profile), and reuses that session across tasks until a
+(persistent Firefox profile), and reuses that session across tasks until a
 rotation/rest, a crash, or shutdown. Failures are routed by a pytok-flavoured
 taxonomy — data-level errors propagate to the caller, account/session-level
 errors trigger a cooldown + rotation, logouts trigger a session rebuild.
@@ -67,9 +67,8 @@ RATE_LIMIT_MINUTES = 15
 # page that will not finish loading for this session -- otherwise repeats it on every
 # handle forever, pinning the worker to one account.
 MAX_INPLACE_REBUILDS = 3
-# How long a session teardown may take before it is abandoned. Every CDP call awaits its
-# reply on an unbounded future, so a browser that dies mid-teardown can hang shutdown for
-# good -- and with it the worker, which then never reaches the release in rotate_account and
+# How long a session teardown may take before it is abandoned. A browser that dies
+# mid-teardown can hang shutdown for good -- and with it the worker, which then never reaches the release in rotate_account and
 # leaves its account marked in_use with nothing able to reclaim it. Abandoning the teardown
 # may orphan the browser process, which is the lesser loss.
 SESSION_CLOSE_TIMEOUT = 30

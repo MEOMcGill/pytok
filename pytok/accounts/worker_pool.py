@@ -1,6 +1,6 @@
 """WorkerPool: run tasks concurrently across a pool of account-bound sessions.
 
-Each Worker owns its own PyTok/Chrome instance (one per account, isolated by the
+Each Worker owns its own PyTok/browser instance (one per account, isolated by the
 account's profile dir), so N workers = N concurrent scraping sessions. Tasks are
 user callables ``async def task(api: PyTok) -> result`` submitted to a shared
 queue; the pool returns a Future per task (or gathers a batch via ``run``).
@@ -51,9 +51,9 @@ class WorkerPool:
             max_retries: per-task retry budget across rotated accounts.
             startup_stagger: optional extra delay (seconds) before each worker's
                 FIRST session build (worker-i waits i * startup_stagger). Left at
-                0 by default: browser launches are now serialized deterministically
-                by a shared startup lock (see below), so a fixed stagger is no
-                longer needed to keep concurrent Chrome starts from racing.
+                0 by default: browser launches are serialized by a shared startup
+                lock (see below), so a fixed stagger is not needed to keep
+                concurrent browser starts apart.
             **pytok_kwargs: forwarded to each PyTok (headless, request_delay,
                 page_load_timeout, manual_captcha_solves, ...).
         """
@@ -70,10 +70,9 @@ class WorkerPool:
         self._initialized = False
         self._shutdown = False
         self._init_lock = asyncio.Lock()
-        # Shared by every worker's PyTok to serialize the racy browser-launch
-        # phase (zendriver start + session bind). Created lazily in initialize()
-        # so it binds to the running loop. This — not startup_stagger — is what
-        # keeps N concurrent Chrome starts from racing each other's session setup.
+        # Shared by every worker's PyTok to serialize the browser-launch phase
+        # (browser start + first page load). Created lazily in initialize() so it
+        # binds to the running loop.
         self._startup_lock: Optional[asyncio.Lock] = None
 
     async def initialize(self) -> int:

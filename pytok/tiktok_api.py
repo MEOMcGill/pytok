@@ -1,7 +1,8 @@
-"""Standalone TikTok API client backed by zendriver.
+"""API client that issues TikTok's own signed requests from the browser page.
 
-Manages sessions (tabs) within a shared zendriver browser to make
-signed API requests to TikTok.
+TikTok's webmssdk wraps the page's fetch and XHR and signs every API request that goes
+through them (X-Bogus, X-Gnarly, msToken). So a plain fetch from the page's main world
+goes out signed exactly like the webapp's own requests, and nothing here signs anything.
 """
 from __future__ import annotations
 
@@ -12,10 +13,7 @@ import logging
 import random
 import time
 from typing import Any, Optional
-from urllib.parse import quote, urlencode, urlparse
-
-from zendriver import cdp
-from zendriver.core.connection import ProtocolException
+from urllib.parse import parse_qsl, quote, urlencode, urlparse
 
 from .exceptions import (
     EmptyResponseException,
@@ -27,61 +25,50 @@ from .exceptions import (
 
 @dataclasses.dataclass
 class TikTokSession:
-    """A TikTok session backed by a zendriver tab."""
+    """A TikTok session backed by a Playwright page."""
 
-    tab: Any
+    page: Any
     proxy: str = None
     params: dict = None
     headers: dict = None
-    ms_token: str = None
     base_url: str = "https://www.tiktok.com"
     is_valid: bool = True
 
 
+class TikTokApiClient:
+    """TikTok API client sharing PyTok's browser page.
 
-class ZendriverTikTokApi:
-    """TikTok API client backed by a shared zendriver browser.
-
-    Manages sessions (tabs) within a zendriver browser owned by PyTok.
+    Signs and fetches in the same page PyTok uses for network capture and DOM scraping.
+    PyTok owns the page and the browser; this client never closes either.
     """
 
-    # webmssdk.js defines window.byted_acrawler.frontierSign (X-Bogus signing).
-    # The URL is normally discovered from the live DOM so the version stays
-    # current; this hardcoded version is a stale-prone last resort only.
+    # webmssdk.js defines window.byted_acrawler and wraps fetch/XHR to sign requests.
+    # The URL is normally discovered from the live DOM so the version stays current;
+    # this hardcoded version is a stale-prone last resort only.
     _SIGNING_SDK_URL_FALLBACK = (
         "https://sf16-website-login.neutral.ttwstatic.com/obj/"
         "tiktok_web_login_static/webmssdk/1.0.0.374/webmssdk.js"
     )
 
-    # Params never replayed from a cached per-endpoint template: signatures and
-    # tokens are stale the moment they're captured (they're re-generated fresh
-    # per request instead). Everything else in a captured request — including
-    # endpoint-specific keys like cursor/secUid — is kept as the template value
-    # and simply overridden by the caller's own per-request params.
-    _TEMPLATE_EXCLUDED_PARAMS = frozenset({
+    # Params the SDK adds to every request it signs. Never replayed from a captured
+    # template, and ignored when matching a request on the wire to one we issued.
+    _SIGNING_PARAMS = frozenset({
         "msToken", "X-Bogus", "X-Gnarly", "X-Dynosaur",
     })
 
     # Templates rot: captured params include moment-bound values (time_of_day,
     # day_of_week, window state, ...) that TikTok cross-checks. Replaying a
     # template past this age gets playAddr URLs in the response poisoned (they
-    # 403 on download) even though the JSON response itself still succeeds —
-    # observed live ~25-45 min after capture. Treat an aged template as absent
-    # so the lazy scraping route re-captures a fresh one.
+    # 403 on download) even though the JSON response itself still succeeds.
+    # Treat an aged template as absent so the lazy scraping route re-captures
+    # a fresh one.
     TEMPLATE_TTL_SECONDS = 15 * 60
 
     def __init__(self, logging_level: Optional[int] = None, logger_name: str = None):
         self.sessions = []
-        self._session_recovery_enabled = True
-        self._session_creation_lock = asyncio.Lock()
         self._cleanup_called = False
-        self._owns_browser = False
-        self.browser = None
-        # The single browser tab shared with PyTok. This client signs and fetches
-        # in the same foreground tab that PyTok uses for CDP network capture and
-        # DOM scraping, so there are no background session tabs to keep alive.
-        # PyTok owns this tab's lifecycle; we must never close it.
-        self._shared_tab = None
+        self.context = None
+        self._shared_page = None
         self._shared_headers = None
         self._shared_base_url = "https://www.tiktok.com"
         # Cached webmssdk.js source, captured from a healthy session and
@@ -97,16 +84,12 @@ class ZendriverTikTokApi:
         # its own param shape — replaying another endpoint's params (or made-up
         # ones) invites bot detection / empty responses.
         self._api_param_cache = {}
-        # Freshest msToken seen on any captured webapp request. TikTok rotates
-        # the token constantly; a stale one is rejected on logged-in sessions.
-        self._latest_ms_token = None
-        # Signed URLs of fetches we issued ourselves, so PyTok's capture
-        # handler never recycles our own (template-derived) requests back into
-        # the template cache.
+        # URLs of fetches we issued ourselves, so PyTok's capture handler never
+        # recycles our own (template-derived) requests back into the template cache.
         self._inflight_fetch_urls = set()
 
         if logger_name is None:
-            logger_name = "ZendriverTikTokApi"
+            logger_name = "TikTokApiClient"
         self._create_logger(logger_name, logging_level)
 
     def _create_logger(self, name: str, level: Optional[int] = None):
@@ -121,15 +104,6 @@ class ZendriverTikTokApi:
             )
             handler.setFormatter(formatter)
             self.logger.addHandler(handler)
-
-    def __del__(self):
-        if not self._cleanup_called:
-            if self.sessions or self.browser:
-                self.logger.warning(
-                    "ZendriverTikTokApi object is being destroyed but cleanup was not called. "
-                    f"Leaked resources: {len(self.sessions)} sessions, "
-                    f"browser={'exists' if self.browser else 'none'}"
-                )
 
     def _get_session(self, **kwargs):
         """Get a session by index or randomly."""
@@ -152,19 +126,14 @@ class ZendriverTikTokApi:
 
     def cache_api_params(self, url: str, params: dict):
         """Store the query params of a webapp-issued API request as the
-        template for that endpoint type (freshest observation wins), and lift
-        its msToken as the newest known token.
+        template for that endpoint type (freshest observation wins).
 
-        Called by PyTok's CDP capture handler for every API request the
-        webapp's own JS issues; our own fetches are excluded via
-        _inflight_fetch_urls.
+        Called by PyTok's capture handler for every API request the webapp's
+        own JS issues; our own fetches are excluded via _inflight_fetch_urls.
         """
         key = self._endpoint_key(url)
         is_new = key not in self._api_param_cache
         self._api_param_cache[key] = (dict(params), time.monotonic())
-        ms_token = params.get("msToken")
-        if ms_token:
-            self._latest_ms_token = ms_token
         if is_new:
             self.logger.info(f"Captured param template for endpoint '{key}'")
 
@@ -184,23 +153,26 @@ class ZendriverTikTokApi:
             return None
         return params
 
+    def _unsigned_params(self, url: str) -> frozenset:
+        return frozenset(
+            (k, v) for k, v in parse_qsl(urlparse(url).query, keep_blank_values=True)
+            if k not in self._SIGNING_PARAMS
+        )
+
     def is_self_issued(self, url: str) -> bool:
         """True if this request URL is one of our own in-flight fetches.
 
-        Exact match against the registered signed URLs, plus a tolerant
-        fallback (same endpoint + same X-Bogus signature) in case the browser
-        re-normalizes the URL string on the wire.
+        The URL on the wire is ours plus whatever the SDK appended to sign it, so
+        compare on the endpoint and the decoded params the SDK does not touch.
         """
-        if url in self._inflight_fetch_urls:
-            return True
+        if not self._inflight_fetch_urls:
+            return False
         key = self._endpoint_key(url)
-        for inflight in self._inflight_fetch_urls:
-            if self._endpoint_key(inflight) != key:
-                continue
-            marker = inflight.rsplit("X-Bogus=", 1)
-            if len(marker) == 2 and f"X-Bogus={marker[1].split('&')[0]}" in url:
-                return True
-        return False
+        params = self._unsigned_params(url)
+        return any(
+            self._endpoint_key(inflight) == key and self._unsigned_params(inflight) == params
+            for inflight in self._inflight_fetch_urls
+        )
 
     def invalidate_cached_api_params(self, url: str):
         """Drop a (presumed stale/burned) endpoint template so the next request
@@ -211,51 +183,27 @@ class ZendriverTikTokApi:
 
     def clear_api_param_cache(self):
         self._api_param_cache = {}
-        self._latest_ms_token = None
 
     # ------------------------------------------------------------------
-    # Session validation
+    # Sessions
     # ------------------------------------------------------------------
 
     async def _is_session_valid(self, session) -> bool:
         if not session.is_valid:
             return False
         try:
-            if session.tab.closed:
+            if session.page.is_closed():
                 session.is_valid = False
                 return False
-            _ = session.tab.url
-            # A tab can be "open" with a readable URL yet have no JS execution
-            # context (Chrome froze/discarded a backgrounded tab). That only
-            # shows up as "Cannot find default execution context" mid-fetch, so
-            # probe it here. If the context is gone, try to reactivate the tab
-            # before writing the session off.
-            try:
-                await session.tab.send(
-                    cdp.runtime.evaluate(expression="1", return_by_value=True)
-                )
-            except Exception:
-                await session.tab.send(
-                    cdp.emulation.set_focus_emulation_enabled(True)
-                )
-                await session.tab.send(cdp.page.set_web_lifecycle_state("active"))
-                await session.tab.send(
-                    cdp.runtime.evaluate(expression="1", return_by_value=True)
-                )
+            await session.page.evaluate("1")
             return True
         except Exception as e:
             self.logger.warning(f"Session validation failed: {e}")
             session.is_valid = False
             return False
 
-    async def _mark_session_invalid(self, session):
-        # The session lives on PyTok's shared main tab, which we don't own — so
-        # we never close it and never drop it from the pool (there's nothing to
-        # recreate). Just flag it; _recover_sessions reactivates the tab.
-        session.is_valid = False
-
     async def _get_valid_session_index(self, **kwargs):
-        """Get a valid session, with automatic recovery if needed.
+        """Get a valid session.
 
         Args:
             session_index (int, optional): Specific session index to use.
@@ -264,235 +212,101 @@ class ZendriverTikTokApi:
             tuple: (index, session)
 
         Raises:
-            Exception: If no valid sessions available and recovery fails.
+            Exception: If the shared page is gone.
         """
-        max_attempts = 3
-
-        for attempt in range(max_attempts):
-            if kwargs.get("session_index") is not None:
-                i = kwargs["session_index"]
-                if i < len(self.sessions):
-                    session = self.sessions[i]
-                    if await self._is_session_valid(session):
-                        return i, session
-                    else:
-                        self.logger.warning(f"Requested session {i} is invalid")
-            else:
-                valid_sessions = []
-                for idx, session in enumerate(self.sessions):
-                    if await self._is_session_valid(session):
-                        valid_sessions.append((idx, session))
-
-                if valid_sessions:
-                    return random.choice(valid_sessions)
-
-            # No valid sessions found - attempt recovery if enabled
-            if self._session_recovery_enabled and attempt < max_attempts - 1:
-                self.logger.warning(
-                    f"No valid sessions found, attempting recovery "
-                    f"(attempt {attempt + 1}/{max_attempts})"
-                )
-                await self._recover_sessions()
-            else:
-                break
-
+        if kwargs.get("session_index") is not None:
+            i = kwargs["session_index"]
+            if i < len(self.sessions) and await self._is_session_valid(self.sessions[i]):
+                return i, self.sessions[i]
+            self.logger.warning(f"Requested session {i} is invalid")
+        else:
+            valid = [(i, s) for i, s in enumerate(self.sessions) if await self._is_session_valid(s)]
+            if valid:
+                return random.choice(valid)
         raise Exception(
-            "No valid sessions available. All sessions appear to be dead. "
-            "Please call create_sessions() again or restart the API."
+            "No valid sessions available: the browser page has closed or stopped "
+            "responding. Rebuild the PyTok session."
         )
-
-    # ------------------------------------------------------------------
-    # Polling helper (replaces page.wait_for_function)
-    # ------------------------------------------------------------------
-
-    async def _poll_for_condition(self, tab, js_condition, timeout=10, poll_interval=0.5):
-        """Poll a JS condition until truthy or timeout (seconds)."""
-        loop = asyncio.get_running_loop()
-        start = loop.time()
-        while loop.time() - start < timeout:
-            result = await tab.evaluate(js_condition)
-            if result:
-                return True
-            await asyncio.sleep(poll_interval)
-        raise asyncio.TimeoutError(
-            f"Condition '{js_condition}' not met within {timeout}s"
-        )
-
-    # ------------------------------------------------------------------
-    # Session creation
-    # ------------------------------------------------------------------
-
-    async def _build_shared_session(self):
-        """Wrap the shared main tab in a single TikTokSession.
-
-        Reads the current msToken from the browser cookie jar and derives the
-        session params from the live tab. Headers come from PyTok, which
-        captured them off the main tab's initial navigation.
-        """
-        session = TikTokSession(
-            tab=self._shared_tab,
-            ms_token=None,
-            headers=self._shared_headers,
-            base_url=self._shared_base_url,
-            is_valid=True,
-        )
-        cookies_dict = await self.get_session_cookies(session)
-        session.ms_token = cookies_dict.get("msToken")
-        if session.ms_token is None:
-            self.logger.info(
-                "Failed to get msToken from cookies; requests may fail. "
-                "Consider passing an ms_token."
-            )
-        return session
 
     async def create_sessions(
         self,
-        zendriver_browser,
-        existing_tab,
+        context,
+        existing_page,
         headers: dict | None = None,
         starting_url: str = "https://www.tiktok.com",
-        enable_session_recovery: bool = True,
         **kwargs,
     ):
-        """Bind the client to PyTok's shared main tab as a single session.
-
-        The client signs and fetches in the same foreground tab PyTok uses for
-        network capture and scraping. There are no background tabs, so nothing
-        needs keep-alive treatment against Chrome freezing.
+        """Bind the client to PyTok's shared page as a single session.
 
         Args:
-            zendriver_browser: The zendriver Browser instance (required).
-            existing_tab: PyTok's main page tab to share (required).
-            headers: Request headers PyTok captured from the main tab's initial
-                navigation; used for signed fetches and the httpx/requests paths.
+            context: The Playwright BrowserContext the page belongs to (for cookies).
+            existing_page: PyTok's page to share.
+            headers: Request headers PyTok captured from the page's initial
+                navigation; used by the httpx/requests download paths.
             starting_url: Base URL for the session.
-            enable_session_recovery: Enable reactivation of a stalled tab.
         """
-        self._session_recovery_enabled = enable_session_recovery
-        self.browser = zendriver_browser
-        self._shared_tab = existing_tab
+        self.context = context
+        self._shared_page = existing_page
         self._shared_headers = dict(headers) if headers else {}
         self._shared_base_url = starting_url
         self._cleanup_called = False
-
-        self.sessions = [await self._build_shared_session()]
-
-    async def _recover_sessions(self):
-        """Reactivate the shared tab rather than spawning a new one.
-
-        The single session lives on PyTok's main tab, which we don't own and
-        can't recreate. If it stalled (lost its JS execution context), pin it
-        active again and rebuild the session wrapper around it.
-        """
-        async with self._session_creation_lock:
-            if self._shared_tab is None:
-                return
-            self.logger.info("Reactivating shared session tab...")
-            try:
-                await self._shared_tab.send(
-                    cdp.emulation.set_focus_emulation_enabled(True)
-                )
-                await self._shared_tab.send(
-                    cdp.page.set_web_lifecycle_state("active")
-                )
-                await self._shared_tab.send(
-                    cdp.runtime.evaluate(expression="1", return_by_value=True)
-                )
-                self.sessions = [await self._build_shared_session()]
-                self.logger.info("Shared session reactivated")
-            except Exception as e:
-                self.logger.error(f"Failed to reactivate shared session: {e}")
-
-    # ------------------------------------------------------------------
-    # Session cleanup
-    # ------------------------------------------------------------------
+        self.sessions = [TikTokSession(
+            page=existing_page,
+            headers=self._shared_headers,
+            base_url=starting_url,
+        )]
 
     async def close_sessions(self):
-        """Drop the session reference. Does NOT close the shared main tab or the
+        """Drop the session reference. Does NOT close the shared page or the
         browser — PyTok owns both and tears them down itself."""
         self.sessions.clear()
-        self._shared_tab = None
+        self._shared_page = None
         self._cleanup_called = True
         self.logger.debug("Session reference cleared")
 
     async def refresh_session_params(self):
-        """Re-derive params and msToken for the shared session in place.
-
-        Called after PyTok re-navigates the main tab to refresh cookies/tokens.
-        No tab is closed or recreated.
-        """
-        if not self.sessions:
-            if self._shared_tab is not None:
-                self.sessions = [await self._build_shared_session()]
-            return
+        """Mark the shared session usable again after PyTok re-navigated its page."""
+        if not self.sessions and self._shared_page is not None:
+            await self.create_sessions(self.context, self._shared_page,
+                                       self._shared_headers, self._shared_base_url)
         for session in self.sessions:
-            cookies = await self.get_session_cookies(session)
-            ms_token = cookies.get("msToken")
-            if ms_token:
-                session.ms_token = ms_token
             session.is_valid = True
 
-    async def stop_playwright(self):
-        """No-op - we don't own the browser."""
-        pass
-
-    stop_browser = stop_playwright
-
     # ------------------------------------------------------------------
-    # JS fetch
+    # JS in the page's main world
     # ------------------------------------------------------------------
 
-    def generate_js_fetch(self, method: str, url: str, headers: dict) -> str:
-        """Generate a JS fetch IIFE for zendriver evaluate."""
-        # fetch() rejects a null headers value or non-string header values, so
-        # coerce to a clean string->string dict (headers may be None for some
-        # sessions, e.g. when loaded from a logged-in Chrome profile).
-        clean_headers = {
-            str(k): str(v) for k, v in (headers or {}).items() if v is not None
-        }
-        headers_js = json.dumps(clean_headers)
-        return (
-            f"(async () => {{"
-            f"  const resp = await fetch('{url}', {{ method: '{method}', headers: {headers_js} }});"
-            f"  return await resp.text();"
-            f"}})()"
-        )
+    @staticmethod
+    async def evaluate_main_world(page, expression: str):
+        """Evaluate in the page's own JS world rather than Playwright's isolated one.
 
-    async def _evaluate(self, tab, expression, await_promise=False):
-        """Evaluate JS, working around zendriver's falsy-value bug."""
-        remote_object, errors = await tab.send(
-            cdp.runtime.evaluate(
-                expression=expression,
-                user_gesture=True,
-                await_promise=await_promise,
-                return_by_value=True,
-                allow_unsafe_eval_blocked_by_csp=True,
-            )
-        )
-        if errors:
-            raise ProtocolException(errors)
-        if remote_object and remote_object.value is not None:
-            return remote_object.value
-        return None
+        Needed for anything that touches the webapp's globals: the signer lives there,
+        and only a fetch issued there goes through the SDK's wrapper and gets signed.
+        Requires the browser to have been launched with main_world_eval.
+        """
+        return await page.evaluate("mw:" + expression)
 
-    async def run_fetch_script(self, url: str, headers: dict, **kwargs):
-        js_script = self.generate_js_fetch("GET", url, headers)
-
+    async def run_fetch_script(self, url: str, **kwargs):
         try:
             _, session = await self._get_valid_session_index(**kwargs)
         except Exception:
             _, session = self._get_session(**kwargs)
 
-        # Register the URL so PyTok's CDP capture handler can tell this
-        # self-issued fetch apart from the webapp's own requests and never
-        # recycles it into the per-endpoint template cache.
+        js = (
+            "(async () => {"
+            f"  const resp = await fetch({json.dumps(url)}, {{ credentials: 'include' }});"
+            "  return await resp.text();"
+            "})()"
+        )
+        # Registered so PyTok's capture handler can tell this self-issued fetch
+        # apart from the webapp's own requests and never recycles it into the
+        # per-endpoint template cache.
         self._inflight_fetch_urls.add(url)
         try:
-            result = await self._evaluate(session.tab, js_script, await_promise=True)
-            return result
+            return await self.evaluate_main_world(session.page, js)
         except Exception as e:
             self.logger.error(f"Session failed during fetch: {e}")
-            await self._mark_session_invalid(session)
+            session.is_valid = False
             raise
         finally:
             self._inflight_fetch_urls.discard(url)
@@ -501,45 +315,27 @@ class ZendriverTikTokApi:
     # Cookies
     # ------------------------------------------------------------------
 
-    async def set_session_cookies(self, session, cookies):
-        """Set cookies on the shared browser.
-
-        Accepts either a list of cookie dicts (with name/value/domain/path keys)
-        or a simple {name: value} dict.
-        """
-        if isinstance(cookies, dict):
-            cookie_params = [
-                cdp.network.CookieParam(
-                    name=k, value=v, domain=".tiktok.com", path="/"
-                )
-                for k, v in cookies.items()
-                if v is not None
-            ]
-        else:
-            cookie_params = [
-                cdp.network.CookieParam(
-                    name=c["name"],
-                    value=c["value"],
-                    domain=c.get("domain", ".tiktok.com"),
-                    path=c.get("path", "/"),
-                )
-                for c in cookies
-            ]
-        await self.browser.cookies.set_all(cookie_params)
-
-    async def get_session_cookies(self, session):
-        cookies = await self.browser.cookies.get_all()
-        return {cookie.name: cookie.value for cookie in cookies}
+    async def get_session_cookies(self, session=None):
+        cookies = await self.context.cookies()
+        return {cookie["name"]: cookie["value"] for cookie in cookies}
 
     # ------------------------------------------------------------------
-    # X-Bogus / signing
+    # Signer
     # ------------------------------------------------------------------
 
-    async def _discover_signing_sdk_url(self, session):
-        """Find webmssdk.js's URL from the page DOM (keeps the version current)."""
-        return await session.tab.evaluate(
-            "(document.querySelector('script[src*=\"webmssdk/\"]') || {}).src || null"
-        )
+    async def _signer_present(self, session) -> bool:
+        return bool(await self.evaluate_main_world(
+            session.page, "typeof window.byted_acrawler !== 'undefined'"
+        ))
+
+    async def _poll_for_signer(self, session, timeout):
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            if await self._signer_present(session):
+                return True
+            await asyncio.sleep(0.5)
+        return False
 
     async def _capture_signing_sdk(self, session):
         """Fetch and cache webmssdk.js from a healthy session (once).
@@ -551,22 +347,20 @@ class ZendriverTikTokApi:
         if self._signing_sdk_src is not None:
             return
         try:
-            sdk_url = await self._discover_signing_sdk_url(session) \
-                or self._SIGNING_SDK_URL_FALLBACK
-            src = await session.tab.evaluate(
-                f"fetch({json.dumps(sdk_url)}).then(r => r.text())",
-                await_promise=True,
+            sdk_url = await session.page.evaluate(
+                "(document.querySelector('script[src*=\"webmssdk/\"]') || {}).src || null"
+            ) or self._SIGNING_SDK_URL_FALLBACK
+            src = await session.page.evaluate(
+                f"fetch({json.dumps(sdk_url)}).then(r => r.text())"
             )
             if src and len(src) > 1000:
                 self._signing_sdk_src = src
-                self.logger.debug(
-                    f"Captured signing SDK ({len(src)} bytes) from {sdk_url}"
-                )
+                self.logger.debug(f"Captured signing SDK ({len(src)} bytes) from {sdk_url}")
         except Exception as e:
             self.logger.debug(f"Failed to capture signing SDK: {e}")
 
     async def _inject_signing_sdk(self, session) -> bool:
-        """Re-inject the cached signer into a session via indirect eval.
+        """Re-inject the cached signer via indirect eval in the main world.
 
         webmssdk only defines window.byted_acrawler when executed in global
         scope via indirect eval; a <script> tag or document-start injection
@@ -575,129 +369,55 @@ class ZendriverTikTokApi:
         if self._signing_sdk_src is None:
             return False
         try:
-            # Stash on window first to avoid escaping a ~227KB source string
-            # into an evaluate expression.
-            await self._evaluate(
-                session.tab,
-                "window.__pytok_sdk__ = " + json.dumps(self._signing_sdk_src) + "; void 0",
+            await self.evaluate_main_world(
+                session.page,
+                f"(window.__pytok_sdk__ = {json.dumps(self._signing_sdk_src)}, void 0)",
             )
-            await self._evaluate(session.tab, "(0,eval)(window.__pytok_sdk__)")
-            present = await self._evaluate(
-                session.tab, "window.byted_acrawler !== undefined"
-            )
+            await self.evaluate_main_world(session.page, "((0,eval)(window.__pytok_sdk__), void 0)")
+            present = await self._signer_present(session)
             if present:
                 self.logger.info("Re-injected signing SDK into session via eval")
-            return bool(present)
+            return present
         except Exception as e:
             self.logger.debug(f"Failed to inject signing SDK: {e}")
             return False
 
     async def _reload_until_signer(self, session):
-        """Legacy fallback: reload TikTok pages until byted_acrawler appears.
-
-        Used only when no cached SDK is available to inject.
-        """
+        """Last resort: reload TikTok pages until byted_acrawler appears."""
         max_attempts = 5
+        try_urls = [
+            "https://www.tiktok.com/foryou",
+            "https://www.tiktok.com",
+            "https://www.tiktok.com/@tiktok",
+        ]
         for attempt in range(1, max_attempts + 1):
-            try:
-                timeout_time = random.randint(5000, 20000)
-                await self._poll_for_condition(
-                    session.tab,
-                    "window.byted_acrawler !== undefined",
-                    timeout=timeout_time / 1000,
-                )
+            if await self._poll_for_signer(session, timeout=random.uniform(5, 20)):
                 return
-            except asyncio.TimeoutError:
-                if attempt == max_attempts:
-                    raise asyncio.TimeoutError(
-                        f"Failed to load tiktok after {max_attempts} attempts, "
-                        "consider using a proxy"
-                    )
-
-                try_urls = [
-                    "https://www.tiktok.com/foryou",
-                    "https://www.tiktok.com",
-                    "https://www.tiktok.com/@tiktok",
-                    "https://www.tiktok.com/foryou",
-                ]
-                await session.tab.get(random.choice(try_urls))
+            if attempt == max_attempts:
+                raise asyncio.TimeoutError(
+                    f"Signer did not load after {max_attempts} page loads, consider using a proxy"
+                )
+            try:
+                await session.page.goto(random.choice(try_urls), wait_until="domcontentloaded")
             except Exception as e:
-                self.logger.error(f"Session died during x-bogus generation: {e}")
-                await self._mark_session_invalid(session)
+                self.logger.error(f"Session died while waiting for the signer: {e}")
+                session.is_valid = False
                 raise
 
     async def _ensure_signer_loaded(self, session):
-        """Ensure window.byted_acrawler is available, self-healing if not.
+        """Make sure the SDK is in the page, so our fetch gets signed.
 
         Fast path: the SDK is already present from the page load. If it is
-        missing, inject the cached SDK source via eval rather than blindly
-        reloading. Only when no cached SDK exists do we fall back to the
-        legacy reload-retry loop.
+        missing, inject the cached SDK source rather than blindly reloading.
+        Only when no cached SDK exists do we fall back to reloading pages.
         """
-        try:
-            await self._poll_for_condition(
-                session.tab, "window.byted_acrawler !== undefined", timeout=10
-            )
+        if await self._poll_for_signer(session, timeout=10):
             await self._capture_signing_sdk(session)
             return
-        except asyncio.TimeoutError:
-            pass
-
         if await self._inject_signing_sdk(session):
             return
-
         await self._reload_until_signer(session)
         await self._capture_signing_sdk(session)
-
-    async def generate_x_bogus(self, url: str, **kwargs):
-        try:
-            _, session = await self._get_valid_session_index(**kwargs)
-        except Exception:
-            _, session = self._get_session(**kwargs)
-
-        await self._ensure_signer_loaded(session)
-
-        try:
-            result = await session.tab.evaluate(
-                f'window.byted_acrawler.frontierSign("{url}")',
-                await_promise=True,
-            )
-            return result
-        except Exception as e:
-            self.logger.error(f"Session died during x-bogus evaluation: {e}")
-            await self._mark_session_invalid(session)
-            raise
-
-    async def sign_url(self, url: str, **kwargs):
-        """Sign a url with X-Bogus and X-Gnarly parameters."""
-        try:
-            i, session = await self._get_valid_session_index(**kwargs)
-        except Exception:
-            i, session = self._get_session(**kwargs)
-
-        sign_result = await self.generate_x_bogus(url, session_index=i)
-
-        x_bogus = sign_result.get("X-Bogus")
-        if x_bogus is None:
-            raise Exception("Failed to generate X-Bogus")
-
-        if "?" in url:
-            url += "&"
-        else:
-            url += "?"
-        url += f"X-Bogus={x_bogus}"
-
-        x_gnarly = sign_result.get("X-Gnarly")
-        if x_gnarly:
-            url += f"&X-Gnarly={x_gnarly}"
-
-        # Stale X-Dynosaur values are stripped from cached templates; attach a
-        # fresh one when the signer can produce it.
-        x_dynosaur = sign_result.get("X-Dynosaur")
-        if x_dynosaur:
-            url += f"&X-Dynosaur={x_dynosaur}"
-
-        return url
 
     # ------------------------------------------------------------------
     # make_request
@@ -706,7 +426,6 @@ class ZendriverTikTokApi:
     async def make_request(
         self,
         url: str,
-        headers: dict = None,
         params: dict = None,
         retries: int = 3,
         exponential_backoff: bool = True,
@@ -729,40 +448,17 @@ class ZendriverTikTokApi:
                 f"No param template captured yet for '{self._endpoint_key(url)}' "
                 "— falling back to scraping to fill the cache"
             )
-        base = {
-            k: v for k, v in template.items()
-            if k not in self._TEMPLATE_EXCLUDED_PARAMS
-        }
-        params = {**base, **params}
+        base = {k: v for k, v in template.items() if k not in self._SIGNING_PARAMS}
+        params = {**base, **(params or {})}
+        request_url = f"{url}?{urlencode(params, safe='=', quote_via=quote)}"
 
-        if headers is not None:
-            headers = {**session.headers, **headers}
-        else:
-            headers = session.headers
-
-        # msToken: TikTok rotates it constantly and (on logged-in sessions)
-        # rejects stale ones, so resolve it fresh per request — the newest of
-        # the live cookie and the token seen on the latest captured webapp
-        # request — rather than a value cached at session build.
-        if params.get("msToken") is None:
-            cookies = await self.get_session_cookies(session)
-            ms_token = cookies.get("msToken") or self._latest_ms_token or session.ms_token
-            if ms_token is None:
-                self.logger.warning(
-                    "Failed to get msToken from cookies, trying anyway (probably will fail)"
-                )
-            params["msToken"] = ms_token
-
-        encoded_params = f"{url}?{urlencode(params, safe='=', quote_via=quote)}"
-        signed_url = await self.sign_url(encoded_params, session_index=i)
+        await self._ensure_signer_loaded(session)
 
         retry_count = 0
         while retry_count < retries:
             retry_count += 1
             try:
-                result = await self.run_fetch_script(
-                    signed_url, headers=headers, session_index=i
-                )
+                result = await self.run_fetch_script(request_url, session_index=i)
 
                 if result is None:
                     raise Exception("run_fetch_script returned None")
@@ -801,15 +497,11 @@ class ZendriverTikTokApi:
                         await asyncio.sleep(1)
             except (EmptyResponseException, InvalidJSONException) as e:
                 # Request-level failure (bot detection / rate limiting / bad JSON),
-                # NOT a dead session. The tab, cookies and msToken are still good;
-                # tearing the session down and recovering a fresh one makes bot
-                # detection *more* likely (a new msToken looks less trustworthy),
-                # and it empties the pool so the next handle can't resume the API
-                # path without a full recovery. So keep the session and retry on
-                # it; after exhausting retries, drop this endpoint's template
-                # (it's evidently stale/burned) and propagate the exception so
-                # the caller falls back to scraping — which both serves the
-                # current request and re-captures a fresh template off the wire.
+                # NOT a dead session: tearing the browser down makes bot detection
+                # more likely, not less. Retry on the same session; after exhausting
+                # retries, drop this endpoint's template (it's evidently stale/burned)
+                # and propagate so the caller falls back to scraping — which both
+                # serves the current request and re-captures a fresh template.
                 if retry_count < retries:
                     self.logger.info(
                         f"Empty/invalid response ({type(e).__name__}), "
@@ -823,21 +515,15 @@ class ZendriverTikTokApi:
                     self.invalidate_cached_api_params(url)
                     raise
             except Exception as e:
-                # Session-level failure (tab died, protocol error, etc.): the
-                # session is genuinely unusable, so invalidate it and recover.
+                # Session-level failure (page closed, evaluation failed, ...).
                 self.logger.error(f"Error during request: {e}")
-                await self._mark_session_invalid(session)
-
+                session.is_valid = False
                 if retry_count < retries:
-                    self.logger.info(
-                        f"Retrying with a new session ({retry_count}/{retries})"
-                    )
+                    self.logger.info(f"Retrying request ({retry_count}/{retries})")
                     try:
                         i, session = await self._get_valid_session_index(**kwargs)
                     except Exception as session_error:
-                        self.logger.error(
-                            f"Failed to get valid session: {session_error}"
-                        )
+                        self.logger.error(f"Failed to get valid session: {session_error}")
                         raise
                 else:
                     raise
@@ -851,24 +537,16 @@ class ZendriverTikTokApi:
             _, session = await self._get_valid_session_index(**kwargs)
         except Exception:
             _, session = self._get_session(**kwargs)
-
-        try:
-            return await session.tab.get_content()
-        except Exception as e:
-            self.logger.error(f"Session died during get_session_content: {e}")
-            await self._mark_session_invalid(session)
-            raise
+        return await session.page.content()
 
     def get_resource_stats(self) -> dict:
         valid_sessions = sum(1 for s in self.sessions if s.is_valid)
-        invalid_sessions = len(self.sessions) - valid_sessions
         return {
             "total_sessions": len(self.sessions),
             "valid_sessions": valid_sessions,
-            "invalid_sessions": invalid_sessions,
-            "has_browser": self.browser is not None,
+            "invalid_sessions": len(self.sessions) - valid_sessions,
+            "has_context": self.context is not None,
             "cleanup_called": self._cleanup_called,
-            "recovery_enabled": self._session_recovery_enabled,
         }
 
     async def __aenter__(self):

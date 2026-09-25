@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pytok"
 version = "0.3.0"
-description = "TikTok scraper with automatic captcha solving using zendriver browser automation."
+description = "TikTok scraper with automatic captcha solving using camoufox browser automation."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "PolyForm-Noncommercial-1.0.0 AND MIT"
@@ -34,7 +34,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-    "zendriver",
+    "camoufox>=0.5.6",
     "requests",
     "httpx",
     "brotli",
@@ -88,7 +88,3 @@ ignore = [
     "F405",
     "B904",  # `raise ... from err` inside the API-fallback handlers
 ]
-
-[tool.ruff.lint.per-file-ignores]
-# Imports follow a runtime patch that has to be applied first.
-"pytok/tiktok.py" = ["E402"]
