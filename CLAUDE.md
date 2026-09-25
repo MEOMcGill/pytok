@@ -108,7 +108,7 @@ PyTok tracks network responses via Chrome DevTools Protocol:
 
 ```python
 PyTok(
-    logging_level=logging.WARNING,
+    logging_level=None,        # this session's logger, a child of "PyTok"; None inherits
     request_delay=0,           # seconds between requests
     headless=False,            # headless doesn't work reliably
     manual_captcha_solves=False,

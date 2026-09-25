@@ -36,7 +36,8 @@ DESKTOP_BASE_URL = "https://www.tiktok.com/"
 
 class PyTok:
     _is_context_manager = False
-    logger = logging.getLogger(LOGGER_NAME)
+    # Numbers the loggers of sessions that have no account to name them by.
+    _anonymous_sessions = 0
 
     # Default browser args for stealth
     _DEFAULT_BROWSER_ARGS = [
@@ -83,7 +84,7 @@ class PyTok:
 
     def __init__(
             self,
-            logging_level: int = logging.WARNING,
+            logging_level: Optional[int] = None,
             request_delay: Optional[int] = 0,
             headless: Optional[bool] = False,
             manual_captcha_solves: Optional[bool] = False,
@@ -103,8 +104,11 @@ class PyTok:
         """The PyTok class. Used to interact with TikTok.
 
         ##### Parameters
-        * logging_level: The logging level you want the program to run at, optional
-            These are the standard python logging module's levels.
+        * logging_level: The logging level for this session's logger, optional
+            These are the standard python logging module's levels. Each session logs
+            to its own child of the "PyTok" logger, named after its account, so this
+            never changes the level of other sessions or of "PyTok" itself. None
+            (default) inherits the level from "PyTok".
 
         * request_delay: The amount of time in seconds to wait before making a request, optional
             This is used to throttle your own requests as you may end up making too
@@ -198,7 +202,9 @@ class PyTok:
         else:
             self._browser_args = self._DEFAULT_BROWSER_ARGS + browser_args
 
-        self.logger.setLevel(logging_level)
+        self.logger = self._session_logger(account)
+        if logging_level is not None:
+            self.logger.setLevel(logging_level)
 
         self.request_cache = {}
 
@@ -206,6 +212,18 @@ class PyTok:
         self.tiktok_api = ZendriverTikTokApi(
             logging_level=logging_level
         )
+
+    @classmethod
+    def _session_logger(cls, account) -> logging.Logger:
+        """A child of the "PyTok" logger named after this session's account, so
+        concurrent sessions' lines can be told apart."""
+        if account is not None:
+            # Dots would split an email username into further logger levels.
+            name = account.display_name.replace(".", "_")
+        else:
+            cls._anonymous_sessions += 1
+            name = f"session{cls._anonymous_sessions}"
+        return logging.getLogger(LOGGER_NAME).getChild(name)
 
     # ------------------------------------------------------------------
     # API object factories
