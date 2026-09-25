@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
+import sys
 import urllib.parse
 from typing import TYPE_CHECKING, Iterator, Optional
 from urllib.parse import parse_qs, urlparse
@@ -60,6 +62,8 @@ class Search(Base):
     _max_page_size = 0
     """Largest page of results this search has been served. See
     _note_page_size. Reset per search_type() call."""
+    _scroll_stop = None
+    """Why the last scroll walk ended, for search_type's closing log line."""
 
     def __init__(self, search_term, parent: Optional[PyTok] = None):
         self.parent = parent
@@ -135,6 +139,7 @@ class Search(Base):
         # _note_page_size for what counts as its word.
         self._exhausted_listing = False
         self._max_page_size = 0
+        self._scroll_stop = None
 
         seen_ids = set()
         amount_yielded = 0
@@ -159,65 +164,106 @@ class Search(Base):
                 if enough():
                     return
 
-        if not prefer_scraping:
-            try:
-                async for result in emit(self._search_type_api(obj_type, cursor=offset)):
-                    yield result
-                if enough() or (amount_yielded and self._exhausted_listing):
-                    return
-                self.parent.logger.warning(
-                    f"API path returned {amount_yielded} search results ({obj_type}) "
-                    f"of {wanted} and stopped short of the end of the listing. "
-                    "Falling back to scraping method."
-                )
-            except ApiFailedException as ex:
-                self.parent.logger.warning(
-                    f"API search ({obj_type}) failed: {ex}. Falling back to scraping method."
-                )
+        # Which route the search is on, so the closing log line can say where it ended.
+        route = "API"
+        try:
+            if not prefer_scraping:
+                try:
+                    async for result in emit(self._search_type_api(obj_type, cursor=offset)):
+                        yield result
+                    if enough() or (amount_yielded and self._exhausted_listing):
+                        return
+                    self.parent.logger.warning(
+                        f"{self._label(obj_type)}: API path returned {amount_yielded} results "
+                        f"of {wanted} and stopped short of the end of the listing. "
+                        "Falling back to scraping method."
+                    )
+                except ApiFailedException as ex:
+                    self.parent.logger.warning(
+                        f"{self._label(obj_type)}: API search failed: {ex}. Falling back to scraping method."
+                    )
 
-        # Scraping route. Loading the search page fires the webapp's own search
-        # request, which fills the param template for that endpoint
-        # (PyTok._on_request_will_be_sent -> cache_api_params). So we harvest that
-        # first page off the wire and then resume paginating through the API from
-        # its cursor and search_id, instead of scrolling for every page.
-        await self._load_search_page(obj_type)
-        results, has_more, cursor, search_id = await self._harvest_page_results(obj_type)
-        self.parent.logger.info(
-            f"Got {len(results)} search results from the search page, "
-            f"has_more={has_more}, cursor={cursor}"
+            # Scraping route. Loading the search page fires the webapp's own search
+            # request, which fills the param template for that endpoint
+            # (PyTok._on_request_will_be_sent -> cache_api_params). So we harvest that
+            # first page off the wire and then resume paginating through the API from
+            # its cursor and search_id, instead of scrolling for every page.
+            route = "search page"
+            await self._load_search_page(obj_type)
+            results, has_more, cursor, search_id = await self._harvest_page_results(obj_type)
+            self.parent.logger.info(
+                f"{self._label(obj_type)}: got {len(results)} results from the search page, "
+                f"has_more={has_more}, cursor={cursor}"
+            )
+            async for result in emit(self._aiter(results)):
+                yield result
+            if enough():
+                return
+            if not has_more:
+                return
+
+            if not prefer_scraping:
+                route = "resumed API"
+                try:
+                    async for result in emit(
+                        self._search_type_api(obj_type, cursor=cursor, search_id=search_id)
+                    ):
+                        yield result
+                    if enough() or self._exhausted_listing:
+                        return
+                    # The resumed API stopped short of the end of the listing. Don't
+                    # settle for what we have — carry on by scrolling, which
+                    # paginates the same listing without replaying any params.
+                    self.parent.logger.warning(
+                        f"{self._label(obj_type)}: resumed API path stopped at {amount_yielded} results "
+                        f"of {wanted}, short of the end of the listing. "
+                        "Continuing by scrolling the page."
+                    )
+                except ApiFailedException as ex:
+                    self.parent.logger.warning(
+                        f"{self._label(obj_type)}: API still failing after the search page load ({ex}). "
+                        "Continuing by scrolling the page."
+                    )
+
+            route = "scroll"
+            remaining = None if count is None else count - amount_yielded
+            async for result in emit(self._scroll_for_results(obj_type, count=remaining)):
+                yield result
+        finally:
+            self._log_search_end(obj_type, route, amount_yielded, count, sys.exc_info()[1])
+
+    def _label(self, obj_type):
+        return f"search {obj_type} '{self.search_term}'"
+
+    def _log_search_end(self, obj_type, route, amount, count, exc):
+        """Log one line saying why search_type stopped.
+
+        A search stopped short by throttling otherwise looks exactly like one that
+        ran out of results, so every exit says which it was. Scrolling ending short
+        of an explicit count is a warning: it is what a throttled session looks like.
+        """
+        level = logging.INFO
+        if count is not None and amount >= count:
+            reason = "reached the requested count"
+        elif isinstance(exc, GeneratorExit):
+            reason = "the caller stopped iterating"
+        elif exc is not None:
+            level = logging.WARNING
+            reason = f"{type(exc).__name__}: {exc}"
+        elif self._exhausted_listing:
+            reason = "TikTok sent a short last page"
+        elif route == "scroll":
+            reason = f"scrolling stopped ({self._scroll_stop})"
+            if count is not None:
+                level = logging.WARNING
+        else:
+            reason = "the route ended without reaching the end of the listing"
+        wanted = count if count is not None else "all"
+        self.parent.logger.log(
+            level,
+            f"{self._label(obj_type)}: ended with {amount} of {wanted} results "
+            f"during the {route} route: {reason}",
         )
-        async for result in emit(self._aiter(results)):
-            yield result
-        if enough():
-            return
-        if not has_more:
-            return
-
-        if not prefer_scraping:
-            try:
-                async for result in emit(
-                    self._search_type_api(obj_type, cursor=cursor, search_id=search_id)
-                ):
-                    yield result
-                if enough() or self._exhausted_listing:
-                    return
-                # The resumed API stopped short of the end of the listing. Don't
-                # settle for what we have — carry on by scrolling, which
-                # paginates the same listing without replaying any params.
-                self.parent.logger.warning(
-                    f"Resumed API path stopped at {amount_yielded} search results "
-                    f"of {wanted}, short of the end of the listing. "
-                    "Continuing by scrolling the page."
-                )
-            except ApiFailedException as ex:
-                self.parent.logger.warning(
-                    f"API still failing after the search page load ({ex}). "
-                    "Continuing by scrolling the page."
-                )
-
-        remaining = None if count is None else count - amount_yielded
-        async for result in emit(self._scroll_for_results(obj_type, count=remaining)):
-            yield result
 
     def _note_page_size(self, page_size):
         """Record a page of results, and say whether it was a short one.
@@ -296,7 +342,7 @@ class Search(Base):
                     )
                 self._exhausted_listing = short_page
                 self.parent.logger.info(
-                    f"TikTok is not sending results beyond cursor {cursor} "
+                    f"{self._label(obj_type)}: TikTok is not sending results beyond cursor {cursor} "
                     f"(last page held {page_size})."
                 )
                 return
@@ -467,9 +513,9 @@ class Search(Base):
                     if not res.get("has_more", 0):
                         walk.stats['pages_saying_no_more'] += 1
         finally:
+            self._scroll_stop = walk.reason
             self.parent.logger.info(
-                f"search {obj_type} '{self.search_term}': walked {yielded} results, "
-                f"{walk.summary()}"
+                f"{self._label(obj_type)}: walked {yielded} results, {walk.summary()}"
             )
 
     def _yield_results(self, obj_type, res, with_id=False):

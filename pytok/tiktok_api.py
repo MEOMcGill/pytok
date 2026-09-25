@@ -70,7 +70,7 @@ class ZendriverTikTokApi:
     # so the lazy scraping route re-captures a fresh one.
     TEMPLATE_TTL_SECONDS = 15 * 60
 
-    def __init__(self, logging_level: int = logging.WARN, logger_name: str = None):
+    def __init__(self, logging_level: Optional[int] = None, logger_name: str = None):
         self.sessions = []
         self._session_recovery_enabled = True
         self._session_creation_lock = asyncio.Lock()
@@ -109,10 +109,11 @@ class ZendriverTikTokApi:
             logger_name = "ZendriverTikTokApi"
         self._create_logger(logger_name, logging_level)
 
-    def _create_logger(self, name: str, level: int = logging.DEBUG):
-        """Create a logger for the class."""
+    def _create_logger(self, name: str, level: Optional[int] = None):
+        """Create a logger for the class. level=None leaves the logger's level alone."""
         self.logger: logging.Logger = logging.getLogger(name)
-        self.logger.setLevel(level)
+        if level is not None:
+            self.logger.setLevel(level)
         if not self.logger.handlers:
             handler = logging.StreamHandler()
             formatter = logging.Formatter(
