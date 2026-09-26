@@ -150,7 +150,7 @@ async with await PyTok.from_pool(pool) as api:   # or username="you@email.com"
     user_data = await user.info()
 
     async for video in user.videos(count=100):
-        video_data = video.info()
+        video_data = await video.info()
         video_bytes = await video.bytes()
 ```
 
