@@ -368,6 +368,10 @@ class User(Base):
         nothing followed this page, so without it a walk far short of videoCount was cut off
         rather than finished.
         """
+        # Every listing route filters or requests by secUid, which only info() looks up.
+        if not self.sec_uid and self.username:
+            await self.info()
+
         # None when info() was never called: no expectation to check against, so the guard
         # below stays off rather than guessing.
         expected_videos = self.as_dict.get('videoCount') if self.as_dict else None
