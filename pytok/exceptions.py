@@ -56,6 +56,9 @@ class NoContentException(TikTokException):
 class TimeoutException(TikTokException):
     """Timed out trying to get content from TikTok"""
 
+class ConnectionDroppedException(TikTokException):
+    """TikTok closed the connection without answering, which it does to a throttled session."""
+
 class ApiFailedException(TikTokException):
     """TikTok API is failing"""
 
