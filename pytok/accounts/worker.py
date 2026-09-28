@@ -16,6 +16,7 @@ from ..exceptions import (
     AccountPrivateException,
     ApiFailedException,
     CaptchaException,
+    ConnectionDroppedException,
     EmptyResponseException,
     FewerVideosThanExpectedException,
     InvalidJSONException,
@@ -55,6 +56,7 @@ ROTATE_EXCEPTIONS = (
     # The profile does have the videos; this session could not page through them, so a fresh
     # one is worth trying. Data-level would mean giving up on the handle after one attempt.
     FewerVideosThanExpectedException,
+    ConnectionDroppedException,
 )
 
 # Rotation / rest policy.
@@ -241,7 +243,9 @@ class Worker:
                 # is the param cache filling itself on the first request per endpoint, a routine
                 # condition that says nothing about the account, so charging it the long cooldown
                 # idles a healthy account for nothing.
-                if isinstance(e, ApiFailedException) and not isinstance(e, NoTemplateException):
+                # A dropped connection is TikTok throttling this account, so the same.
+                if isinstance(e, ConnectionDroppedException) or (
+                        isinstance(e, ApiFailedException) and not isinstance(e, NoTemplateException)):
                     minutes = RATE_LIMIT_MINUTES
                 else:
                     minutes = REST_MINUTES

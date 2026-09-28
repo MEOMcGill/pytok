@@ -47,6 +47,10 @@ class PyTok:
     # from the video CDN, the tiktok.com host header gets it a 403.
     _UNREPLAYABLE_HEADERS = frozenset({'host', 'cookie', 'connection', 'content-length'})
 
+    # Firefox's error when TikTok closes the connection without a response, which it does
+    # to every page for a session it is throttling.
+    _DROPPED_CONNECTION_ERROR = "NS_ERROR_NET_EMPTY_RESPONSE"
+
     # Where a persistent profile keeps the fingerprint it was first given.
     _FINGERPRINT_FILE = "pytok-fingerprint.json"
 
@@ -354,6 +358,10 @@ class PyTok:
         except PlaywrightError as ex:
             if "NS_BINDING_ABORTED" in str(ex) or "interrupted by another navigation" in str(ex):
                 self.logger.debug(f"Navigation to {url} was superseded: {ex}")
+            elif self._DROPPED_CONNECTION_ERROR in str(ex):
+                raise ConnectionDroppedException(
+                    f"TikTok dropped the connection loading {url}"
+                ) from ex
             else:
                 raise
 
@@ -371,8 +379,14 @@ class PyTok:
         # before account verification so a slow login/captcha doesn't block other
         # workers' startup.
         startup_lock = self._startup_lock or contextlib.nullcontext()
-        async with startup_lock:
-            await self._launch_browser_and_bind_session()
+        try:
+            async with startup_lock:
+                await self._launch_browser_and_bind_session()
+        except Exception:
+            # Tear down the half-started browser and release the account.
+            self._is_context_manager = True
+            await self.shutdown()
+            raise
 
         # If running as a pool account, verify the profile is logged into the
         # expected identity (repairing from the cookie backup / login if needed)
@@ -453,9 +467,8 @@ class PyTok:
         self._page.on("requestfailed", self._on_request_failed)
 
         try:
-            await self._page.goto('https://www.tiktok.com', wait_until='load',
-                                  timeout=self._page_load_timeout * 1000)
-        except PlaywrightTimeoutError as ex:
+            await self.navigate('https://www.tiktok.com', wait_until='load')
+        except TimeoutError as ex:
             raise TimeoutError(
                 f"tiktok.com did not finish loading within {self._page_load_timeout}s "
                 f"(pass a larger page_load_timeout if the site is just loading slowly)"

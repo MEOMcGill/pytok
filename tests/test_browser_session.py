@@ -94,3 +94,47 @@ def test_migration_forgets_chrome_profile_dirs():
             return [r[0] for r in db.execute("SELECT profile_dir FROM accounts")]
 
     assert asyncio.run(stored_dirs()) == [None]
+
+
+class _FailingPage:
+    def __init__(self, message):
+        self.message = message
+
+    async def goto(self, url, **kwargs):
+        from playwright.async_api import Error
+        raise Error(self.message)
+
+
+def test_a_dropped_connection_is_its_own_exception():
+    from pytok.exceptions import ConnectionDroppedException
+
+    api = _unstarted_pytok()
+    api._page = _FailingPage("Page.goto: NS_ERROR_NET_EMPTY_RESPONSE")
+    with pytest.raises(ConnectionDroppedException):
+        asyncio.run(api.navigate("https://www.tiktok.com/@nba"))
+
+    # a navigation that TikTok's own redirect cut short is not an error
+    api._page = _FailingPage("Page.goto: NS_BINDING_ABORTED")
+    asyncio.run(api.navigate("https://www.tiktok.com/@nba"))
+
+
+def test_a_failed_launch_shuts_down_and_releases_the_account():
+    released = []
+
+    class _Pool:
+        async def update_last_used(self, username):
+            pass
+
+        async def release_account(self, username):
+            released.append(username)
+
+    account = SimpleNamespace(username="acct-a", display_name="acct-a", profile_dir=None, cookies=[])
+    api = PyTok(account=account, accounts_pool=_Pool())
+
+    async def launch_fails():
+        raise RuntimeError("browser would not start")
+
+    api._launch_browser_and_bind_session = launch_fails
+    with pytest.raises(RuntimeError):
+        asyncio.run(api.__aenter__())
+    assert released == ["acct-a"]
