@@ -9,6 +9,7 @@ import time
 from typing import Optional, Union
 from urllib.parse import parse_qs, urlparse
 
+import httpx
 from camoufox.async_api import AsyncCamoufox
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -164,6 +165,10 @@ class PyTok:
         self._user_data_dir = user_data_dir
         self._page_load_timeout = page_load_timeout
         self._browser_args = list(browser_args or [])
+        # CDN media downloads share one client, and one browser cookie read per
+        # MEDIA_COOKIE_TTL, rather than paying a handshake and a browser round trip per video.
+        self._media_http_client = None
+        self._media_cookies_read_at = None
 
         self.logger = self._session_logger(account)
         if logging_level is not None:
@@ -561,6 +566,12 @@ class PyTok:
                         await self._accounts_pool.release_account(self._account.username)
                 except Exception:
                     pass
+        if self._media_http_client is not None:
+            try:
+                await self._media_http_client.aclose()
+            except Exception:
+                pass
+            self._media_http_client = None
         try:
             # Drop the API client's session reference (does not touch the page)
             await self.tiktok_api.close_sessions()
@@ -573,6 +584,36 @@ class PyTok:
                 await camoufox.__aexit__(None, None, None)
         except Exception:
             pass
+
+    # Long enough to spare the browser a cookie read per video, short enough to pick up
+    # rotated cookies without waiting for a rejection.
+    MEDIA_COOKIE_TTL = 300
+
+    async def _media_client(self, timeout: float) -> httpx.AsyncClient:
+        """The session's shared client for CDN media, carrying the browser's cookies.
+
+        The CDN authorizes by session cookie. The cookie read is the only browser round
+        trip in a download, so it is bounded by `timeout`: a page that no longer answers
+        fails here rather than hanging the caller.
+        """
+        if self._media_http_client is None:
+            self._media_http_client = httpx.AsyncClient(follow_redirects=True)
+            self._media_cookies_read_at = None
+        read_at = self._media_cookies_read_at
+        if read_at is None or time.monotonic() - read_at > self.MEDIA_COOKIE_TTL:
+            browser_cookies = await asyncio.wait_for(self._context.cookies(), timeout=timeout)
+            # set on the client's jar rather than per request: httpx rebuilds a redirect's
+            # Cookie header from the jar, dropping anything passed with the request
+            jar = httpx.Cookies()
+            for c in browser_cookies:
+                jar.set(c['name'], c['value'], domain=c.get('domain', ''), path=c.get('path') or '/')
+            self._media_http_client.cookies = jar
+            self._media_cookies_read_at = time.monotonic()
+        return self._media_http_client
+
+    def _expire_media_cookies(self) -> None:
+        """Make the next media download re-read the browser's cookies."""
+        self._media_cookies_read_at = None
 
     async def __aexit__(self, type, value, traceback):
         await self.shutdown()
@@ -595,6 +636,8 @@ class PyTok:
             await self.navigate('https://www.tiktok.com')
             await self.wait_for_load(15)
             await asyncio.sleep(3)
+
+        self._expire_media_cookies()
 
         # Clear accumulated state
         self.request_cache = {}
