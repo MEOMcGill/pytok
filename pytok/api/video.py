@@ -30,6 +30,10 @@ from .base import Base
 
 logger = logging.getLogger("pytok.api.video")
 
+
+class _CdnRejected(Exception):
+    """The CDN answered a direct media download with an error status."""
+
 class Counter:
     def __init__(self):
         self._counter = 0
@@ -356,6 +360,10 @@ class Video(Base):
         with open('saved_video.mp4', 'wb') as output:
             output.write(video_bytes)
         ```
+
+        `timeout` bounds every wait on the browser and how long a direct download may go
+        without receiving data, not the whole download: a large video still arriving on a
+        slow link is not cut off.
         """
         # playAddr is the highest-bitrate variant; prefer it for quality, fall back to
         # download. Carry the variant name so a failure can say which URL was tried.
@@ -377,40 +385,48 @@ class Video(Base):
         if cached is not None and self._looks_like_video(cached):
             return cached
 
-        # Otherwise fetch the signed CDN URL ourselves. The CDN authorizes by session cookie,
-        # so the request must carry credentials — a cookieless fetch 403s. See pytok memory:
-        # video-cdn-cors-block.
-        #
-        # Prefer a direct httpx download carrying the browser's session cookies: it's much
-        # faster for large files than the in-browser fetch, which has to base64-encode the
-        # whole video and ship it back through the browser driver. Fall back to the in-browser
-        # fetch() only if the direct request is rejected (e.g. the CDN ever tightens checks).
+        # Otherwise fetch the signed CDN URL ourselves, directly with httpx: the in-browser
+        # fetch has to base64-encode the whole video and ship it back through the browser
+        # driver, so it is only worth trying when the CDN rejected the direct request (e.g.
+        # it ever tightens checks). A direct download that timed out or dropped would fare
+        # no better going through the browser's network stack.
         req_exceptions = []
-        for fetcher_name, fetcher in (("httpx", self._httpx_fetch_bytes),
-                                      ("browser", self._browser_fetch_bytes)):
+        rejected = False
+        for url_name, bytes_url in bytes_urls:
+            label = f"httpx/{url_name}"
+            started = time.monotonic()
+            try:
+                data = await self._httpx_fetch_bytes(bytes_url, timeout)
+            except asyncio.TimeoutError:
+                # only the cookie read waits on the browser, and a page that does not answer
+                # that will not answer the in-page fallback either
+                req_exceptions.append(f"{label}: reading the browser's cookies timed out after {timeout}s")
+                break
+            except _CdnRejected as ex:
+                rejected = True
+                req_exceptions.append(f"{label}: {ex}")
+            except Exception as ex:
+                req_exceptions.append(
+                    f"{label}: {self._describe_exception(ex)} (after {time.monotonic() - started:.1f}s)"
+                )
+            else:
+                if self._looks_like_video(data):
+                    return data
+                rejected = True
+                req_exceptions.append(f"{label}: {self._describe_body(data)}")
+
+        if rejected:
             for url_name, bytes_url in bytes_urls:
-                label = f"{fetcher_name}/{url_name}"
+                label = f"browser/{url_name}"
                 started = time.monotonic()
                 try:
-                    data = await asyncio.wait_for(fetcher(bytes_url), timeout=timeout)
+                    data = await asyncio.wait_for(self._browser_fetch_bytes(bytes_url), timeout=timeout)
                 except asyncio.TimeoutError:
-                    # asyncio.TimeoutError stringifies to '', which is what used to make
-                    # this whole list read as ['httpx: ', 'browser: ', ...] -- saying
-                    # nothing about what went wrong. Name it outright. Landing here rather
-                    # than on httpx's own ReadTimeout is a signal in itself: it points at
-                    # the browser round trip (cookie read, in-page eval) rather than at the
-                    # CDN download.
+                    # asyncio.TimeoutError stringifies to '', so name it outright
                     req_exceptions.append(f"{label}: timed out after {timeout}s")
                 except Exception as ex:
-                    # never interpolate a bare exception -- plenty of them stringify to ''
-                    if not str(ex):
-                        detail = type(ex).__name__
-                    elif type(ex) is Exception:
-                        detail = str(ex)  # raised here with a written-out message already
-                    else:
-                        detail = f"{type(ex).__name__}: {ex}"
                     req_exceptions.append(
-                        f"{label}: {detail} (after {time.monotonic() - started:.1f}s)"
+                        f"{label}: {self._describe_exception(ex)} (after {time.monotonic() - started:.1f}s)"
                     )
                 else:
                     if self._looks_like_video(data):
@@ -419,6 +435,15 @@ class Video(Base):
         raise Exception(
             f"Failed to get video bytes for video {self.id}: " + "; ".join(req_exceptions)
         )
+
+    @staticmethod
+    def _describe_exception(ex) -> str:
+        """Never interpolate a bare exception: plenty of them stringify to ''."""
+        if not str(ex):
+            return type(ex).__name__
+        if type(ex) is Exception:
+            return str(ex)  # raised here with a written-out message already
+        return f"{type(ex).__name__}: {ex}"
 
     @staticmethod
     def _describe_body(body) -> str:
@@ -453,19 +478,23 @@ class Video(Base):
         Other large CDN blobs (DASH fragments, separate audio, range probes) lack this."""
         return isinstance(body, (bytes, bytearray)) and body[4:8] == b'ftyp'
 
-    async def _httpx_fetch_bytes(self, bytes_url) -> bytes:
-        """Download the signed CDN URL directly with httpx, carrying the browser's session
-        cookies (the CDN authorizes by cookie) and the browser session's headers. Avoids the
-        base64 round trip of the in-browser fetch, so it's much faster for large files
-        and can run concurrently with browser activity."""
-        cookies = {c['name']: c['value'] for c in await self.parent._context.cookies([bytes_url])}
+    async def _httpx_fetch_bytes(self, bytes_url, timeout) -> bytes:
+        """Download the signed CDN URL directly with httpx, over the session's shared media
+        client (which carries the browser's cookies) and with the browser session's headers.
+
+        `timeout` bounds the cookie read, raising asyncio.TimeoutError, and each wait on the
+        network, raising httpx.TimeoutException; it does not bound the whole transfer, so a
+        large video still arriving on a slow link is not cut off and restarted.
+        """
+        client = await self.parent._media_client(timeout)
         _, session = self.parent.tiktok_api._get_session()
         headers = dict(session.headers)
         headers['Referer'] = 'https://www.tiktok.com/'
-        async with httpx.AsyncClient(follow_redirects=True, timeout=60) as client:
-            resp = await client.get(bytes_url, headers=headers, cookies=cookies)
+        resp = await client.get(bytes_url, headers=headers, timeout=httpx.Timeout(timeout))
+        if resp.status_code in (401, 403):
+            self.parent._expire_media_cookies()
         if resp.status_code not in (200, 206):
-            raise Exception(f"httpx fetch returned status {resp.status_code}")
+            raise _CdnRejected(f"httpx fetch returned status {resp.status_code}")
         return resp.content
 
     async def _browser_fetch_bytes(self, bytes_url) -> bytes:
