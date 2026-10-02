@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import logging
+import secrets
 import time
 from datetime import datetime
 from typing import TYPE_CHECKING, Optional
@@ -497,29 +498,62 @@ class Video(Base):
             raise _CdnRejected(f"httpx fetch returned status {resp.status_code}")
         return resp.content
 
+    # Bytes per slice sent back from the page: small enough that no single JS string
+    # nears the engine's length limit or the renderer's heap, however large the video.
+    BROWSER_FETCH_SLICE = 8 * 1024 * 1024
+
     async def _browser_fetch_bytes(self, bytes_url) -> bytes:
         """Fetch the video via an in-page fetch() so the request goes through the browser's network
-        stack with the session cookies (credentials:'include'), then ship the bytes back
-        base64-encoded. The CDN authorizes by cookie, so credentials are required."""
-        js = (
+        stack with the session cookies (credentials:'include'). The CDN authorizes by cookie, so
+        credentials are required.
+
+        The body stays in the page as a Uint8Array under a random key and comes back in
+        base64 slices, so the whole file is never one string; the key is deleted afterwards.
+        """
+        # In the main world: the isolated one can't read the page's ArrayBuffer.
+        evaluate = self.parent.tiktok_api.evaluate_main_world
+        page = self.parent._page
+        key = json.dumps(f"__pytok_bytes_{secrets.token_hex(8)}")
+        fetch_js = (
             "(async () => { try {"
             f"  const resp = await fetch({json.dumps(bytes_url)}, {{ method: 'GET', credentials: 'include' }});"
             "  if (!resp.ok) return JSON.stringify({ok: false, status: resp.status});"
             "  const bytes = new Uint8Array(await resp.arrayBuffer());"
-            "  let binary = ''; const chunk = 0x8000;"
-            "  for (let i = 0; i < bytes.length; i += chunk) {"
-            "    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk)); }"
-            "  return JSON.stringify({ok: true, b64: btoa(binary)});"
+            f"  Object.defineProperty(window, {key}, {{ value: bytes, configurable: true }});"
+            "  return JSON.stringify({ok: true, size: bytes.length});"
             "} catch (e) { return JSON.stringify({ok: false, error: String(e)}); } })()"
         )
-        # In the main world: the isolated one can't read the page's ArrayBuffer.
-        result = await self.parent.tiktok_api.evaluate_main_world(self.parent._page, js)
-        if not result:
-            raise Exception("In-browser byte fetch returned no result")
-        data = json.loads(result)
-        if not data.get("ok"):
-            raise Exception(f"In-browser byte fetch failed: status={data.get('status')} {data.get('error', '')}")
-        return base64.b64decode(data["b64"])
+        try:
+            result = await evaluate(page, fetch_js)
+            if not result:
+                raise Exception("In-browser byte fetch returned no result")
+            data = json.loads(result)
+            if not data.get("ok"):
+                raise Exception(f"In-browser byte fetch failed: status={data.get('status')} {data.get('error', '')}")
+            size = data["size"]
+            slices = []
+            for offset in range(0, size, self.BROWSER_FETCH_SLICE):
+                end = min(offset + self.BROWSER_FETCH_SLICE, size)
+                b64 = await evaluate(page, (
+                    "(() => {"
+                    f"  const bytes = window[{key}];"
+                    "  if (!bytes) return null;"
+                    f"  const part = bytes.subarray({offset}, {end});"
+                    "  let binary = ''; const chunk = 0x8000;"
+                    "  for (let i = 0; i < part.length; i += chunk) {"
+                    "    binary += String.fromCharCode.apply(null, part.subarray(i, i + chunk)); }"
+                    "  return btoa(binary);"
+                    "})()"
+                ))
+                if b64 is None:
+                    raise Exception("In-browser byte fetch lost its buffer (page navigated?)")
+                slices.append(base64.b64decode(b64))
+            return b"".join(slices)
+        finally:
+            try:
+                await asyncio.wait_for(evaluate(page, f"delete window[{key}]"), timeout=5)
+            except Exception:
+                pass  # best effort: a navigation frees the buffer anyway
 
     async def _get_comments_and_req(self, count):
         # get request
