@@ -1,5 +1,9 @@
 import asyncio
+import http.server
+import json
 import logging
+import shutil
+import threading
 from types import SimpleNamespace
 
 import httpx
@@ -90,3 +94,73 @@ async def test_unanswered_cookie_read_fails_fast():
         await _video(parent).bytes(timeout=0.1)
     assert parent.cookie_reads == 1
     assert parent.browser_fetches == 0
+
+
+_NODE_EVAL = r"""
+globalThis.window = globalThis;
+const rl = require('readline').createInterface({input: process.stdin});
+rl.on('line', async (line) => {
+  let out;
+  try { out = {result: await (0, eval)(JSON.parse(line))}; }
+  catch (e) { out = {error: String(e)}; }
+  process.stdout.write(JSON.stringify(out === undefined ? null : out) + '\n');
+});
+"""
+
+
+class _NodePage:
+    """Runs page-world expressions in a Node process, standing in for the browser page."""
+
+    async def __aenter__(self):
+        self.proc = await asyncio.create_subprocess_exec(
+            "node", "-e", _NODE_EVAL, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            limit=64 * 1024 * 1024)  # a full-size slice arrives as one line
+        return self
+
+    async def __aexit__(self, *exc):
+        self.proc.stdin.close()
+        await self.proc.wait()
+
+    async def evaluate(self, page, expression):
+        self.proc.stdin.write(json.dumps(expression).encode() + b"\n")
+        out = json.loads(await self.proc.stdout.readline())
+        if "error" in out:
+            raise Exception(out["error"])
+        return out["result"]
+
+
+@pytest.fixture
+def cdn():
+    """A local CDN serving a video at /video and a 404 elsewhere."""
+    body = MP4 + bytes(range(256)) * 40 + b"tail"  # not a multiple of the slice size or of 3
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            ok = self.path == "/video"
+            self.send_response(200 if ok else 404)
+            self.send_header("Content-Length", str(len(body) if ok else 0))
+            self.end_headers()
+            if ok:
+                self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{server.server_port}", body
+    server.shutdown()
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs node to run the page script")
+async def test_browser_fetch_reassembles_slices_and_frees_buffer(cdn, monkeypatch):
+    base_url, body = cdn
+    monkeypatch.setattr(Video, "BROWSER_FETCH_SLICE", 1000)
+    async with _NodePage() as page:
+        parent = SimpleNamespace(_page=None, tiktok_api=SimpleNamespace(evaluate_main_world=page.evaluate))
+        video = Video(id="1", data={"id": "1"}, parent=parent)
+        assert await video._browser_fetch_bytes(base_url + "/video") == body
+        with pytest.raises(Exception, match="status=404"):
+            await video._browser_fetch_bytes(base_url + "/missing")
+        leftover = await page.evaluate(None, "Object.getOwnPropertyNames(window).filter(k => k.startsWith('__pytok'))")
+        assert leftover == []
