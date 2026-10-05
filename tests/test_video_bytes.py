@@ -88,6 +88,65 @@ async def test_network_failure_skips_browser_fallback():
     assert parent.browser_fetches == 0
 
 
+def _cutting_cdn(body, cut_every):
+    """A CDN that serves `body` honouring Range, but drops each connection after `cut_every` bytes."""
+    requests = []
+
+    def handler(request):
+        start = 0
+        if "range" in request.headers:
+            start = int(request.headers["range"].removeprefix("bytes=").split("-")[0])
+        requests.append((start, request.headers.get("accept-encoding")))
+        part = body[start:]
+
+        async def stream():
+            yield part[:cut_every]
+            if len(part) > cut_every:
+                raise httpx.RemoteProtocolError("peer closed connection without sending complete message body")
+
+        status, headers = 200, {"content-length": str(len(part))}
+        if start:
+            status = 206
+            headers["content-range"] = f"bytes {start}-{len(body) - 1}/{len(body)}"
+        return httpx.Response(status, headers=headers, stream=_AsyncStream(stream()))
+
+    return handler, requests
+
+
+class _AsyncStream(httpx.AsyncByteStream):
+    def __init__(self, gen):
+        self._gen = gen
+
+    async def __aiter__(self):
+        async for chunk in self._gen:
+            yield chunk
+
+
+async def test_cut_download_resumes_from_where_it_stopped():
+    body = MP4 + bytes(range(256)) * 40
+    handler, requests = _cutting_cdn(body, cut_every=1000)
+    parent = _Parent(handler)
+    assert await _video(parent).bytes(timeout=5) == body
+    assert [start for start, _ in requests] == list(range(0, len(body), 1000))
+    assert all(encoding == "identity" for _, encoding in requests)
+    assert parent.browser_fetches == 0
+
+
+async def test_resume_ignored_by_cdn_fails_rather_than_splicing():
+    body = MP4 + b"\x01" * 5000
+
+    def handler(request):
+        async def stream():
+            yield body[:1000]
+            raise httpx.RemoteProtocolError("peer closed connection")
+        # always the whole file from byte 0, whatever Range asked for
+        return httpx.Response(200, stream=_AsyncStream(stream()))
+
+    parent = _Parent(handler)
+    with pytest.raises(Exception, match="resuming at byte 1000 got 200"):
+        await _video(parent).bytes(timeout=5)
+
+
 async def test_unanswered_cookie_read_fails_fast():
     parent = _Parent(lambda request: httpx.Response(200, content=MP4), cookie_delay=5)
     with pytest.raises(Exception, match="reading the browser's cookies timed out"):
