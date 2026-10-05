@@ -479,24 +479,67 @@ class Video(Base):
         Other large CDN blobs (DASH fragments, separate audio, range probes) lack this."""
         return isinstance(body, (bytes, bytearray)) and body[4:8] == b'ftyp'
 
+    # Resumes allowed after the CDN closes a download partway. Each must make progress, so
+    # this only bounds a connection that keeps dropping.
+    MAX_DOWNLOAD_RESUMES = 20
+
     async def _httpx_fetch_bytes(self, bytes_url, timeout) -> bytes:
         """Download the signed CDN URL directly with httpx, over the session's shared media
         client (which carries the browser's cookies) and with the browser session's headers.
 
         `timeout` bounds the cookie read, raising asyncio.TimeoutError, and each wait on the
         network, raising httpx.TimeoutException; it does not bound the whole transfer, so a
-        large video still arriving on a slow link is not cut off and restarted.
+        large video still arriving on a slow link is not cut off and restarted. The CDN closes
+        long transfers partway, so a cut download resumes with a Range request from where it
+        stopped rather than starting over.
         """
         client = await self.parent._media_client(timeout)
         _, session = self.parent.tiktok_api._get_session()
         headers = dict(session.headers)
         headers['Referer'] = 'https://www.tiktok.com/'
-        resp = await client.get(bytes_url, headers=headers, timeout=httpx.Timeout(timeout))
-        if resp.status_code in (401, 403):
-            self.parent._expire_media_cookies()
-        if resp.status_code not in (200, 206):
-            raise _CdnRejected(f"httpx fetch returned status {resp.status_code}")
-        return resp.content
+        # byte offsets only line up across a resume when the body isn't content-encoded
+        headers['Accept-Encoding'] = 'identity'
+
+        body = bytearray()
+        resumes = 0
+        while True:
+            request_headers = dict(headers)
+            if body:
+                request_headers['Range'] = f"bytes={len(body)}-"
+            received = 0
+            encoded = False
+            try:
+                async with client.stream("GET", bytes_url, headers=request_headers,
+                                         timeout=httpx.Timeout(timeout)) as resp:
+                    if resp.status_code in (401, 403):
+                        self.parent._expire_media_cookies()
+                    if resp.status_code not in (200, 206):
+                        raise _CdnRejected(f"httpx fetch returned status {resp.status_code}")
+                    if body and self._range_start(resp) != len(body):
+                        raise Exception(
+                            f"resuming at byte {len(body)} got {resp.status_code} "
+                            f"{resp.headers.get('content-range', 'without Content-Range')}"
+                        )
+                    encoded = resp.headers.get('content-encoding', 'identity') != 'identity'
+                    async for chunk in resp.aiter_bytes():
+                        body.extend(chunk)
+                        received += len(chunk)
+                return bytes(body)
+            except (httpx.RemoteProtocolError, httpx.ReadError):
+                if not received or encoded or resumes >= self.MAX_DOWNLOAD_RESUMES:
+                    raise
+                resumes += 1
+
+    @staticmethod
+    def _range_start(resp) -> Optional[int]:
+        """First byte offset a 206 response carries, from its Content-Range; None otherwise."""
+        if resp.status_code != 206:
+            return None
+        content_range = resp.headers.get('content-range', '')
+        try:
+            return int(content_range.split(' ', 1)[1].split('-', 1)[0])
+        except (IndexError, ValueError):
+            return None
 
     # Bytes per slice sent back from the page: small enough that no single JS string
     # nears the engine's length limit or the renderer's heap, however large the video.
