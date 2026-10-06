@@ -25,6 +25,11 @@ LISTING_MIN_COVERAGE = 0.9
 POST_ITEM_SELECTOR = '[data-e2e="user-post-item"]'
 
 
+async def _aiter(items):
+    for item in items:
+        yield item
+
+
 class User(Base):
     """
     A TikTok User.
@@ -416,7 +421,27 @@ class User(Base):
     async def _iter_videos_inner(self, count=None, batch_size=100, prefer_scraping=False, **kwargs) -> Iterator[Video]:
         # If user info came from the API, use the API for videos directly
         # If user info was scraped (page already loaded), get initial videos from page first
+        seen_ids = set()
         amount_yielded = 0
+
+        def enough():
+            return count is not None and amount_yielded >= count
+
+        async def emit(source):
+            """Yield videos from a source, skipping ones already yielded and honouring `count`."""
+            nonlocal amount_yielded
+            async for video in source:
+                video_id = getattr(video, 'id', None)
+                if video_id is not None:
+                    if video_id in seen_ids:
+                        continue
+                    seen_ids.add(video_id)
+                amount_yielded += 1
+                yield video
+                if enough():
+                    return
+
+        cursor = 0
         if not self._used_api_for_info:
             # Try to harvest the videos already on the loaded page. If that fails to find any
             # (ApiFailedException), fall through to the API/scraping path below. LoginException
@@ -427,12 +452,11 @@ class User(Base):
                 self.parent.logger.warning(f"Initial video page harvest failed: {ex}. Falling back to API/scraping method.")
             else:
                 self.parent.logger.info(f"Got {len(videos)} initial videos, finished={finished}, cursor={cursor}")
-                for video in videos:
+                async for video in emit(_aiter(videos)):
                     yield video
-                    amount_yielded += 1
-                    if count and amount_yielded >= count:
-                        self.parent.logger.info(f"Reached count limit after {amount_yielded} initial videos")
-                        return
+                if enough():
+                    self.parent.logger.info(f"Reached count limit after {amount_yielded} initial videos")
+                    return
 
                 if finished:
                     self.parent.logger.info("Finished after initial videos")
@@ -440,21 +464,23 @@ class User(Base):
                     self._listing_exhausted = True
                     return
 
-                self.parent.logger.info("Continuing with _get_videos_api to get more videos")
+                self.parent.logger.info(f"Continuing with _get_videos_api from cursor={cursor}")
 
-        remaining = None if count is None else count - amount_yielded
+        # The sources below are uncapped (or capped at the full `count`, for scraping, which
+        # starts again from the top of the profile) so videos emit() drops as repeats don't
+        # use up the caller's count.
         if prefer_scraping:
             # Explicit opt-out of the API path: go straight to scraping for
             # browser-sourced URLs (see the prefer_scraping docstring above).
-            async for video in self._get_videos_scraping(remaining):
+            async for video in emit(self._get_videos_scraping(count)):
                 yield video
             return
         try:
-            async for video in self._get_videos_api(count=remaining, cursor=0, **kwargs):
+            async for video in emit(self._get_videos_api(cursor=cursor, **kwargs)):
                 yield video
         except ApiFailedException as ex:
             self.parent.logger.warning(f"API method failed with exception: {ex}. Falling back to scraping method.")
-            async for video in self._get_videos_scraping(remaining):
+            async for video in emit(self._get_videos_scraping(count)):
                 yield video
 
 
