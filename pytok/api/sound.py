@@ -216,7 +216,7 @@ class Sound(Base):
         detail = data.get('__DEFAULT_SCOPE__', {}).get('webapp.music-detail', {})
         return detail.get('musicInfo') or None
 
-    async def videos(self, count=30, offset=0, prefer_scraping=False, **kwargs) -> Iterator[Video]:
+    async def videos(self, count=30, offset=0, prefer_scraping=False, get_bytes=False, **kwargs) -> Iterator[Video]:
         """Returns Video objects of videos created with this sound.
 
         - Parameters:
@@ -229,6 +229,9 @@ class Sound(Base):
               load below on the first sound of a session (see
               ZendriverTikTokApi.cache_api_params) — changing only musicID and
               cursor. Kept as an explicit escape hatch to force the scrolling path.
+            - get_bytes (bool | callable): Download each video's MP4 into
+              ``video.video_bytes`` as it is yielded, or pass a predicate
+              ``(video) -> bool`` to choose which. See User.videos().
 
         Example Usage
         ```py
@@ -236,6 +239,11 @@ class Sound(Base):
             # do something
         ```
         """
+        videos = self._iter_videos(count=count, offset=offset, prefer_scraping=prefer_scraping)
+        async for video in self._with_bytes(videos, get_bytes):
+            yield video
+
+    async def _iter_videos(self, count, offset, prefer_scraping):
         self.__ensure_valid()
 
         seen_ids = set()

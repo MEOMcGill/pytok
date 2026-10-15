@@ -56,12 +56,12 @@ def _search(monkeypatch, harvest, scroll_pages=0, scroll_reason="no new results"
     async def harvest_page(obj_type):
         results, has_more = harvest
         search._exhausted_listing = not has_more
-        return [({"id": i}, i) for i in results], has_more, len(results), "sid"
+        return [(SimpleNamespace(id=i), i) for i in results], has_more, len(results), "sid"
 
     async def scroll(obj_type, count):
         try:
             for i in range(scroll_pages * 12):
-                yield {"id": f"s{i}"}, f"s{i}"
+                yield SimpleNamespace(id=f"s{i}"), f"s{i}"
         finally:
             search._scroll_stop = scroll_reason
 

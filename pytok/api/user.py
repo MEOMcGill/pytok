@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 from typing import TYPE_CHECKING, Iterator, Optional
 
@@ -326,25 +325,8 @@ class User(Base):
                 f.write(video.video_bytes)
         ```
         """
-        async for video in self._iter_videos(count=count, batch_size=batch_size, prefer_scraping=prefer_scraping, **kwargs):
-            video.video_bytes = None
-            if get_bytes:
-                wanted = True
-                if callable(get_bytes):
-                    try:
-                        wanted = get_bytes(video)
-                        if inspect.isawaitable(wanted):
-                            wanted = await wanted
-                    except Exception as ex:
-                        # a broken predicate shouldn't silently turn into "download everything"
-                        self.parent.logger.warning(f"get_bytes: predicate failed for video {video.id}, skipping bytes: {ex}")
-                        wanted = False
-                if wanted:
-                    try:
-                        video.video_bytes = await video.bytes()
-                    except Exception as ex:
-                        self.parent.logger.warning(f"get_bytes: failed to download bytes for video {video.id}: {ex}")
-                        video.video_bytes = None
+        videos = self._iter_videos(count=count, batch_size=batch_size, prefer_scraping=prefer_scraping, **kwargs)
+        async for video in self._with_bytes(videos, get_bytes):
             yield video
 
     async def _iter_videos(self, count=None, batch_size=100, prefer_scraping=False,

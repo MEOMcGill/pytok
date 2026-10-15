@@ -67,7 +67,7 @@ class Search(Base):
         self.parent = parent
         self.search_term = search_term
 
-    async def videos(self, count=28, offset=0, **kwargs) -> Iterator[Video]:
+    async def videos(self, count=28, offset=0, get_bytes=False, **kwargs) -> Iterator[Video]:
         """
         Searches for Videos
 
@@ -77,6 +77,9 @@ class Search(Base):
             - offset (int): The offset of videos from your data you want returned.
             - prefer_scraping (bool): If True, get results by scrolling the browser
               page rather than through the make_request API. See search_type().
+            - get_bytes (bool | callable): Download each video's MP4 into
+              ``video.video_bytes`` as it is yielded, or pass a predicate
+              ``(video) -> bool`` to choose which. See User.videos().
 
         Example Usage
         ```py
@@ -84,8 +87,9 @@ class Search(Base):
             # do something
         ```
         """
-        async for result in self.search_type("item", count=count, offset=offset, **kwargs):
-            yield result
+        videos = self.search_type("item", count=count, offset=offset, **kwargs)
+        async for video in self._with_bytes(videos, get_bytes):
+            yield video
 
     async def users(self, count=28, offset=0, **kwargs) -> Iterator[User]:
         """
