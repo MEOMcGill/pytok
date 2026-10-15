@@ -333,7 +333,7 @@ class Hashtag(Base):
         detail = self._challenge_detail_from_html(html) or {}
         return detail.get('challengeInfo') or None
 
-    async def videos(self, count=30, offset=0, prefer_scraping=False, **kwargs) -> Iterator[Video]:
+    async def videos(self, count=30, offset=0, prefer_scraping=False, get_bytes=False, **kwargs) -> Iterator[Video]:
         """Returns a dictionary listing TikToks with a specific hashtag.
 
         - Parameters:
@@ -347,6 +347,9 @@ class Hashtag(Base):
               load below on the first hashtag of a session (see
               ZendriverTikTokApi.cache_api_params) — changing only challengeID and
               cursor. Kept as an explicit escape hatch to force the scrolling path.
+            - get_bytes (bool | callable): Download each video's MP4 into
+              ``video.video_bytes`` as it is yielded, or pass a predicate
+              ``(video) -> bool`` to choose which. See User.videos().
 
         Example Usage
         ```py
@@ -354,6 +357,11 @@ class Hashtag(Base):
             # do something
         ```
         """
+        videos = self._iter_videos(count=count, offset=offset, prefer_scraping=prefer_scraping)
+        async for video in self._with_bytes(videos, get_bytes):
+            yield video
+
+    async def _iter_videos(self, count, offset, prefer_scraping):
         await self.info()
 
         seen_ids = set()

@@ -1,7 +1,9 @@
 import asyncio
+import inspect
 import json
 import random
 from collections import Counter
+from contextlib import aclosing
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -253,6 +255,37 @@ class ScrollWalk:
 
 
 class Base:
+
+    async def _with_bytes(self, videos, get_bytes):
+        """Yield each Video from `videos` with ``video.video_bytes`` set, per `get_bytes`.
+
+        `get_bytes` is False, True, or a predicate ``(video) -> bool`` (sync or async) asked
+        per video before its bytes are fetched. A video that is skipped, or whose download
+        fails, gets ``video_bytes = None``.
+        """
+        # aclosing, so a caller that stops early closes the listing generator now rather
+        # than whenever it is garbage collected
+        async with aclosing(videos):
+            async for video in videos:
+                video.video_bytes = None
+                if get_bytes:
+                    wanted = True
+                    if callable(get_bytes):
+                        try:
+                            wanted = get_bytes(video)
+                            if inspect.isawaitable(wanted):
+                                wanted = await wanted
+                        except Exception as ex:
+                            # a broken predicate shouldn't silently turn into "download everything"
+                            self.parent.logger.warning(f"get_bytes: predicate failed for video {video.id}, skipping bytes: {ex}")
+                            wanted = False
+                    if wanted:
+                        try:
+                            video.video_bytes = await video.bytes()
+                        except Exception as ex:
+                            self.parent.logger.warning(f"get_bytes: failed to download bytes for video {video.id}: {ex}")
+                            video.video_bytes = None
+                yield video
 
     def scroll_walk(self, url_pattern, item_selector=None, container_selector=None,
                     max_rounds=30, before_round=None):
