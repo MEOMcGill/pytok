@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Iterator, Optional
 from urllib.parse import parse_qs, urlparse
 
 from ..exceptions import *
+from ..tiktok_api import raise_for_search_limit
 from .base import Base
 from .user import User
 from .video import Video
@@ -180,6 +181,8 @@ class Search(Base):
                         f"of {wanted} and stopped short of the end of the listing. "
                         "Falling back to scraping method."
                     )
+                except SearchLimitException:
+                    raise
                 except ApiFailedException as ex:
                     self.parent.logger.warning(
                         f"{self._label(obj_type)}: API search failed: {ex}. Falling back to scraping method."
@@ -221,6 +224,8 @@ class Search(Base):
                         f"of {wanted}, short of the end of the listing. "
                         "Continuing by scrolling the page."
                     )
+                except SearchLimitException:
+                    raise
                 except ApiFailedException as ex:
                     self.parent.logger.warning(
                         f"{self._label(obj_type)}: API still failing after the search page load ({ex}). "
@@ -313,6 +318,8 @@ class Search(Base):
                     url=f"https://www.tiktok.com/api/search/{obj_type}/full/",
                     params=params,
                 )
+            except SearchLimitException:
+                raise
             except Exception as e:
                 raise ApiFailedException(f"API request failed: {e}")
 
@@ -464,6 +471,7 @@ class Search(Base):
         if res.get('type') == 'verify':
             # this is the captcha denied response
             return None
+        raise_for_search_limit(res)
         return res
 
     async def _scroll_for_results(self, obj_type, count=28) -> Iterator:

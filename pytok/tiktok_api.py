@@ -20,7 +20,21 @@ from .exceptions import (
     InvalidJSONException,
     NoTemplateException,
     ResponseValidationException,
+    SearchLimitException,
 )
+
+# statusCode TikTok returns once an account has used up its daily searches.
+SEARCH_LIMIT_STATUS_CODE = 2484
+
+
+def raise_for_search_limit(data: dict):
+    """Raise SearchLimitException if this response says the account's searches are capped."""
+    status_code = max(data.get('statusCode', 0), data.get('status_code', 0))
+    if status_code == SEARCH_LIMIT_STATUS_CODE:
+        raise SearchLimitException(
+            f"TikTok says this account has reached its search limit: "
+            f"{data.get('status_msg') or data.get('statusMsg') or status_code}"
+        )
 
 
 @dataclasses.dataclass
@@ -472,6 +486,7 @@ class TikTokApiClient:
 
                 try:
                     data = json.loads(result)
+                    raise_for_search_limit(data)
                     status_code = max(data.get('statusCode', 0), data.get('status_code', 0))
                     if status_code != 0:
                         self.logger.error(f"Got an unexpected status code: {data}")
@@ -514,6 +529,9 @@ class TikTokApiClient:
                 else:
                     self.invalidate_cached_api_params(url)
                     raise
+            except SearchLimitException:
+                # The account's state, not the session's: retrying or rebuilding won't lift it.
+                raise
             except Exception as e:
                 # Session-level failure (page closed, evaluation failed, ...).
                 self.logger.error(f"Error during request: {e}")

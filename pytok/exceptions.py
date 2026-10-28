@@ -70,6 +70,15 @@ class NoTemplateException(ApiFailedException):
     own request params off the wire. A subclass of ApiFailedException so every
     existing API→scraping fallback handles it transparently."""
 
+class SearchLimitException(ApiFailedException):
+    """This account has used up its search allowance (statusCode 2484), so every search
+    comes back empty until it lifts.
+
+    Raised instead of falling back to the search page, which would only end in 0 results
+    that look like a keyword with none. The cap is per account, so a caller can keep going
+    on another one. A subclass of ApiFailedException so a worker rests and rotates the
+    account as it does for other rate limiting."""
+
 class FewerVideosThanExpectedException(TikTokException):
     """TikTok is returning fewer videos for this user than their metadata led us to expect.
 
