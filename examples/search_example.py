@@ -16,16 +16,21 @@ from pytok.accounts import AccountsPool
 from pytok.tiktok import PyTok
 
 
-async def scrape_search(search_term, search_type, count, output, account_username, headless):
+async def scrape_search(search_term, search_type, count, output, account_username, headless, media_dir=None):
     pool = AccountsPool()
 
     async with await PyTok.from_pool(pool, username=account_username, headless=headless) as api:
         search = api.search(search_term)
-        source = search.users(count=count) if search_type == "user" else search.videos(count=count)
+        if search_type == "user":
+            source = search.users(count=count)
+        else:
+            source = search.videos(count=count, get_media=media_dir is not None)
 
         results = []
         async for result in source:
             results.append(await result.info())
+            if getattr(result, "post_media", None) is not None:
+                result.post_media.save(media_dir)
 
         with open(output, "w") as out_file:
             json.dump(results, out_file)
@@ -49,6 +54,8 @@ def main():
              "least-recently-used available account.",
     )
     parser.add_argument("--headless", action="store_true", help="Run the browser headless.")
+    parser.add_argument("--media-dir", default=None,
+                        help="With --type video, also download each post's media (MP4, or a photo post's images and sound) here.")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -57,7 +64,7 @@ def main():
     )
 
     asyncio.run(scrape_search(
-        args.term, args.type, args.count, args.output, args.account, args.headless,
+        args.term, args.type, args.count, args.output, args.account, args.headless, args.media_dir,
     ))
 
 
