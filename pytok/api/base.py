@@ -256,35 +256,35 @@ class ScrollWalk:
 
 class Base:
 
-    async def _with_bytes(self, videos, get_bytes):
-        """Yield each Video from `videos` with ``video.video_bytes`` set, per `get_bytes`.
+    async def _with_media(self, videos, get_media):
+        """Yield each Video from `videos` with ``video.post_media`` set, per `get_media`.
 
-        `get_bytes` is False, True, or a predicate ``(video) -> bool`` (sync or async) asked
-        per video before its bytes are fetched. A video that is skipped, or whose download
-        fails, gets ``video_bytes = None``.
+        `get_media` is False, True, or a predicate ``(video) -> bool`` (sync or async) asked
+        per video before its media is fetched. A video that is skipped, or whose download
+        fails, gets ``post_media = None``.
         """
         # aclosing, so a caller that stops early closes the listing generator now rather
         # than whenever it is garbage collected
         async with aclosing(videos):
             async for video in videos:
-                video.video_bytes = None
-                if get_bytes:
+                video.post_media = None
+                if get_media:
                     wanted = True
-                    if callable(get_bytes):
+                    if callable(get_media):
                         try:
-                            wanted = get_bytes(video)
+                            wanted = get_media(video)
                             if inspect.isawaitable(wanted):
                                 wanted = await wanted
                         except Exception as ex:
                             # a broken predicate shouldn't silently turn into "download everything"
-                            self.parent.logger.warning(f"get_bytes: predicate failed for video {video.id}, skipping bytes: {ex}")
+                            self.parent.logger.warning(f"get_media: predicate failed for video {video.id}, skipping media: {ex}")
                             wanted = False
                     if wanted:
                         try:
-                            video.video_bytes = await video.bytes()
+                            video.post_media = await video.media()
                         except Exception as ex:
-                            self.parent.logger.warning(f"get_bytes: failed to download bytes for video {video.id}: {ex}")
-                            video.video_bytes = None
+                            self.parent.logger.warning(f"get_media: failed to download media for video {video.id}: {ex}")
+                            video.post_media = None
                 yield video
 
     def scroll_walk(self, url_pattern, item_selector=None, container_selector=None,

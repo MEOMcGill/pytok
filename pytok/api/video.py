@@ -6,8 +6,10 @@ import json
 import logging
 import secrets
 import time
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import TYPE_CHECKING, Optional
+from pathlib import Path
+from typing import TYPE_CHECKING, Callable, Optional
 from urllib import parse as url_parsers
 
 import brotli
@@ -34,6 +36,83 @@ logger = logging.getLogger("pytok.api.video")
 
 class _CdnRejected(Exception):
     """The CDN answered a direct media download with an error status."""
+
+
+def _image_extension(body) -> Optional[str]:
+    """File extension for an image body, from its magic bytes; None if it isn't an image."""
+    if not isinstance(body, (bytes, bytearray)):
+        return None
+    if body[:3] == b'\xff\xd8\xff':
+        return "jpg"
+    if body[:8] == b'\x89PNG\r\n\x1a\n':
+        return "png"
+    if body[:4] == b'RIFF' and body[8:12] == b'WEBP':
+        return "webp"
+    if body[:4] == b'GIF8':
+        return "gif"
+    if body[4:8] == b'ftyp' and body[8:12] in (b'heic', b'heix', b'mif1', b'msf1'):
+        return "heic"
+    if body[4:8] == b'ftyp' and body[8:12] in (b'avif', b'avis'):
+        return "avif"
+    return None
+
+
+def _audio_extension(body) -> Optional[str]:
+    """File extension for an audio body, from its magic bytes; None if it isn't audio."""
+    if not isinstance(body, (bytes, bytearray)) or len(body) < 12:
+        return None
+    if body[:3] == b'ID3':
+        return "mp3"
+    if body[0] == 0xff and body[1] & 0xe0 == 0xe0:
+        # an MPEG frame sync; layer bits 00 mean ADTS AAC rather than MP3
+        return "aac" if body[1] & 0x06 == 0 else "mp3"
+    if body[4:8] == b'ftyp':
+        return "m4a"
+    if body[:4] == b'OggS':
+        return "ogg"
+    if body[:4] == b'RIFF' and body[8:12] == b'WAVE':
+        return "wav"
+    if body[:4] == b'fLaC':
+        return "flac"
+    return None
+
+
+@dataclass
+class PostMedia:
+    """The media of a post: the MP4 of a video post, or the images (in display order) and
+    sound of a photo/slideshow post."""
+
+    id: str
+    video: Optional[bytes] = None
+    images: list[bytes] = field(default_factory=list)
+    audio: Optional[bytes] = None
+    """A photo post's sound; None for a video post (its MP4 carries the audio) or a photo
+    post without a downloadable sound."""
+
+    @property
+    def is_photo_post(self) -> bool:
+        return self.video is None
+
+    def save(self, directory) -> list[Path]:
+        """Write the media into `directory`: ``<id>.mp4`` for a video post, or ``<id>_01.jpg``,
+        ``<id>_02.jpg``, ... and ``<id>.m4a`` for a photo post, with extensions taken from the
+        content. Returns the paths written."""
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        files = []
+        if self.video is not None:
+            files.append((f"{self.id}.mp4", self.video))
+        width = max(2, len(str(len(self.images))))
+        for n, image in enumerate(self.images, start=1):
+            files.append((f"{self.id}_{n:0{width}d}.{_image_extension(image) or 'bin'}", image))
+        if self.audio is not None:
+            files.append((f"{self.id}.{_audio_extension(self.audio) or 'bin'}", self.audio))
+        paths = []
+        for name, body in files:
+            paths.append(directory / name)
+            paths[-1].write_bytes(body)
+        return paths
+
 
 class Counter:
     def __init__(self):
@@ -349,51 +428,88 @@ class Video(Base):
             async for video in self._related_videos(counter, count=count):
                 yield video
 
-    async def bytes(self, timeout=60) -> bytes:
+    @property
+    def is_photo_post(self) -> bool:
+        """True for a photo/slideshow post, whose media is images rather than a video."""
+        return bool(getattr(self, 'as_dict', None)) and 'imagePost' in self.as_dict
+
+    async def media(self, timeout=60) -> PostMedia:
         """
-        Returns the bytes of a TikTok Video.
+        Downloads the media of a TikTok post: the MP4 of a video post, or the images and sound
+        of a photo/slideshow post.
 
         Example Usage
         ```py
-        video_bytes = api.video(id='7041997751718137094').bytes()
+        media = await api.video(id='7041997751718137094').media()
+        media.save('media/')  # <id>.mp4, or <id>_01.jpg, <id>_02.jpg, ..., <id>.m4a
 
-        # Saving The Video
-        with open('saved_video.mp4', 'wb') as output:
-            output.write(video_bytes)
+        if not media.is_photo_post:
+            mp4 = media.video
         ```
 
         `timeout` bounds every wait on the browser and how long a direct download may go
         without receiving data, not the whole download: a large video still arriving on a
         slow link is not cut off.
+
+        Raises NoVideoException for a post with neither a video nor images to download.
         """
+        if self.is_photo_post:
+            return await self._photo_post_media(timeout)
+
         # playAddr is the highest-bitrate variant; prefer it for quality, fall back to
         # download. Carry the variant name so a failure can say which URL was tried.
-        bytes_urls = [
+        video_urls = [
             ("playAddr", self.as_dict['video'].get('playAddr')),
             ("downloadAddr", self.as_dict['video'].get('downloadAddr')),
         ]
-        bytes_urls = [(name, url) for name, url in bytes_urls if url]
-        if not bytes_urls:
-            # a photo/slideshow post rather than anything wrong: raise the specific exception
-            # so a media collector can skip it without treating it as a failed download.
-            raise exceptions.NoVideoException(
-                f"Post {self.id} has no video to download (photo/slideshow post)"
-            )
+        video_urls = [(name, url) for name, url in video_urls if url]
+        if not video_urls:
+            raise exceptions.NoVideoException(f"Post {self.id} has no video or images to download")
 
+        video = await self._fetch_media(
+            video_urls, timeout, self._looks_like_video, "an MP4", f"the video of post {self.id}")
+        return PostMedia(id=self.id, video=video)
+
+    async def _photo_post_media(self, timeout) -> PostMedia:
+        images = []
+        for n, image in enumerate(self.as_dict['imagePost'].get('images') or [], start=1):
+            # urlList holds the same image on different CDN hosts
+            urls = (image.get('imageURL') or {}).get('urlList') or []
+            named_urls = [(f"image{n}/url{i}", url) for i, url in enumerate(urls) if url]
+            images.append(await self._fetch_media(
+                named_urls, timeout, lambda body: _image_extension(body) is not None,
+                "an image", f"image {n} of photo post {self.id}"))
+        if not images:
+            raise exceptions.NoVideoException(f"Photo post {self.id} has no images to download")
+
+        # a muted "original sound" carries no playUrl
+        audio = None
+        audio_url = (self.as_dict.get('music') or {}).get('playUrl')
+        if audio_url:
+            audio = await self._fetch_media(
+                [("music/playUrl", audio_url)], timeout,
+                lambda body: _audio_extension(body) is not None,
+                "audio", f"the sound of photo post {self.id}")
+        return PostMedia(id=self.id, images=images, audio=audio)
+
+    async def _fetch_media(self, named_urls, timeout, is_valid: Callable[[bytes], bool],
+                           kind: str, what: str) -> bytes:
+        """Download the first of `named_urls` ((name, url) pairs for the same file) whose body
+        passes `is_valid`. `kind` names the expected content and `what` the file, for errors."""
         # If the bytes were already captured on the wire (e.g. during playback), use them.
-        paths = [url_parsers.urlparse(url).path for _, url in bytes_urls]
+        paths = [url_parsers.urlparse(url).path for _, url in named_urls]
         cached = self._find_cached_bytes(paths)
-        if cached is not None and self._looks_like_video(cached):
+        if cached is not None and is_valid(cached):
             return cached
 
         # Otherwise fetch the signed CDN URL ourselves, directly with httpx: the in-browser
-        # fetch has to base64-encode the whole video and ship it back through the browser
+        # fetch has to base64-encode the whole file and ship it back through the browser
         # driver, so it is only worth trying when the CDN rejected the direct request (e.g.
         # it ever tightens checks). A direct download that timed out or dropped would fare
         # no better going through the browser's network stack.
         req_exceptions = []
         rejected = False
-        for url_name, bytes_url in bytes_urls:
+        for url_name, bytes_url in named_urls:
             label = f"httpx/{url_name}"
             started = time.monotonic()
             try:
@@ -411,13 +527,13 @@ class Video(Base):
                     f"{label}: {self._describe_exception(ex)} (after {time.monotonic() - started:.1f}s)"
                 )
             else:
-                if self._looks_like_video(data):
+                if is_valid(data):
                     return data
                 rejected = True
-                req_exceptions.append(f"{label}: {self._describe_body(data)}")
+                req_exceptions.append(f"{label}: {self._describe_body(data, kind)}")
 
         if rejected:
-            for url_name, bytes_url in bytes_urls:
+            for url_name, bytes_url in named_urls:
                 label = f"browser/{url_name}"
                 started = time.monotonic()
                 try:
@@ -430,11 +546,11 @@ class Video(Base):
                         f"{label}: {self._describe_exception(ex)} (after {time.monotonic() - started:.1f}s)"
                     )
                 else:
-                    if self._looks_like_video(data):
+                    if is_valid(data):
                         return data
-                    req_exceptions.append(f"{label}: {self._describe_body(data)}")
+                    req_exceptions.append(f"{label}: {self._describe_body(data, kind)}")
         raise Exception(
-            f"Failed to get video bytes for video {self.id}: " + "; ".join(req_exceptions)
+            f"Failed to get {what}: " + "; ".join(req_exceptions)
         )
 
     @staticmethod
@@ -447,12 +563,9 @@ class Video(Base):
         return f"{type(ex).__name__}: {ex}"
 
     @staticmethod
-    def _describe_body(body) -> str:
-        """Say what a response that wasn't an MP4 actually was.
-
-        The old message only echoed the URL back, so a CDN error page, an empty body and a
-        DASH fragment were indistinguishable -- all three read as "did not return an MP4".
-        """
+    def _describe_body(body, kind="an MP4") -> str:
+        """Say what a response that wasn't `kind` actually was, so a CDN error page, an empty
+        body and a DASH fragment are told apart."""
         if body is None:
             return "returned no data"
         if not isinstance(body, (bytes, bytearray)):
@@ -462,11 +575,13 @@ class Video(Base):
         head = bytes(body[:12])
         if head.lstrip()[:1] in (b'<', b'{'):
             # an HTML/JSON error page served with a 200
-            return f"returned {len(body)} bytes of markup/JSON, not an MP4 ({head!r})"
-        return f"returned {len(body)} bytes but no ftyp box, not a progressive MP4 ({head!r})"
+            return f"returned {len(body)} bytes of markup/JSON, not {kind} ({head!r})"
+        if kind == "an MP4":
+            return f"returned {len(body)} bytes but no ftyp box, not a progressive MP4 ({head!r})"
+        return f"returned {len(body)} bytes that are not {kind} ({head!r})"
 
     def _find_cached_bytes(self, paths) -> Optional[bytes]:
-        """Return video bytes from the captured response cache if present, else None."""
+        """Return a file's bytes from the captured response cache if present, else None."""
         for path in paths:
             for res in self.get_responses(path):
                 if res.get('body'):

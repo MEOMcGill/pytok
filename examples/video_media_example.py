@@ -1,4 +1,5 @@
-"""Download a video's MP4 bytes as a pooled account.
+"""Download a post's media as a pooled account: the MP4 of a video post, or the
+images and sound of a photo/slideshow post.
 
 Run login_example.py (or the accounts CLI) once first to register + log in an
 account.
@@ -21,13 +22,12 @@ async def main():
         video = api.video(username=username, id=id)
 
         video_data = await video.info()
-        video_bytes = await video.bytes()
+        media = await video.media()
 
         with open("out.json", "w") as out_file:
             json.dump(video_data, out_file)
 
-        with open("out.mp4", "wb") as out_file:
-            out_file.write(video_bytes)
+        media.save("out")
 
 
 if __name__ == "__main__":

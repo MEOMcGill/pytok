@@ -296,37 +296,37 @@ class User(Base):
         self.__extract_from_data()
         return user
 
-    async def videos(self, get_bytes=False, count=None, batch_size=100, prefer_scraping=False, **kwargs) -> Iterator[Video]:
+    async def videos(self, get_media=False, count=None, batch_size=100, prefer_scraping=False, **kwargs) -> Iterator[Video]:
         """
         Returns an iterator yielding Video objects.
 
         - Parameters:
             - count (int): The amount of videos you want returned.
-            - get_bytes (bool | callable): If True, download each video's MP4 as it is yielded
-              and store it on the yielded Video as ``video.video_bytes`` (None if the download
-              failed). May instead be a predicate ``(video) -> bool`` (sync or async, and given
-              the video before its bytes are fetched, so ``video.id``/``video.as_dict`` are
-              available), consulted per video: when it returns False no download is attempted
-              and ``video.video_bytes`` stays None. Use it to skip videos you already hold
+            - get_media (bool | callable): If True, download each post's media as it is yielded
+              and store it on the yielded Video as ``video.post_media``, a PostMedia (None if
+              the download failed; see Video.media()). May instead be a predicate
+              ``(video) -> bool`` (sync or async, and given the video before its media is
+              fetched, so ``video.id``/``video.as_dict`` are available), consulted per video:
+              when it returns False no download is attempted and ``video.post_media`` stays None. Use it to skip videos you already hold
               somewhere, since the download happens in here rather than in the caller's loop.
             - prefer_scraping (bool): If True, get videos by scraping the browser page rather
               than the make_request API. Normally unnecessary: API requests reuse a per-endpoint
               param template captured from the webapp's own requests (lazily filled by the
               scraping route on the first request of each endpoint type — see
               ZendriverTikTokApi.cache_api_params), so their playAddr URLs download cleanly in
-              ``video.bytes()``. Kept as an explicit escape hatch to force the scraping path.
+              ``video.media()``. Kept as an explicit escape hatch to force the scraping path.
             - cursor (int): The unix epoch to get uploaded videos since.
 
         Example Usage
         ```py
         user = api.user(username='therock')
-        async for video in user.videos(count=100, get_bytes=True):
-            with open(f"{video.id}.mp4", "wb") as f:
-                f.write(video.video_bytes)
+        async for video in user.videos(count=100, get_media=True):
+            if video.post_media is not None:
+                video.post_media.save("media/")
         ```
         """
         videos = self._iter_videos(count=count, batch_size=batch_size, prefer_scraping=prefer_scraping, **kwargs)
-        async for video in self._with_bytes(videos, get_bytes):
+        async for video in self._with_media(videos, get_media):
             yield video
 
     async def _iter_videos(self, count=None, batch_size=100, prefer_scraping=False,
