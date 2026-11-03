@@ -16,7 +16,7 @@ class _Video:
         self.fail = fail
         self.fetched = False
 
-    async def bytes(self):
+    async def media(self):
         self.fetched = True
         if self.fail:
             raise Exception("CDN said no")
@@ -57,26 +57,26 @@ def _search(videos):
 
 
 @pytest.mark.parametrize("make", [_hashtag, _sound, _search])
-async def test_get_bytes_downloads_each_video(make):
+async def test_get_media_downloads_each_video(make):
     videos = [_Video(1), _Video(2, fail=True), _Video(3)]
-    got = [v async for v in make(videos).videos(get_bytes=True)]
-    assert [v.video_bytes for v in got] == [b"mp4-1", None, b"mp4-3"]
+    got = [v async for v in make(videos).videos(get_media=True)]
+    assert [v.post_media for v in got] == [b"mp4-1", None, b"mp4-3"]
 
 
 @pytest.mark.parametrize("make", [_hashtag, _sound, _search])
-async def test_get_bytes_predicate_skips_videos(make):
+async def test_get_media_predicate_skips_videos(make):
     videos = [_Video(1), _Video(2)]
 
     async def wanted(video):
         return video.id != 2
-    got = [v async for v in make(videos).videos(get_bytes=wanted)]
-    assert [v.video_bytes for v in got] == [b"mp4-1", None]
+    got = [v async for v in make(videos).videos(get_media=wanted)]
+    assert [v.post_media for v in got] == [b"mp4-1", None]
     assert not videos[1].fetched
 
 
 @pytest.mark.parametrize("make", [_hashtag, _sound, _search])
-async def test_without_get_bytes_nothing_is_downloaded(make):
+async def test_without_get_media_nothing_is_downloaded(make):
     videos = [_Video(1)]
     got = [v async for v in make(videos).videos()]
-    assert got[0].video_bytes is None
+    assert got[0].post_media is None
     assert not videos[0].fetched

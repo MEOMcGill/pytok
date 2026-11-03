@@ -80,6 +80,14 @@ async for video in sound.videos(count=100):
     ...
 ```
 
+To download media, call `video.media()`, or pass `get_media=True` to any of these listings to fetch it as each video is yielded. Either way you get a `PostMedia`: the MP4 of a video post, or the images and sound of a photo/slideshow post, which `save()` writes to a directory:
+
+```py
+async for video in api.user(username="therock").videos(count=100, get_media=True):
+    if video.post_media is not None:  # None if that post's download failed
+        video.post_media.save("media/")  # <id>.mp4, or <id>_01.jpg, ..., <id>.m4a
+```
+
 Please note pulling data from TikTok takes a while! We recommend leaving the scripts running on a server for a while for them to finish downloading everything. Feel free to play around with the delay constants to either speed up the process or avoid TikTok rate limiting, like so: `PyTok(request_delay=10)`
 
 ## Accounts, login, and persistent sessions

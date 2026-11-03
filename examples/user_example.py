@@ -1,4 +1,4 @@
-"""Fetch a user's videos as a logged-in account from the pool.
+"""Fetch a user's videos, and download their media, as a logged-in account from the pool.
 
 Run login_example.py (or the accounts CLI) once first to register + log in an
 account. PyTok.from_pool acquires the least-recently-used available account and
@@ -28,9 +28,13 @@ async def main():
             await user.info()
 
             videos = []
-            async for video in user.videos(count=30):
+            # get_media downloads each post's media as it is yielded: an MP4, or a photo
+            # post's images and sound. post_media is None if that download failed.
+            async for video in user.videos(count=30, get_media=True):
                 video_data = await video.info()
                 videos.append(video_data)
+                if video.post_media is not None:
+                    video.post_media.save(f"media/{username}")
 
             assert len(videos) > 0, "No videos found"
             print(f"Fetched {len(videos)} videos for user {username}")

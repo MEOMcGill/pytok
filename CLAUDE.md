@@ -151,7 +151,8 @@ async with await PyTok.from_pool(pool) as api:   # or username="you@email.com"
 
     async for video in user.videos(count=100):
         video_data = await video.info()
-        video_bytes = await video.bytes()
+        media = await video.media()        # PostMedia: MP4, or a photo post's images + sound
+        media.save("media/")
 ```
 
 Accounts are registered and logged in once via
