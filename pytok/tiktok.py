@@ -14,6 +14,7 @@ from camoufox.async_api import AsyncCamoufox
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
+from .api.for_you import ForYou
 from .api.hashtag import Hashtag
 from .api.search import Search
 from .api.sound import Sound
@@ -224,6 +225,10 @@ class PyTok:
     def video(self, *args, **kwargs) -> Video:
         """Create a Video bound to this PyTok instance."""
         return Video(*args, parent=self, **kwargs)
+
+    def for_you(self, *args, **kwargs) -> ForYou:
+        """Create a ForYou (home feed) bound to this PyTok instance."""
+        return ForYou(*args, parent=self, **kwargs)
 
     def trending(self, *args, **kwargs) -> Trending:
         """Create a Trending bound to this PyTok instance."""
