@@ -141,6 +141,29 @@ Earlier versions kept a Chrome profile per account, which Firefox cannot open. T
 
 `PyTok(headless=True)` runs Firefox without a window, but TikTok treats true headless browsers with more suspicion. On Linux, prefer `headless="virtual"`, which runs a normal browser inside a virtual display (needs `Xvfb` installed).
 
+## The For You feed
+
+`api.for_you().videos()` reads the home feed of the logged-in pool account, so the videos
+are that account's personalised recommendations, and a second read gives different ones.
+By default it replays the page's own recommend request for each batch; with
+`prefer_scraping=True` it moves through the feed in the page instead, so every video is
+actually shown to the account.
+
+```py
+async with await PyTok.from_pool(pool) as api:
+    async for video in api.for_you().videos(count=50):
+        print(video.as_dict["author"]["uniqueId"], video.id)
+```
+
+From a phone, `PhoneTikTok.for_you()` swipes through mobile web's feed (see below).
+Mobile web stops moving the feed after its first batch, so it returns about five videos
+logged out and eight or nine from a phone logged into its bound pool account.
+
+Phones are bound to pool accounts with `python -m pytok.accounts.cli bind-phone SERIAL
+USERNAME`; `PhoneTikTok.from_pool(pool, serial)` then holds that account for the session
+and checks the phone's Chrome is logged into it. `PhoneTikTok.import_cookies()` logs a
+phone in from the account's saved cookies, and `login()` with its password.
+
 ## Scraping concurrently across accounts
 
 `WorkerPool` runs many sessions at once — each worker owns one account and its own isolated Firefox profile, so N accounts means N concurrent scrapers. Tasks are plain async callables `async def task(api) -> result` distributed across a shared queue:
@@ -191,7 +214,8 @@ async def main():
     async with PhoneTikTok(serials[0]) as phone:
         user = await phone.user_info("therock")
         videos = await phone.user_videos("therock")
-        print(user["followerCount"], len(videos))
+        feed = await phone.for_you()           # first For You batch
+        print(user["followerCount"], len(videos), len(feed))
 
 asyncio.run(main())
 ```
