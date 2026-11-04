@@ -246,10 +246,13 @@ class AccountsPool:
         return Account.from_rs(rs) if rs else None
 
     async def get_available(self) -> Account | None:
+        # Phone-bound accounts stay on their handset rather than also being driven
+        # from a desktop browser with a different fingerprint.
         q = f"""
         SELECT username FROM accounts
         WHERE active = true
           AND in_use = false
+          AND username NOT IN (SELECT username FROM phone_bindings)
           AND (
                 locks IS NULL
                 OR json_extract(locks, '$.locked_until') IS NULL
@@ -326,6 +329,41 @@ class AccountsPool:
             at_local = datetime.now() + (trg - now)
             return at_local.strftime("%H:%M:%S")
         return None
+
+    # ==================== Phone bindings ====================
+
+    async def bind_phone(self, username: str, serial: str) -> None:
+        """Bind an account to the phone serial whose Chrome it uses.
+
+        One account per phone and one phone per account: rebinding either side
+        replaces its previous binding.
+        """
+        await self.get(username)  # raises if the account is not in the pool
+        await execute(self._db_file,
+                      "DELETE FROM phone_bindings WHERE serial = :serial OR username = :username",
+                      {"serial": serial, "username": username})
+        await execute(self._db_file,
+                      "INSERT INTO phone_bindings (serial, username) VALUES (:serial, :username)",
+                      {"serial": serial, "username": username})
+
+    async def unbind_phone(self, serial: str) -> None:
+        await execute(self._db_file, "DELETE FROM phone_bindings WHERE serial = :serial",
+                      {"serial": serial})
+
+    async def phone_bindings(self) -> dict[str, str]:
+        """{serial: username} for every bound phone."""
+        rows = await fetchall(self._db_file, "SELECT serial, username FROM phone_bindings")
+        return {r["serial"]: r["username"] for r in rows}
+
+    async def get_for_phone(self, serial: str) -> Account | None:
+        """Acquire the account bound to a phone, marking it in_use.
+
+        None when no account is bound to `serial` or the bound one is in use.
+        """
+        q = ("SELECT username FROM accounts WHERE in_use = false AND username = "
+             "(SELECT username FROM phone_bindings WHERE serial = '{}')").format(
+                 serial.replace("'", "''"))
+        return await self._get_and_mark_in_use(q)
 
     async def release_account(self, username):
         usernames = username if isinstance(username, list) else [username] if username else []

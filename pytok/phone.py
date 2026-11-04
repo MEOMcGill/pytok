@@ -68,6 +68,11 @@ Usage::
                            adb=r"C:\\platform-tools\\adb.exe") as phone:
         info = await phone.user_info("therock")
         videos = await phone.user_videos("therock")
+        feed = await phone.for_you(count=50)
+
+`for_you()` reads the home feed by swiping through it. Mobile web stops moving the feed
+after its first batch, so it returns about five videos logged out and eight or nine
+logged in (a phone bound to a pool account, see `from_pool`), and no more.
 
 The transport here (adb wrapper, CDP tunnel, the three gotchas below) follows
 `ai_scrapers.phone_farm`, which drives the same handsets for Google AI Mode. It is
@@ -81,6 +86,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -98,6 +104,7 @@ from .utils import LOGGER_NAME
 logger = logging.getLogger(LOGGER_NAME)
 
 CHROME_PKG = "com.android.chrome"
+_CHROME_MAIN = "com.google.android.apps.chrome.Main"
 DEFAULT_CDP_PORT = 9222
 PROFILE_URL = "https://www.tiktok.com/@{username}"
 
@@ -105,6 +112,91 @@ PROFILE_URL = "https://www.tiktok.com/@{username}"
 # because it carries a long signed query string. Profile info does not need capturing:
 # the mobile page ships it in its rehydration payload and never calls /api/user/detail/.
 _ITEM_LIST_EP = "/api/post/item_list/"
+_RECOMMEND_EP = "/api/recommend/item_list/"
+FOR_YOU_URL = "https://www.tiktok.com/foryou"
+LOGIN_URL = "https://www.tiktok.com/login/phone-or-email/email"
+
+GMAIL_PKG = "com.google.android.gm"
+# How long to wait for TikTok's emailed login code to reach the phone's Gmail inbox.
+_EMAIL_CODE_TIMEOUT = 180.0
+# TikTok's code email as Gmail's inbox list describes it to accessibility services,
+# e.g. "Unread, TikTok, 2 messages, 123456 is your 6-digit code, ..., 3:19 p.m.". The
+# whole description identifies the row: a resent code can repeat the previous one.
+# The row's text sits in `text` or `content-desc` depending on the Gmail build.
+_TIKTOK_CODE_ROW_RE = re.compile(
+    r'="([^"]*TikTok, (?:\d+ messages, )?(\d{6}) is your 6-digit code[^"]*)"')
+# The "verify it's really you" step: a button per method, of which we use the email one.
+_CHOOSE_EMAIL_METHOD_JS = r"""
+(() => {
+  const b = [...document.querySelectorAll('button')]
+    .find(b => b.offsetParent && /^Email/.test(b.innerText.trim()));
+  if (!b) return false;
+  b.click();
+  return true;
+})()
+"""
+_CODE_INPUT = 'input[type="tel"]'
+_SUBMIT_CODE_JS = r"""
+(() => {
+  const b = [...document.querySelectorAll('button')].find(b => b.offsetParent && !b.disabled
+    && /^(next|verify|submit|confirm|continue)$/i.test(b.innerText.trim()));
+  if (!b) return null;
+  b.click();
+  return b.innerText.trim();
+})()
+"""
+
+# Cookies TikTok sets once a session is logged in.
+_SESSION_COOKIES = {"sessionid", "sessionid_ss", "sid_tt"}
+_LOGIN_FIELDS = ('input[name="username"]', 'input[type="password"]')
+# What the login page shows instead of logging in: a captcha, or an error under the form.
+_LOGIN_OBSTACLE_JS = r"""
+(() => {
+  const text = document.body ? document.body.innerText : '';
+  const captcha = ['Drag the slider', 'Verify to continue', 'Rotate the shapes',
+                   'Select 2 objects', 'Click on the shapes'].find(t => text.includes(t));
+  if (captcha || document.querySelector('[id*="captcha" i] canvas, [class*="captcha" i] img'))
+    return 'captcha: ' + (captcha || 'puzzle shown');
+  const errors = ['incorrect', "doesn't exist", 'too many attempts', 'something went wrong',
+                  'try again later', 'maximum number of attempts'];
+  const lower = text.toLowerCase();
+  const error = errors.find(e => lower.includes(e));
+  return error ? 'error: ' + text.slice(Math.max(0, lower.indexOf(error) - 60), lower.indexOf(error) + 60).trim() : null;
+})()
+"""
+
+# Mobile web's For You feed is a swiper fetching small batches a few videos ahead, so
+# several swipes in a row can go by without a request; this many with nothing new ends
+# the walk.
+_FOR_YOU_STALL_SWIPES = 12
+# A touch the renderer never acknowledges means the tab is not on screen: the phone
+# went to sleep, or something else brought its own tab or app to the front.
+# Swipes in a row that leave the same video in front before the walk gives up. Mobile
+# web stops moving its feed after the first batch, logged in or not.
+_FOR_YOU_STUCK_SWIPES = 3
+_ACTIVE_SLIDE_JS = r"""
+(() => {
+  const a = document.querySelector('[data-e2e="video-slide-active"]');
+  return a ? a.innerText.slice(0, 200) : null;
+})()
+"""
+_TOUCH_TIMEOUT = 15.0
+_TOUCH_FAILURES_ALLOWED = 3
+
+# Dismisses what mobile web lays over the feed: the "open the app" sheet it raises after
+# a swipe, and the privacy notice a newly logged-in account gets. While either is up,
+# swipes go to it rather than the feed. A script click, never a touch: the app sheet's
+# "Open TikTok Lite" button sits right beside "Not now" and launches the app.
+_DISMISS_APP_PROMPT_JS = r"""
+(() => {
+  const b = document.querySelector('[data-e2e="alt-middle-cta-cancel-btn"]')
+    || [...document.querySelectorAll('button')]
+         .find(b => b.offsetParent && b.innerText.trim() === 'Got it');
+  if (!b) return false;
+  b.click();
+  return true;
+})()
+"""
 
 
 class PhoneError(TikTokException):
@@ -221,12 +313,16 @@ class CdpTunnel:
         fwd = (f"{self._adb.adb} -s {self._serial} forward tcp:{self._port} "
                f"localabstract:chrome_devtools_remote")
         if self._adb.ssh_host:
-            # Windows keepalive, killed when we terminate the ssh process. The forward and
-            # the -L tunnel must share one process (gotcha 1 above).
-            keepalive = "ping -n 100000 127.0.0.1 >NUL"
+            # Windows keepalive that blocks on stdin, so it exits when the ssh channel
+            # closes; a timed one (ping) outlives a killed ssh client on the host. The
+            # forward and the -L tunnel must share one process (gotcha 1 above).
+            keepalive = "findstr pytok-keepalive-never-matches"
             self._proc = await asyncio.create_subprocess_exec(
-                "ssh", "-L", f"{self._port}:127.0.0.1:{self._port}",
+                # Its own connection, not a shared ControlMaster: tearing down a master
+                # takes every tunnel multiplexed onto it with it.
+                "ssh", "-o", "ControlPath=none", "-L", f"{self._port}:127.0.0.1:{self._port}",
                 self._adb.ssh_host, f"{fwd} && {keepalive}",
+                stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
         else:
             rc, out, err = await self._adb._run(fwd)
@@ -250,7 +346,8 @@ class CdpTunnel:
         # would quietly point at the wrong phone.
         await self._adb.raw(self._serial, f"forward --remove tcp:{self._port}")
 
-    async def _wait_ready(self, timeout: float = 25.0) -> None:
+    # A busy farm host can take tens of seconds to accept a fresh ssh connection.
+    async def _wait_ready(self, timeout: float = 90.0) -> None:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         last: Any = None
@@ -300,7 +397,10 @@ class CdpSession:
     async def __aenter__(self) -> "CdpSession":
         # 100 MB: a single item_list page came back at ~1 MB, but video payloads and
         # long comment pages run much larger, and a truncated frame kills the connection.
-        self._ws = await websockets.connect(self._ws_url, max_size=100 * 1024 * 1024)
+        # No keepalive pings: every call carries its own timeout, and a ping that a slow
+        # farm host delays past websockets' 20s default would drop a healthy session.
+        self._ws = await websockets.connect(self._ws_url, max_size=100 * 1024 * 1024,
+                                            ping_interval=None)
         self._reader = asyncio.create_task(self._read_loop())
         return self
 
@@ -465,6 +565,32 @@ class PhoneTikTok:
         self.sleep_on_exit = sleep_on_exit
         self._tunnel: Optional[CdpTunnel] = None
         self._cdp: Optional[CdpSession] = None
+        # set by from_pool: the pool account bound to this phone, released on exit
+        self.account = None
+        self._pool = None
+
+    @classmethod
+    async def from_pool(cls, accounts_pool, serial: str, **kwargs) -> "PhoneTikTok":
+        """A PhoneTikTok for `serial`, holding the pool account bound to that phone.
+
+        Bind accounts to phones with `python -m pytok.accounts.cli bind-phone`. The
+        account is marked in use until the session exits, so a desktop session cannot
+        take it meanwhile. On entry the session checks which account the phone's
+        Chrome is logged into: another account is an error, logged out a warning.
+
+        Use as ``async with await PhoneTikTok.from_pool(pool, serial) as phone:``.
+        """
+        account = await accounts_pool.get_for_phone(serial)
+        if account is None:
+            bound = (await accounts_pool.phone_bindings()).get(serial)
+            if bound is None:
+                raise PhoneError(f"No account is bound to phone {serial} "
+                                 f"(python -m pytok.accounts.cli bind-phone {serial} <username>)")
+            raise PhoneError(f"{bound}, bound to phone {serial}, is in use by another session")
+        phone = cls(serial, **kwargs)
+        phone.account = account
+        phone._pool = accounts_pool
+        return phone
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -472,6 +598,8 @@ class PhoneTikTok:
         if self.keep_awake:
             await self.wake()
         await self._ensure_chrome()
+        # Chrome stalls a tab while another app is in front, which a farm phone often has.
+        await self._adb.shell(self.serial, f"am start -n {CHROME_PKG}/{_CHROME_MAIN}")
         self._tunnel = CdpTunnel(self._adb, self.serial, self.cdp_port)
         await self._tunnel.__aenter__()
         # From here on, anything that fails has to undo the tunnel by hand: `async with`
@@ -481,11 +609,17 @@ class PhoneTikTok:
             version = await self._tunnel.get_json("/json/version")
             ws_url = version["webSocketDebuggerUrl"].replace("localhost", "127.0.0.1")
             logger.info(f"[phone {self.serial}] driving {version.get('Browser')}")
-            self._cdp = CdpSession(ws_url, response_filter=(_ITEM_LIST_EP,))
+            self._cdp = CdpSession(ws_url, response_filter=(_ITEM_LIST_EP, _RECOMMEND_EP))
             await self._cdp.__aenter__()
+            if self.account is not None:
+                await self._check_identity()
         except Exception:
+            if self._cdp is not None:
+                await self._cdp.__aexit__(None, None, None)
+                self._cdp = None
             await self._tunnel.__aexit__(None, None, None)
             self._tunnel = None
+            await self._release_account()
             raise
         return self
 
@@ -496,12 +630,215 @@ class PhoneTikTok:
             await self._tunnel.__aexit__(*exc)
         if self.sleep_on_exit:
             await self._adb.shell(self.serial, "svc power stayon false; input keyevent KEYCODE_SLEEP")
+        await self._release_account()
 
-    async def wake(self) -> None:
-        """Wake and unlock the screen, and hold it on for the session."""
-        await self._adb.shell(
-            self.serial,
-            "input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard; svc power stayon true")
+    async def _release_account(self) -> None:
+        if self._pool is not None and self.account is not None:
+            await self._pool.release_account(self.account.username)
+            self._pool = None
+
+    async def login(self, username: str, password: str, timeout: float = 90.0) -> str:
+        """Log this phone's Chrome into TikTok with an email/username and password.
+
+        Types into mobile web's login form through CDP, so the page's own input
+        handlers fire as they would for a person typing. Returns the handle now logged
+        in. When TikTok asks to verify the login, the emailed code is read from the
+        phone's Gmail, which must be signed into the account's address. A captcha or a
+        login error raises rather than being worked around: both need a person.
+        """
+        if self._cdp is None:
+            raise PhoneError("PhoneTikTok used outside its `async with` block")
+        cdp = self._cdp
+        target_id, session_id = await cdp.open_tab()
+        try:
+            await cdp.call("Page.navigate", {"url": LOGIN_URL}, session_id=session_id, timeout=90)
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + self.page_timeout_s
+            while not await cdp.evaluate(
+                    f"!!document.querySelector({json.dumps(_LOGIN_FIELDS[0])})", session_id):
+                if loop.time() > deadline:
+                    raise PhoneError(f"TikTok's login form never appeared on phone {self.serial}")
+                await asyncio.sleep(1.0)
+
+            for selector, value in zip(_LOGIN_FIELDS, (username, password), strict=True):
+                await cdp.evaluate(
+                    f"(() => {{ const el = document.querySelector({json.dumps(selector)}); "
+                    f"el.focus(); el.select(); }})()", session_id)
+                await cdp.call("Input.insertText", {"text": value}, session_id=session_id)
+                await asyncio.sleep(0.5)
+            await cdp.evaluate(
+                "document.querySelector('[data-e2e=\"login-button\"]').click()", session_id)
+
+            deadline = loop.time() + timeout
+            code_entered = False
+            while loop.time() < deadline:
+                await asyncio.sleep(2.0)
+                cookies = (await cdp.call("Network.getCookies",
+                                          {"urls": ["https://www.tiktok.com"]},
+                                          session_id=session_id)).get("cookies", [])
+                if _SESSION_COOKIES & {c["name"] for c in cookies}:
+                    break
+                if not code_entered and await cdp.evaluate(
+                        "/Verify it.s really you/.test(document.body.innerText)", session_id):
+                    await self._enter_email_code(session_id)
+                    code_entered = True
+                    deadline = loop.time() + timeout
+                    continue
+                obstacle = await cdp.evaluate(_LOGIN_OBSTACLE_JS, session_id)
+                if obstacle and obstacle.startswith("captcha"):
+                    raise CaptchaException(
+                        f"TikTok asked phone {self.serial} for a {obstacle} while logging "
+                        f"in as {username}")
+                if obstacle:
+                    raise PhoneError(f"login as {username} on phone {self.serial} failed: {obstacle}")
+            else:
+                text = await cdp.evaluate("document.body.innerText.slice(-300)", session_id)
+                raise PhoneError(f"login as {username} on phone {self.serial} did not complete "
+                                 f"within {timeout:.0f}s; the page ends: {text!r}")
+        finally:
+            await cdp.close_tab(target_id, session_id)
+
+        handle = await self.logged_in_unique_id()
+        if not handle:
+            raise PhoneError(f"phone {self.serial} got session cookies for {username} but "
+                             f"TikTok shows no logged-in user")
+        logger.info(f"[phone {self.serial}] logged in as @{handle}")
+        return handle
+
+    async def _enter_email_code(self, session_id: str) -> None:
+        """Get past "verify it's really you" with the code TikTok emails.
+
+        The phone is signed into the account's Gmail, but Gmail does not post a
+        notification for these, so the code is read off the Gmail inbox list. Codes
+        already in the inbox are noted first, so only the one this login asked for is used.
+        """
+        seen = {row for row, _ in await self._gmail_tiktok_codes()}
+        await self._show_tab(session_id)
+        if not await self._cdp.evaluate(_CHOOSE_EMAIL_METHOD_JS, session_id):
+            raise PhoneError(f"phone {self.serial}: TikTok asked to verify the login but "
+                             f"offered no email method")
+        logger.info(f"[phone {self.serial}] TikTok asked to verify the login; reading the "
+                    f"emailed code from Gmail")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _EMAIL_CODE_TIMEOUT
+        code = None
+        while code is None:
+            if loop.time() > deadline:
+                await self._show_tab(session_id)
+                raise PhoneError(f"phone {self.serial}: TikTok's login code never reached "
+                                 f"Gmail within {_EMAIL_CODE_TIMEOUT:.0f}s")
+            await asyncio.sleep(8.0)
+            fresh = [c for row, c in await self._gmail_tiktok_codes() if row not in seen]
+            code = fresh[0] if fresh else None
+        await self._show_tab(session_id)
+        await self._cdp.evaluate(
+            f"(() => {{ const el = document.querySelector({json.dumps(_CODE_INPUT)}); "
+            f"el.focus(); el.select(); }})()", session_id)
+        await self._cdp.call("Input.insertText", {"text": code}, session_id=session_id)
+        await asyncio.sleep(3.0)
+        # some variants of the step submit on the sixth digit, others want a tap
+        await self._cdp.evaluate(_SUBMIT_CODE_JS, session_id)
+
+    async def _gmail_tiktok_codes(self, attempts: int = 5) -> list[tuple[str, str]]:
+        """(inbox row, code) for TikTok's code emails in the phone's Gmail, newest first.
+
+        uiautomator refuses to dump a screen that is still animating, so a dump that
+        comes back without a view hierarchy is retried rather than read as "no codes".
+        """
+        launch = f"monkey -p {GMAIL_PKG} -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1"
+        for _ in range(attempts):
+            xml = await self._adb.shell(
+                self.serial,
+                f"{launch}; sleep 4; uiautomator dump /sdcard/pytok_ui.xml >/dev/null; "
+                f"cat /sdcard/pytok_ui.xml; rm -f /sdcard/pytok_ui.xml")
+            if "<hierarchy" in xml:
+                return list(dict.fromkeys(_TIKTOK_CODE_ROW_RE.findall(xml)))
+            await asyncio.sleep(2.0)
+        raise PhoneError(f"phone {self.serial}: could not read the Gmail inbox")
+
+    async def _show_tab(self, session_id: str) -> None:
+        """Put Chrome, and this tab within it, back in front."""
+        await self._adb.shell(self.serial, f"am start -n {CHROME_PKG}/{_CHROME_MAIN}")
+        await self._cdp.call("Page.bringToFront", {}, session_id=session_id)
+        await asyncio.sleep(2.0)
+
+    async def import_cookies(self, cookies: list[dict]) -> int:
+        """Load saved TikTok cookies (the pool's Playwright-shaped backup) into Chrome.
+
+        Returns how many were set. Only TikTok's own domains are copied.
+        """
+        if self._cdp is None:
+            raise PhoneError("PhoneTikTok used outside its `async with` block")
+        params = []
+        for c in cookies:
+            domain = c.get("domain") or ""
+            if not domain.lstrip(".").endswith("tiktok.com"):
+                continue
+            cookie = {"name": c["name"], "value": c["value"], "path": c.get("path") or "/",
+                      "secure": bool(c.get("secure")), "httpOnly": bool(c.get("httpOnly"))}
+            if domain.startswith("."):
+                cookie["domain"] = domain
+            else:
+                # a domain attribute would widen a host-only cookie to its subdomains
+                cookie["url"] = f"https://{domain}{cookie['path']}"
+            if c.get("sameSite") in ("Strict", "Lax", "None"):
+                cookie["sameSite"] = c["sameSite"]
+            if c.get("expires") and c["expires"] > 0:
+                cookie["expires"] = c["expires"]
+            params.append(cookie)
+        target_id, session_id = await self._cdp.open_tab()
+        try:
+            await self._cdp.call("Network.setCookies", {"cookies": params}, session_id=session_id)
+        finally:
+            await self._cdp.close_tab(target_id, session_id)
+        return len(params)
+
+    async def logged_in_unique_id(self) -> Optional[str]:
+        """The handle of the account this phone's Chrome is logged into, or None."""
+        target_id, session_id = await self._cdp.open_tab()
+        try:
+            await self._cdp.call("Page.navigate", {"url": FOR_YOU_URL},
+                                 session_id=session_id, timeout=90)
+            state = await self._await_page_state(session_id)
+        finally:
+            await self._cdp.close_tab(target_id, session_id)
+        try:
+            scope = json.loads(state.get("rehydration") or "{}").get("__DEFAULT_SCOPE__", {})
+        except json.JSONDecodeError:
+            return None
+        user = (scope.get("webapp.app-context") or {}).get("user") or {}
+        return user.get("uniqueId") or None
+
+    async def _check_identity(self) -> None:
+        handle = await self.logged_in_unique_id()
+        expected = self.account.unique_id
+        if handle is None:
+            logger.warning(
+                f"[phone {self.serial}] Chrome is not logged into TikTok, so reads are "
+                f"anonymous rather than as {expected or self.account.username}")
+        elif expected and handle.lower() != expected.lower():
+            raise PhoneError(
+                f"phone {self.serial}'s Chrome is logged in as @{handle}, not as its bound "
+                f"account @{expected}")
+        else:
+            logger.info(f"[phone {self.serial}] logged in as @{handle}")
+
+    async def wake(self, attempts: int = 3) -> None:
+        """Wake and unlock the screen, and hold it on for the session.
+
+        From Samsung's always-on display WAKEUP alone often leaves the panel dozing, and
+        a dozing phone silently drops touches; HOME brings it fully on. Callers put
+        Chrome back in front afterwards.
+        """
+        for _ in range(attempts):
+            state = await self._adb.shell(
+                self.serial,
+                "svc power stayon true; input keyevent KEYCODE_WAKEUP; "
+                "input keyevent KEYCODE_HOME; wm dismiss-keyguard; sleep 1; "
+                "dumpsys power | grep -m1 mWakefulness=")
+            if "Awake" in state:
+                return
+        raise PhoneError(f"phone {self.serial} would not wake (power state: {state.strip()})")
 
     async def _ensure_chrome(self, timeout: float = 45.0) -> None:
         """Start Chrome and wait for its DevTools socket to exist.
@@ -704,3 +1041,129 @@ class PhoneTikTok:
             return videos
         finally:
             await self._cdp.close_tab(target_id, session_id)
+
+    # -- home feed ------------------------------------------------------------
+
+    async def for_you(self, count: int = 30) -> list[dict]:
+        """Videos from the mobile For You feed, as raw `itemList` dicts.
+
+        Swipes through the feed in its own tab with CDP touch events, which reach only
+        that tab, and collects the batches the page fetches as it goes. The walk ends at
+        `count` distinct videos, once swiping stops bringing new ones, or once the feed
+        stops moving -- which mobile web does after its first batch.
+        """
+        if self._cdp is None:
+            raise PhoneError("PhoneTikTok used outside its `async with` block")
+        cdp = self._cdp
+        target_id, session_id = await cdp.open_tab()
+        try:
+            await cdp.call("Page.navigate", {"url": FOR_YOU_URL},
+                           session_id=session_id, timeout=90)
+            videos: list[dict] = []
+            seen: set[str] = set()
+            read = 0
+
+            async def collect() -> int:
+                nonlocal read
+                mine = [(rid, url) for sid, rid, url in cdp.responses
+                        if sid == session_id and _RECOMMEND_EP in url]
+                added = 0
+                for request_id, _url in mine[read:]:
+                    body = await cdp.response_body(request_id, session_id)
+                    for item in (body or {}).get("itemList") or []:
+                        if item.get("id") and item["id"] not in seen:
+                            seen.add(item["id"])
+                            videos.append(item)
+                            added += 1
+                read = len(mine)
+                return added
+
+            if not await self._await_recommendations(session_id):
+                raise ApiFailedException(
+                    f"the For You page on phone {self.serial} sent no recommendations "
+                    f"within {self.listing_timeout_s:.0f}s")
+            await collect()
+            if not videos:
+                raise ApiFailedException(
+                    "TikTok answered the For You feed with an empty body -- refused rather "
+                    "than empty (commonly rate-limiting, which is per egress IP)")
+            width, height = await cdp.evaluate("[innerWidth, innerHeight]", session_id)
+
+            idle = 0
+            stuck = 0
+            touch_failures = 0
+            active = await cdp.evaluate(_ACTIVE_SLIDE_JS, session_id)
+            while len(videos) < count and idle < _FOR_YOU_STALL_SWIPES:
+                try:
+                    await asyncio.wait_for(self._dismiss_app_prompt(session_id), _TOUCH_TIMEOUT)
+                    await asyncio.wait_for(
+                        self._swipe_up(session_id, width, height), _TOUCH_TIMEOUT)
+                    touch_failures = 0
+                except (asyncio.TimeoutError, PhoneError) as ex:
+                    touch_failures += 1
+                    if touch_failures > _TOUCH_FAILURES_ALLOWED:
+                        raise PhoneError(
+                            f"phone {self.serial} stopped responding to touch in the feed "
+                            f"tab ({ex}) -- it is asleep, or another job has its own tab "
+                            f"or app in front")
+                    # close the half-finished gesture so the next touchStart begins clean
+                    try:
+                        await cdp.call("Input.dispatchTouchEvent",
+                                       {"type": "touchCancel", "touchPoints": []},
+                                       session_id=session_id, timeout=5)
+                    except PhoneError:
+                        pass
+                    await self.wake()
+                    await self._show_tab(session_id)
+                    continue
+                # the time a viewer spends on a video, and the page's chance to fetch
+                await asyncio.sleep(2.0)
+                added = await collect()
+                idle = 0 if added else idle + 1
+                logger.debug(f"[phone {self.serial}] For You swipe: {added} new, {len(videos)} so far")
+
+                await self._dismiss_app_prompt(session_id)
+                now_active = await cdp.evaluate(_ACTIVE_SLIDE_JS, session_id)
+                stuck = stuck + 1 if now_active == active else 0
+                active = now_active
+                if stuck >= _FOR_YOU_STUCK_SWIPES:
+                    logger.warning(
+                        f"[phone {self.serial}] For You feed stopped moving after "
+                        f"{len(videos)} videos; mobile web stops paging the feed after its "
+                        f"first batch")
+                    break
+
+            logger.info(f"[phone {self.serial}] For You: {len(videos)} videos")
+            return videos[:count]
+        finally:
+            await cdp.close_tab(target_id, session_id)
+
+    async def _await_recommendations(self, session_id: str) -> bool:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.listing_timeout_s
+        while loop.time() < deadline:
+            if any(sid == session_id and _RECOMMEND_EP in url
+                   for sid, _, url in self._cdp.responses):
+                return True
+            await asyncio.sleep(0.5)
+        return False
+
+    async def _dismiss_app_prompt(self, session_id: str) -> None:
+        if await self._cdp.evaluate(_DISMISS_APP_PROMPT_JS, session_id):
+            await asyncio.sleep(0.5)
+
+    async def _swipe_up(self, session_id: str, width: int, height: int) -> None:
+        """One upward swipe, moving the feed on by a video."""
+        x, start, end = width // 2, int(height * 0.75), int(height * 0.25)
+        steps = 8
+        await self._cdp.call("Input.dispatchTouchEvent",
+                             {"type": "touchStart", "touchPoints": [{"x": x, "y": start}]},
+                             session_id=session_id)
+        for k in range(1, steps + 1):
+            y = start + (end - start) * k // steps
+            await self._cdp.call("Input.dispatchTouchEvent",
+                                 {"type": "touchMove", "touchPoints": [{"x": x, "y": y}]},
+                                 session_id=session_id)
+            await asyncio.sleep(0.02)
+        await self._cdp.call("Input.dispatchTouchEvent",
+                             {"type": "touchEnd", "touchPoints": []}, session_id=session_id)
