@@ -116,6 +116,35 @@ def delete(ctx, username, delete_all):
     run_async(_delete())
 
 
+@cli.command(name="bind-phone")
+@click.argument("serial")
+@click.argument("username")
+@click.pass_context
+def bind_phone(ctx, serial, username):
+    """Bind USERNAME to the phone with adb serial SERIAL.
+
+    PhoneTikTok.from_pool then drives that phone as that account, and desktop
+    sessions stop picking the account up from the pool.
+    """
+    async def _bind():
+        await AccountsPool(ctx.obj["db"]).bind_phone(username, serial)
+        click.echo(f"Bound {username} to phone {serial}")
+
+    run_async(_bind())
+
+
+@cli.command(name="unbind-phone")
+@click.argument("serial")
+@click.pass_context
+def unbind_phone(ctx, serial):
+    """Remove the account binding from phone SERIAL."""
+    async def _unbind():
+        await AccountsPool(ctx.obj["db"]).unbind_phone(serial)
+        click.echo(f"Unbound phone {serial}")
+
+    run_async(_unbind())
+
+
 @cli.command(name="list")
 @click.option("--active", is_flag=True, help="Active accounts only")
 @click.option("--inactive", is_flag=True, help="Inactive accounts only")
@@ -135,9 +164,10 @@ def list_accounts(ctx, active, inactive, verbose):
         if not accounts:
             click.echo("No accounts")
             return
+        phone_of = {u.lower(): serial for serial, u in (await pool.phone_bindings()).items()}
 
         if verbose:
-            headers = ["Username", "Handle", "UID", "Active", "In Use", "Last Used", "Cookies", "Error"]
+            headers = ["Username", "Handle", "UID", "Active", "In Use", "Phone", "Last Used", "Cookies", "Error"]
             rows = [
                 [
                     a.username,
@@ -145,6 +175,7 @@ def list_accounts(ctx, active, inactive, verbose):
                     a.user_id or "-",
                     "Y" if a.active else "N",
                     "Y" if a.in_use else "N",
+                    phone_of.get(a.username.lower(), "-"),
                     str(a.last_used)[:19] if a.last_used else "-",
                     len(a.cookies),
                     (a.error_msg[:30] + "...") if a.error_msg and len(a.error_msg) > 30 else (a.error_msg or "-"),
@@ -152,13 +183,14 @@ def list_accounts(ctx, active, inactive, verbose):
                 for a in accounts
             ]
         else:
-            headers = ["Username", "Handle", "Active", "In Use", "Last Used"]
+            headers = ["Username", "Handle", "Active", "In Use", "Phone", "Last Used"]
             rows = [
                 [
                     a.username,
                     a.unique_id or "-",
                     "Y" if a.active else "N",
                     "Y" if a.in_use else "N",
+                    phone_of.get(a.username.lower(), "-"),
                     str(a.last_used)[:19] if a.last_used else "-",
                 ]
                 for a in accounts

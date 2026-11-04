@@ -44,6 +44,7 @@ async def migrate(db: aiosqlite.Connection):
     MIGRATIONS = [
         (1, migrate_v1),
         (2, migrate_v2),
+        (3, migrate_v3),
     ]
 
     for version, migration_fn in MIGRATIONS:
@@ -104,6 +105,19 @@ async def migrate_v2(db: aiosqlite.Connection):
     Firefox profile dir, which starts empty and is logged in from the cookie backup.
     """
     await db.execute("UPDATE accounts SET profile_dir = NULL")
+
+
+async def migrate_v3(db: aiosqlite.Connection):
+    """Bind accounts to the phones whose Chrome they are logged into.
+
+    A table of its own rather than a column on `accounts`: older pytok builds turn
+    `SELECT *` rows straight into Account objects and would break on a new column.
+    """
+    await db.execute("""
+    CREATE TABLE IF NOT EXISTS phone_bindings (
+        serial TEXT NOT NULL PRIMARY KEY,
+        username TEXT NOT NULL UNIQUE COLLATE NOCASE
+    )""")
 
 
 class DB:
