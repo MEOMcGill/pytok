@@ -40,15 +40,14 @@ class NotAvailableException(TikTokException):
     """The requested object is not available in this region."""
 
 class NoVideoException(NotAvailableException):
-    """This post has no video to download — it is a photo/slideshow post.
+    """This post has no media to download: neither a video nor any images.
 
     A property of the post, not of the session or the account, so a caller collecting media
-    should skip it and carry on rather than counting it as a download failure. Photo-heavy
-    profiles post these in long runs, which would otherwise look like a broken session.
+    should skip it and carry on rather than counting it as a download failure.
 
     Subclasses NotAvailableException so callers that only catch that keep working. A caller
     which maps NotAvailableException to "this account is unavailable, skip the handle" has to
-    catch this one *first*: one photo post says nothing about the account."""
+    catch this one *first*: one post without media says nothing about the account."""
 
 class NoContentException(TikTokException):
     """TikTok returned no content"""
@@ -56,18 +55,8 @@ class NoContentException(TikTokException):
 class TimeoutException(TikTokException):
     """Timed out trying to get content from TikTok"""
 
-class CDPTimeoutException(TikTokException):
-    """A CDP command was sent to the browser and never answered.
-
-    Means the page has stopped servicing the DevTools protocol, so every later command on
-    that connection would hang too — the session is dead and has to be rebuilt.
-
-    Deliberately a plain TikTokException: it is in neither the accounts pool's
-    DATA_LEVEL_EXCEPTIONS (which propagate with no retry — this is not the target's fault)
-    nor ROTATE_EXCEPTIONS (which cooldown the account for minutes — the account is fine, it
-    is the browser that is broken). That drops it into Worker.execute_task's generic handler,
-    which closes the session and rebuilds in place on the same account: the fast recovery
-    this actually wants."""
+class ConnectionDroppedException(TikTokException):
+    """TikTok closed the connection without answering, which it does to a throttled session."""
 
 class ApiFailedException(TikTokException):
     """TikTok API is failing"""
@@ -80,8 +69,26 @@ class NoTemplateException(ApiFailedException):
     own request params off the wire. A subclass of ApiFailedException so every
     existing API→scraping fallback handles it transparently."""
 
+class SearchLimitException(ApiFailedException):
+    """This account has used up its search allowance (statusCode 2484), so every search
+    comes back empty until it lifts.
+
+    Raised instead of falling back to the search page, which would only end in 0 results
+    that look like a keyword with none. The cap is per account, so a caller can keep going
+    on another one. A subclass of ApiFailedException so a worker rests and rotates the
+    account as it does for other rate limiting."""
+
 class FewerVideosThanExpectedException(TikTokException):
-    """TikTok is returning fewer videos for this user than their metadata led us to expect"""
+    """TikTok is returning fewer videos for this user than their metadata led us to expect.
+
+    Raised when a listing walk stops partway through a profile without TikTok ever saying the
+    listing had ended. Distinct from the bare "no videos at all" case: a profile's first page
+    comes from the page HTML, which a bot-flagged session still receives, so a blocked walk
+    yields a page or two and then dies looking like a complete profile.
+
+    Session-level rather than data-level, hence its place in ROTATE_EXCEPTIONS: the profile
+    really does have the videos, this session just could not page through them, so retrying on
+    a fresh one is worth doing."""
 
 class AccountPrivateException(TikTokException):
     """This TikTok account is private and cannot be scraped"""

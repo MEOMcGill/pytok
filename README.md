@@ -1,15 +1,34 @@
 
+[![CI](https://github.com/MEOMcGill/pytok/actions/workflows/ci.yml/badge.svg)](https://github.com/MEOMcGill/pytok/actions/workflows/ci.yml)
+[![License: PolyForm Noncommercial](https://img.shields.io/badge/License-PolyForm%20Noncommercial%201.0.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![DOI](https://zenodo.org/badge/555492190.svg)](https://zenodo.org/doi/10.5281/zenodo.12802713)
 
 # pytok
 
-This is a zendriver based version of David Teacher's unofficial api wrapper for TikTok.com in python. It re-implements a currently limited set of the features of the original library, with a shifted focus on using browser automation to allow automatic captcha solves with a hopefully minor trade-off in performance.
+This is a [camoufox](https://github.com/daijro/camoufox) based version of David Teather's unofficial api wrapper for TikTok.com in python. It re-implements a set of features from the original library, with a shifted focus on using browser automation to allow automatic captcha solves with a hopefully minor trade-off in performance.
 
 ## Installation
 
 ```bash
-pip install git+https://github.com/networkdynamics/pytok.git@master
+pip install git+https://github.com/MEOMcGill/pytok.git@master
 ```
+
+> [!WARNING]
+> Install from this repository, not from PyPI. The `pytok` name on PyPI belongs to
+> an unrelated project, so `pip install pytok` will get you different software.
+
+PyTok drives camoufox, a Firefox build hardened against fingerprinting. Its browser is
+downloaded on first launch, or ahead of time with:
+
+```bash
+python -m camoufox fetch
+```
+
+> [!NOTE]
+> camoufox 0.5 deletes a camoufox 0.4 browser cache it finds on first run. If another
+> project on the same machine still uses camoufox 0.4, give one of them its own cache
+> location first.
 
 ## Quick Start Guide
 
@@ -20,7 +39,7 @@ python -m pytok.accounts.cli add   --username you@email.com --password 'your-pas
 python -m pytok.accounts.cli login --username you@email.com
 ```
 
-Here's a quick bit of code to get the videos from a particular user on TikTok. There's more examples in the [examples](https://github.com/networkdynamics/pytok/tree/master/examples) directory.
+Here's a quick bit of code to get the videos from a particular user on TikTok. There's more examples in the [examples](https://github.com/MEOMcGill/pytok/tree/master/examples) directory.
 
 ```py
 import asyncio
@@ -61,11 +80,19 @@ async for video in sound.videos(count=100):
     ...
 ```
 
+To download media, call `video.media()`, or pass `get_media=True` to any of these listings to fetch it as each video is yielded. Either way you get a `PostMedia`: the MP4 of a video post, or the images and sound of a photo/slideshow post, which `save()` writes to a directory:
+
+```py
+async for video in api.user(username="therock").videos(count=100, get_media=True):
+    if video.post_media is not None:  # None if that post's download failed
+        video.post_media.save("media/")  # <id>.mp4, or <id>_01.jpg, ..., <id>.m4a
+```
+
 Please note pulling data from TikTok takes a while! We recommend leaving the scripts running on a server for a while for them to finish downloading everything. Feel free to play around with the delay constants to either speed up the process or avoid TikTok rate limiting, like so: `PyTok(request_delay=10)`
 
 ## Accounts, login, and persistent sessions
 
-PyTok supports scraping as a logged-in account, and managing multiple accounts, via an **accounts pool**: a SQLite-backed set of TikTok accounts, each with its own persistent Chrome profile and a cookie/identity backup. You register an account and log in **once** (interactively), and every session afterwards comes up already authenticated from that profile, repairing itself from the cookie backup if the profile's session is lost.
+PyTok supports scraping as a logged-in account, and managing multiple accounts, via an **accounts pool**: a SQLite-backed set of TikTok accounts, each with its own persistent Firefox profile (and the browser fingerprint it was first given) and a cookie/identity backup. You register an account and log in **once** (interactively), and every session afterwards comes up already authenticated from that profile, repairing itself from the cookie backup if the profile's session is lost.
 
 The pool lives in `~/.pytok` by default (override with the `$PYTOK_HOME` env var). The database holds credentials and cookie backups in plaintext, so keep that directory private — it is deliberately kept outside the repo.
 
@@ -104,9 +131,19 @@ if __name__ == "__main__":
 
 Other useful CLI commands: `info <username>`, `stats`, `activate`/`deactivate`, `release` (recover an account left in-use by a crashed run), `unlock`, and `delete`. Run `python -m pytok.accounts.cli --help` for the full list.
 
+Each account's browser profile lives in `~/.pytok/firefox-profiles/<username>`, alongside a `pytok-fingerprint.json` holding the browser fingerprint that profile was first given. Every later session reuses it, so the account keeps appearing from the same device. `login --seed-profile <dir>` copies a warmed Firefox profile into a new account's profile dir first; the source's fingerprint file is not copied, so the new account gets its own.
+
+### Upgrading from the zendriver (Chrome) version
+
+Earlier versions kept a Chrome profile per account, which Firefox cannot open. The first time this version opens an accounts database, it forgets those profile dirs (leaving them on disk). Each account then starts a fresh Firefox profile and logs in from its stored cookie backup. If that backup has gone stale, log the account in again with `python -m pytok.accounts.cli login --username ...`. An older PyTok sharing the same database keeps working, since it falls back to its default Chrome profile location.
+
+## Running headless
+
+`PyTok(headless=True)` runs Firefox without a window, but TikTok treats true headless browsers with more suspicion. On Linux, prefer `headless="virtual"`, which runs a normal browser inside a virtual display (needs `Xvfb` installed).
+
 ## Scraping concurrently across accounts
 
-`WorkerPool` runs many sessions at once — each worker owns one account and its own isolated Chrome profile, so N accounts means N concurrent scrapers. Tasks are plain async callables `async def task(api) -> result` distributed across a shared queue:
+`WorkerPool` runs many sessions at once — each worker owns one account and its own isolated Firefox profile, so N accounts means N concurrent scrapers. Tasks are plain async callables `async def task(api) -> result` distributed across a shared queue:
 
 ```py
 import asyncio
@@ -133,7 +170,7 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-`max_workers` is capped to the number of active accounts. Workers rotate/rest accounts and rebuild crashed sessions automatically. See [`examples/worker_pool_example.py`](https://github.com/networkdynamics/pytok/tree/master/examples/worker_pool_example.py).
+`max_workers` is capped to the number of active accounts. Workers rotate/rest accounts and rebuild crashed sessions automatically. See [`examples/worker_pool_example.py`](https://github.com/MEOMcGill/pytok/tree/master/examples/worker_pool_example.py).
 
 Please do not hesitate to make an issue in this repo to get our help with this!
 

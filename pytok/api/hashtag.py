@@ -3,19 +3,16 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-
 from typing import TYPE_CHECKING, Iterator, Optional
 from urllib.parse import parse_qs, urlparse
-
-from zendriver import cdp
 
 if TYPE_CHECKING:
     from ..tiktok import PyTok
     from .video import Video
 
-from .base import Base
 from ..exceptions import *
 from ..helpers import extract_tag_contents
+from .base import Base
 
 # challenge/detail statusCode TikTok returns for a hashtag that doesn't exist.
 HASHTAG_NOT_FOUND_STATUS_CODES = (10205,)
@@ -34,6 +31,16 @@ def _apostrophe_variants(texts):
         if "'" in text:
             variants.append(text.replace("'", "’"))
     return variants
+
+
+# The hashtag feed's items, used both to wait for the feed and to report how far it
+# has grown during a scroll walk.
+CHALLENGE_ITEM_SELECTOR = '[data-e2e=challenge-item]'
+
+# A hashtag listing is only ended by the walk's stall check, so this is a backstop against
+# a feed that never stops producing rather than a budget. It used to be left at
+# scroll_walk's default of 30, which capped a busy tag at ~30 pages however much it held.
+_UNBOUNDED_MAX_ROUNDS = 400
 
 
 class Hashtag(Base):
@@ -97,7 +104,7 @@ class Hashtag(Base):
             return await self._info_full_api(**kwargs)
         except ApiFailedException as ex:
             self.parent.logger.warning(
-                f"TikTok-Api hashtag.info_full() failed: {ex}. Falling back to scraping method."
+                f"API hashtag info request failed: {ex}. Falling back to scraping method."
             )
             return await self._info_full_scrape(**kwargs)
 
@@ -119,7 +126,7 @@ class Hashtag(Base):
         except EmptyResponseException:
             raise ApiFailedException("TikTok API returned empty response")
         except Exception as e:
-            raise ApiFailedException(f"TikTok-Api make_request failed: {e}")
+            raise ApiFailedException(f"API request failed: {e}")
 
         if resp is None:
             raise ApiFailedException("TikTok returned None response")
@@ -169,7 +176,7 @@ class Hashtag(Base):
 
         try:
             await self.wait_for_content_or_unavailable_or_captcha(
-                '[data-e2e=challenge-item]',
+                CHALLENGE_ITEM_SELECTOR,
                 'Not available',
                 no_content_text=_apostrophe_variants(HASHTAG_NOT_FOUND_TEXTS),
             )
@@ -186,7 +193,7 @@ class Hashtag(Base):
         if challenge_info is None:
             # Anonymous sessions get the same object inlined in the page.
             challenge_info = self._challenge_info_from_html(
-                await self.parent._page.get_content()
+                await self.parent._page.content()
             )
 
         if challenge_info is None and page_challenge_id is not None:
@@ -250,7 +257,7 @@ class Hashtag(Base):
         in the page's meta tags, and the challengeID on the feed request the page
         did fire, both name the hashtag even though nothing fetched its details.
         """
-        html = await self.parent._page.get_content()
+        html = await self.parent._page.content()
         match = re.search(r'challenge/detail/(\d+)', html)
         if match:
             return match.group(1)
@@ -293,7 +300,7 @@ class Hashtag(Base):
                         f"TikTok has no hashtag '{self.name}': page says '{text}'"
                     )
 
-        detail = self._challenge_detail_from_html(await self.parent._page.get_content())
+        detail = self._challenge_detail_from_html(await self.parent._page.content())
         if detail is None:
             return
         status_code = max(detail.get('statusCode', 0), detail.get('status_code', 0))
@@ -326,7 +333,7 @@ class Hashtag(Base):
         detail = self._challenge_detail_from_html(html) or {}
         return detail.get('challengeInfo') or None
 
-    async def videos(self, count=30, offset=0, prefer_scraping=False, **kwargs) -> Iterator[Video]:
+    async def videos(self, count=30, offset=0, prefer_scraping=False, get_media=False, **kwargs) -> Iterator[Video]:
         """Returns a dictionary listing TikToks with a specific hashtag.
 
         - Parameters:
@@ -340,6 +347,9 @@ class Hashtag(Base):
               load below on the first hashtag of a session (see
               ZendriverTikTokApi.cache_api_params) — changing only challengeID and
               cursor. Kept as an explicit escape hatch to force the scrolling path.
+            - get_media (bool | callable): Download each post's media into
+              ``video.post_media`` as it is yielded, or pass a predicate
+              ``(video) -> bool`` to choose which. See User.videos().
 
         Example Usage
         ```py
@@ -347,6 +357,11 @@ class Hashtag(Base):
             # do something
         ```
         """
+        videos = self._iter_videos(count=count, offset=offset, prefer_scraping=prefer_scraping)
+        async for video in self._with_media(videos, get_media):
+            yield video
+
+    async def _iter_videos(self, count, offset, prefer_scraping):
         await self.info()
 
         seen_ids = set()
@@ -382,12 +397,12 @@ class Hashtag(Base):
                 )
             except ApiFailedException as ex:
                 self.parent.logger.warning(
-                    f"TikTok-Api hashtag.videos() failed: {ex}. Falling back to scraping method."
+                    f"API hashtag videos request failed: {ex}. Falling back to scraping method."
                 )
 
         # Scraping route. Loading the hashtag page fires the webapp's own
         # challenge/item_list request, which fills the param template for that
-        # endpoint (PyTok._on_request_will_be_sent -> cache_api_params). So we
+        # endpoint (PyTok._on_request -> cache_api_params). So we
         # harvest that first page off the wire and then resume paginating through
         # the API from its cursor, instead of scrolling for every page.
         await self._load_hashtag_page()
@@ -436,10 +451,10 @@ class Hashtag(Base):
                     params=params,
                 )
             except Exception as e:
-                raise ApiFailedException(f"TikTok-Api make_request failed: {e}")
+                raise ApiFailedException(f"API request failed: {e}")
 
             if res is None:
-                raise ApiFailedException("TikTok-Api returned None response")
+                raise ApiFailedException("API returned None response")
 
             if res.get('type') == 'verify':
                 raise ApiFailedException("TikTok API is asking for verification")
@@ -471,9 +486,8 @@ class Hashtag(Base):
 
         The page load fires the webapp's own challenge/detail and
         challenge/item_list requests, which fill the param templates for those
-        endpoints (PyTok._on_request_will_be_sent -> cache_api_params).
+        endpoints (PyTok._on_request -> cache_api_params).
         """
-        page = self.parent._page
 
         # Drop anything captured for earlier operations first, so what we harvest
         # after the navigation belongs to this hashtag.
@@ -481,9 +495,8 @@ class Hashtag(Base):
 
         url = f"https://www.tiktok.com/tag/{self.name}"
         self.parent.logger.debug(f"Loading page: {url}")
-        await page.send(cdp.page.navigate(url))
-        async with asyncio.timeout(30):
-            await page.wait_for_ready_state(until='complete', timeout=31)
+        await self.parent.navigate(url)
+        await self.parent.wait_for_load(30)
         await asyncio.sleep(3)
 
     async def _load_hashtag_page(self):
@@ -499,7 +512,7 @@ class Hashtag(Base):
         await self.check_and_wait_for_captcha()
         await self.check_and_close_signin()
         await self._raise_if_hashtag_missing()
-        if not await self._is_selector_visible('[data-e2e=challenge-item]'):
+        if not await self._is_selector_visible(CHALLENGE_ITEM_SELECTOR):
             self.parent.logger.warning(
                 "Hashtag video grid not visible yet (TikTok requires login for this "
                 "feed; pass a logged-in user_data_dir if you get no results)."
@@ -514,7 +527,6 @@ class Hashtag(Base):
         API route can't take over. Returns (items, has_more, cursor) so pagination
         continues from where the page's own requests left off.
         """
-        page = self.parent._page
         items = []
         has_more = True
         cursor = 0
@@ -548,7 +560,7 @@ class Hashtag(Base):
             if not has_more or attempt == attempts - 1:
                 break
             await self.check_and_wait_for_captcha()
-            await page.evaluate('window.scrollBy(0, window.innerHeight * 4)')
+            await self.scroll_feed(CHALLENGE_ITEM_SELECTOR)
             await asyncio.sleep(2.5)
 
         return items, has_more, cursor
@@ -576,57 +588,33 @@ class Hashtag(Base):
 
     async def _scroll_for_videos(self):
         """Scroll the loaded hashtag page, yielding videos from each new response."""
-        page = self.parent._page
+        yielded = 0
+        walk = self.scroll_walk("api/challenge/item_list", CHALLENGE_ITEM_SELECTOR,
+                                max_rounds=_UNBOUNDED_MAX_ROUNDS,
+                                before_round=self.check_and_wait_for_captcha)
+        try:
+            async for rnd in walk.rounds():
+                for resp in rnd.responses:
+                    res = self._parse_response(resp)
+                    if res is None:
+                        walk.stats['unusable_responses'] += 1
+                        continue
 
-        has_more = True
-        scroll_attempts = 0
-        max_scroll_attempts = 30
-        empty_rounds = 0
-        max_empty_rounds = 5
+                    videos = res.get("itemList", [])
+                    rnd.produced += len(videos)
+                    for video in videos:
+                        yielded += 1
+                        yield self.parent.video(data=video)
 
-        while has_more and scroll_attempts < max_scroll_attempts:
-            await self.check_and_wait_for_captcha()
-
-            # Scroll first so the lazily-loaded item_list request fires, then give
-            # its response body time to be captured before reading it.
-            yielded_this_round = 0
-            await page.evaluate('window.scrollBy(0, window.innerHeight * 4)')
-            await asyncio.sleep(3)
-            await self.check_and_resolve_refresh_button()
-
-            video_responses = await self.parent.process_pending_responses("api/challenge/item_list")
-            for resp in video_responses:
-                res = self._parse_response(resp)
-                if res is None:
-                    continue
-
-                for video in res.get("itemList", []):
-                    yielded_this_round += 1
-                    yield self.parent.video(data=video)
-
-                if not res.get("hasMore", False):
-                    self.parent.logger.info(
-                        "TikTok isn't sending more TikToks beyond this point."
-                    )
-                    has_more = False
-
-            if not has_more:
-                break
-
-            # Give up early if scrolling stops producing new videos (e.g. the
-            # feed is login-walled) rather than scrolling to the hard limit.
-            if yielded_this_round == 0:
-                empty_rounds += 1
-                if empty_rounds >= max_empty_rounds:
-                    self.parent.logger.info(
-                        "No new hashtag videos after repeated scrolls, stopping."
-                    )
-                    return
-            else:
-                empty_rounds = 0
-
-            await self.parent.request_delay()
-            scroll_attempts += 1
+                    # hasMore=0 is counted, never obeyed: TikTok sends it on short pages
+                    # well inside a listing that then keeps serving, so ending the walk on
+                    # it stops a busy tag at a fraction of its depth. The walk's stall
+                    # check costs a handful of quiet rounds and is the only thing here that
+                    # can tell an exhausted listing from a throttled one.
+                    if not res.get('hasMore', 1):
+                        walk.stats['pages_saying_no_more'] += 1
+        finally:
+            self.parent.logger.info(f"#{self.name}: walked {yielded} videos, {walk.summary()}")
 
     def __extract_from_data(self):
         data = self.as_dict

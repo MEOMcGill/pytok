@@ -23,7 +23,7 @@ def run_async(coro):
 
 
 def _seed_profile_dir(src: str, dst: str):
-    """Copy a warmed Chrome profile at `src` into the account's profile dir `dst`.
+    """Copy a warmed Firefox profile at `src` into the account's profile dir `dst`.
 
     Gives the login browser a warmed profile (history/state) while still capturing
     fresh cookies from the login flow. Refuses to clobber an already-populated
@@ -38,7 +38,11 @@ def _seed_profile_dir(src: str, dst: str):
             f"Profile dir already populated: {dst}. Refusing to overwrite a warmed/logged-in "
             f"profile — delete it (or add a fresh account) before seeding."
         )
-    shutil.copytree(src, dst, dirs_exist_ok=True)
+    from ..tiktok import PyTok
+
+    # The fingerprint stays behind so the new account gets one of its own.
+    shutil.copytree(src, dst, dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns(PyTok._FINGERPRINT_FILE))
 
 
 @click.group()
@@ -57,7 +61,7 @@ def cli(ctx, db):
 @click.option("--email-password", default=None, help="Email password")
 @click.option("--phone", default=None, help="Optional phone on file")
 @click.option("--cookies", default=None, help="Cookies JSON string, header string, or file path")
-@click.option("--profile-dir", default=None, help="Chrome profile dir (defaults to ~/.pytok/profiles/<user>)")
+@click.option("--profile-dir", default=None, help="Firefox profile dir (defaults to ~/.pytok/firefox-profiles/<user>)")
 @click.pass_context
 def add(ctx, username, password, email, email_password, phone, cookies, profile_dir):
     """Add a new account."""
@@ -101,7 +105,7 @@ def delete(ctx, username, delete_all):
             if not accounts:
                 click.echo("No accounts")
                 return
-            if not click.confirm(f"Delete ALL {len(accounts)} accounts? (Chrome profiles are left on disk)"):
+            if not click.confirm(f"Delete ALL {len(accounts)} accounts? (browser profiles are left on disk)"):
                 return
             await pool.delete_account([a.username for a in accounts])
             click.echo(f"Deleted {len(accounts)}")
@@ -280,28 +284,51 @@ def release(ctx, username):
 @click.option("--username", required=True, help="Login identifier to log in")
 @click.option("--headless", is_flag=True, help="Run headless (not recommended for login)")
 @click.option("--seed-profile", default=None,
-              help="Path to a warmed Chrome profile to copy into this account's profile dir "
+              help="Path to a warmed Firefox profile to copy into this account's profile dir "
                    "before login. Gives a warmed browser (history/state) while the login flow "
                    "still captures fresh cookies. Refuses to overwrite a populated profile dir; "
                    "the source template is copied, never mutated.")
 @click.option("--force-relogin", is_flag=True,
               help="Clear the profile's session and force a fresh login (recover a stale account)")
+@click.option("--manual-login", is_flag=True,
+              help="Sign in by hand in the browser window instead of driving the stored "
+                   "credentials. Use this when the automatic flow cannot get past a captcha: "
+                   "you type the username and password and solve the challenge, then this "
+                   "captures the identity and cookies once you are in.")
+@click.option("--timeout", default=None, type=int,
+              help="Seconds to wait for the login to complete (default 300, or 600 with "
+                   "--manual-login, since typing credentials and solving a captcha takes longer)")
 @click.pass_context
-def login(ctx, username, headless, seed_profile, force_relogin):
+def login(ctx, username, headless, seed_profile, force_relogin, manual_login, timeout):
     """Open a browser for this account, log in, and capture identity + cookies.
 
-    Use this once per new account: it launches the account's persistent Chrome
+    Use this once per new account: it launches the account's persistent Firefox
     profile, runs the login/verification flow, then stores the resolved TikTok
     identity and a cookie backup so future sessions start already logged in.
 
-    Pass --seed-profile to copy a warmed Chrome profile into this account's
+    Pass --seed-profile to copy a warmed Firefox profile into this account's
     profile dir first, so the login runs in a browser that already looks
     used (helps avoid new-profile bot detection) while still logging in fresh.
 
     Pass --force-relogin to recover an account whose cookies look valid but whose
     session TikTok has invalidated (app-context shows no logged-in user).
+
+    Pass --manual-login to sign in yourself in the browser window rather than having
+    the stored credentials typed in. This is the way past a captcha the solver cannot
+    read, which the automatic flow can only fail on. Combine the two to recover a
+    stale account that also needs a challenge solved:
+
+        cli login --username you@example.com --force-relogin --manual-login
+
+    Completion is detected by polling for the session, so no console is needed and it
+    works when driven from a scheduled task or over ssh. It does need a real desktop
+    for the browser, so --manual-login and --headless are mutually exclusive.
     """
     from ..tiktok import PyTok
+
+    if manual_login and headless:
+        raise click.UsageError("--manual-login needs a visible browser; drop --headless")
+    login_timeout = timeout if timeout is not None else (600 if manual_login else 300)
 
     async def _login():
         pool = AccountsPool(ctx.obj["db"])
@@ -314,8 +341,13 @@ def login(ctx, username, headless, seed_profile, force_relogin):
                 _seed_profile_dir(seed_profile, account.profile_dir)
                 click.echo(f"Seeded warmed profile: {os.path.expanduser(seed_profile)} "
                            f"-> {account.profile_dir}")
+            if manual_login:
+                click.echo(f"Manual login: a browser will open on {account.username}'s profile. "
+                           f"Sign in there and solve any challenge; this waits up to "
+                           f"{login_timeout}s and stores the session once you are in.")
             async with PyTok(account=account, accounts_pool=pool, headless=headless,
-                             force_relogin=force_relogin) as api:
+                             force_relogin=force_relogin, manual_login=manual_login,
+                             login_timeout=login_timeout) as api:
                 ident = await api._get_logged_in_identity()
                 if ident:
                     click.echo(f"Logged in as @{ident.get('unique_id')} (uid {ident.get('user_id')})")

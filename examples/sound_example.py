@@ -15,11 +15,11 @@ import asyncio
 import json
 import logging
 
-from pytok.tiktok import PyTok
 from pytok.accounts import AccountsPool
+from pytok.tiktok import PyTok
 
 
-async def scrape_sound(sound_id, count, output, account_username, headless):
+async def scrape_sound(sound_id, count, output, account_username, headless, media_dir=None):
     pool = AccountsPool()
 
     # from_pool acquires the given account (or the least-recently-used available
@@ -28,9 +28,11 @@ async def scrape_sound(sound_id, count, output, account_username, headless):
         sound = api.sound(id=sound_id)
 
         videos = []
-        async for video in sound.videos(count=count):
+        async for video in sound.videos(count=count, get_media=media_dir is not None):
             video_info = await video.info()
             videos.append(video_info)
+            if video.post_media is not None:
+                video.post_media.save(media_dir)
 
         with open(output, "w") as out_file:
             json.dump(videos, out_file)
@@ -55,6 +57,8 @@ def main():
              "least-recently-used available account.",
     )
     parser.add_argument("--headless", action="store_true", help="Run the browser headless.")
+    parser.add_argument("--media-dir", default=None,
+                        help="Also download each post's media (MP4, or a photo post's images and sound) here.")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -63,7 +67,7 @@ def main():
     )
 
     asyncio.run(scrape_sound(
-        args.sound, args.count, args.output, args.account, args.headless,
+        args.sound, args.count, args.output, args.account, args.headless, args.media_dir,
     ))
 
 

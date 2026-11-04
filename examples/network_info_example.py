@@ -7,8 +7,8 @@ account.
 import asyncio
 import json
 
-from pytok.tiktok import PyTok
 from pytok.accounts import AccountsPool
+from pytok.tiktok import PyTok
 
 username = 'therock'
 id = '7296444945991224622'

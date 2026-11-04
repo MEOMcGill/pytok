@@ -4,8 +4,11 @@ import pytest
 
 from pytok import utils
 
+
 @pytest.mark.parametrize("json_file_path", [os.path.join(".", "tests", "data", "20230915-200856_error_videos.json")])
 def test_get_video_df(json_file_path):
+    if not os.path.exists(json_file_path):
+        pytest.skip("fixture data is not committed to the repo")
     csv_file_path = json_file_path.replace(".json", ".csv")
     video_df = utils.try_load_video_df_from_file(csv_file_path, file_paths=[json_file_path])
 
@@ -14,6 +17,8 @@ def test_get_video_df(json_file_path):
 
 @pytest.mark.parametrize("json_file_path", [os.path.join(".", "tests", "data", "20230915-200856_error_users.json")])
 def test_get_user_df(json_file_path):
+    if not os.path.exists(json_file_path):
+        pytest.skip("fixture data is not committed to the repo")
     csv_file_path = json_file_path.replace(".json", ".csv")
     user_df = utils.try_load_user_df_from_file(csv_file_path, file_paths=[json_file_path])
 

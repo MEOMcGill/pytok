@@ -2,17 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
+import sys
 import urllib.parse
 from typing import TYPE_CHECKING, Iterator, Optional
 from urllib.parse import parse_qs, urlparse
 
-from zendriver import cdp
-
+from ..exceptions import *
+from ..tiktok_api import raise_for_search_limit
+from .base import Base
 from .user import User
 from .video import Video
-from .base import Base
-from ..exceptions import *
 
 if TYPE_CHECKING:
     from ..tiktok import PyTok
@@ -20,21 +21,15 @@ if TYPE_CHECKING:
 # web_search_code mirrors what the TikTok web app sends with search requests
 _WEB_SEARCH_CODE = '{"tiktok":{"client_params_x":{"search_engine":{"ies_mt_user_live_video_card_use_libra":1,"mt_search_general_user_live_card":1}},"search_server":{}}}'
 
-# TikTok's search results render inside an inner scroll container, not the
-# document body — so window.scrollBy does nothing. Scroll that container to
-# fire the lazily-loaded pagination requests. Fall back to the window in case
-# the layout changes.
-_SCROLL_SEARCH_GRID_JS = """
-(() => {
-  const el = document.querySelector('#grid-main') ||
-             document.querySelector('[class*=SearchGridLayoutContainer]');
-  if (el && el.scrollHeight > el.clientHeight) {
-    el.scrollTop = el.scrollHeight;
-    return;
-  }
-  window.scrollBy(0, window.innerHeight * 4);
-})()
-"""
+# TikTok's search results render inside an inner scroll container, not the document
+# body -- so scrolling the window does nothing and never fires the lazily-loaded
+# pagination requests. base.scroll_feed falls back to the window if this is not
+# found, in case the layout changes.
+_SEARCH_GRID_SELECTOR = '#grid-main, [class*=SearchGridLayoutContainer]'
+
+# Scrolls with no `count` to size them are only ended by the walk's stall check; this is
+# just a backstop against a page that never stops producing.
+_UNBOUNDED_MAX_ROUNDS = 400
 
 # Page size TikTok serves videos at. User search pages come 20 at a time, so
 # this is only used to size scroll budgets — as the smaller of the two it can
@@ -66,12 +61,14 @@ class Search(Base):
     _max_page_size = 0
     """Largest page of results this search has been served. See
     _note_page_size. Reset per search_type() call."""
+    _scroll_stop = None
+    """Why the last scroll walk ended, for search_type's closing log line."""
 
     def __init__(self, search_term, parent: Optional[PyTok] = None):
         self.parent = parent
         self.search_term = search_term
 
-    async def videos(self, count=28, offset=0, **kwargs) -> Iterator[Video]:
+    async def videos(self, count=28, offset=0, get_media=False, **kwargs) -> Iterator[Video]:
         """
         Searches for Videos
 
@@ -81,6 +78,9 @@ class Search(Base):
             - offset (int): The offset of videos from your data you want returned.
             - prefer_scraping (bool): If True, get results by scrolling the browser
               page rather than through the make_request API. See search_type().
+            - get_media (bool | callable): Download each post's media into
+              ``video.post_media`` as it is yielded, or pass a predicate
+              ``(video) -> bool`` to choose which. See User.videos().
 
         Example Usage
         ```py
@@ -88,8 +88,9 @@ class Search(Base):
             # do something
         ```
         """
-        async for result in self.search_type("item", count=count, offset=offset, **kwargs):
-            yield result
+        videos = self.search_type("item", count=count, offset=offset, **kwargs)
+        async for video in self._with_media(videos, get_media):
+            yield video
 
     async def users(self, count=28, offset=0, **kwargs) -> Iterator[User]:
         """
@@ -141,6 +142,7 @@ class Search(Base):
         # _note_page_size for what counts as its word.
         self._exhausted_listing = False
         self._max_page_size = 0
+        self._scroll_stop = None
 
         seen_ids = set()
         amount_yielded = 0
@@ -165,65 +167,110 @@ class Search(Base):
                 if enough():
                     return
 
-        if not prefer_scraping:
-            try:
-                async for result in emit(self._search_type_api(obj_type, cursor=offset)):
-                    yield result
-                if enough() or (amount_yielded and self._exhausted_listing):
-                    return
-                self.parent.logger.warning(
-                    f"API path returned {amount_yielded} search results ({obj_type}) "
-                    f"of {wanted} and stopped short of the end of the listing. "
-                    "Falling back to scraping method."
-                )
-            except ApiFailedException as ex:
-                self.parent.logger.warning(
-                    f"TikTok-Api search ({obj_type}) failed: {ex}. Falling back to scraping method."
-                )
+        # Which route the search is on, so the closing log line can say where it ended.
+        route = "API"
+        try:
+            if not prefer_scraping:
+                try:
+                    async for result in emit(self._search_type_api(obj_type, cursor=offset)):
+                        yield result
+                    if enough() or (amount_yielded and self._exhausted_listing):
+                        return
+                    self.parent.logger.warning(
+                        f"{self._label(obj_type)}: API path returned {amount_yielded} results "
+                        f"of {wanted} and stopped short of the end of the listing. "
+                        "Falling back to scraping method."
+                    )
+                except SearchLimitException:
+                    raise
+                except ApiFailedException as ex:
+                    self.parent.logger.warning(
+                        f"{self._label(obj_type)}: API search failed: {ex}. Falling back to scraping method."
+                    )
 
-        # Scraping route. Loading the search page fires the webapp's own search
-        # request, which fills the param template for that endpoint
-        # (PyTok._on_request_will_be_sent -> cache_api_params). So we harvest that
-        # first page off the wire and then resume paginating through the API from
-        # its cursor and search_id, instead of scrolling for every page.
-        await self._load_search_page(obj_type)
-        results, has_more, cursor, search_id = await self._harvest_page_results(obj_type)
-        self.parent.logger.info(
-            f"Got {len(results)} search results from the search page, "
-            f"has_more={has_more}, cursor={cursor}"
+            # Scraping route. Loading the search page fires the webapp's own search
+            # request, which fills the param template for that endpoint
+            # (PyTok._on_request -> cache_api_params). So we harvest that
+            # first page off the wire and then resume paginating through the API from
+            # its cursor and search_id, instead of scrolling for every page.
+            route = "search page"
+            await self._load_search_page(obj_type)
+            results, has_more, cursor, search_id = await self._harvest_page_results(obj_type)
+            self.parent.logger.info(
+                f"{self._label(obj_type)}: got {len(results)} results from the search page, "
+                f"has_more={has_more}, cursor={cursor}"
+            )
+            async for result in emit(self._aiter(results)):
+                yield result
+            if enough():
+                return
+            if not has_more:
+                return
+
+            if not prefer_scraping:
+                route = "resumed API"
+                try:
+                    async for result in emit(
+                        self._search_type_api(obj_type, cursor=cursor, search_id=search_id)
+                    ):
+                        yield result
+                    if enough() or self._exhausted_listing:
+                        return
+                    # The resumed API stopped short of the end of the listing. Don't
+                    # settle for what we have — carry on by scrolling, which
+                    # paginates the same listing without replaying any params.
+                    self.parent.logger.warning(
+                        f"{self._label(obj_type)}: resumed API path stopped at {amount_yielded} results "
+                        f"of {wanted}, short of the end of the listing. "
+                        "Continuing by scrolling the page."
+                    )
+                except SearchLimitException:
+                    raise
+                except ApiFailedException as ex:
+                    self.parent.logger.warning(
+                        f"{self._label(obj_type)}: API still failing after the search page load ({ex}). "
+                        "Continuing by scrolling the page."
+                    )
+
+            route = "scroll"
+            remaining = None if count is None else count - amount_yielded
+            async for result in emit(self._scroll_for_results(obj_type, count=remaining)):
+                yield result
+        finally:
+            self._log_search_end(obj_type, route, amount_yielded, count, sys.exc_info()[1])
+
+    def _label(self, obj_type):
+        return f"search {obj_type} '{self.search_term}'"
+
+    def _log_search_end(self, obj_type, route, amount, count, exc):
+        """Log one line saying why search_type stopped.
+
+        A search stopped short by throttling otherwise looks exactly like one that
+        ran out of results, so every exit says which it was. Scrolling ending short
+        of an explicit count is a warning: it is what a throttled session looks like.
+        """
+        level = logging.INFO
+        if count is not None and amount >= count:
+            reason = "reached the requested count"
+        elif isinstance(exc, GeneratorExit):
+            reason = "the caller stopped iterating"
+        elif exc is not None:
+            level = logging.WARNING
+            reason = f"{type(exc).__name__}: {exc}"
+        elif self._exhausted_listing:
+            reason = "TikTok sent a short last page"
+        elif route == "scroll":
+            reason = f"scrolling stopped ({self._scroll_stop})"
+            if count is not None:
+                level = logging.WARNING
+        else:
+            reason = "the route ended without reaching the end of the listing"
+        wanted = count if count is not None else "all"
+        self.parent.logger.log(
+            level,
+            f"{self._label(obj_type)}: ended with {amount} of {wanted} results "
+            f"during the {route} route: {reason}",
         )
-        async for result in emit(self._aiter(results)):
-            yield result
-        if enough():
-            return
-        if not has_more:
-            return
-
-        if not prefer_scraping:
-            try:
-                async for result in emit(
-                    self._search_type_api(obj_type, cursor=cursor, search_id=search_id)
-                ):
-                    yield result
-                if enough() or self._exhausted_listing:
-                    return
-                # The resumed API stopped short of the end of the listing. Don't
-                # settle for what we have — carry on by scrolling, which
-                # paginates the same listing without replaying any params.
-                self.parent.logger.warning(
-                    f"Resumed API path stopped at {amount_yielded} search results "
-                    f"of {wanted}, short of the end of the listing. "
-                    "Continuing by scrolling the page."
-                )
-            except ApiFailedException as ex:
-                self.parent.logger.warning(
-                    f"API still failing after the search page load ({ex}). "
-                    "Continuing by scrolling the page."
-                )
-
-        remaining = None if count is None else count - amount_yielded
-        async for result in emit(self._scroll_for_results(obj_type, count=remaining)):
-            yield result
 
     def _note_page_size(self, page_size):
         """Record a page of results, and say whether it was a short one.
@@ -271,11 +318,13 @@ class Search(Base):
                     url=f"https://www.tiktok.com/api/search/{obj_type}/full/",
                     params=params,
                 )
+            except SearchLimitException:
+                raise
             except Exception as e:
-                raise ApiFailedException(f"TikTok-Api make_request failed: {e}")
+                raise ApiFailedException(f"API request failed: {e}")
 
             if res is None:
-                raise ApiFailedException("TikTok-Api returned None response")
+                raise ApiFailedException("API returned None response")
 
             if res.get('type') == 'verify':
                 raise ApiFailedException("TikTok API is asking for verification")
@@ -302,7 +351,7 @@ class Search(Base):
                     )
                 self._exhausted_listing = short_page
                 self.parent.logger.info(
-                    f"TikTok is not sending results beyond cursor {cursor} "
+                    f"{self._label(obj_type)}: TikTok is not sending results beyond cursor {cursor} "
                     f"(last page held {page_size})."
                 )
                 return
@@ -318,7 +367,6 @@ class Search(Base):
 
     async def _load_search_page(self, obj_type):
         """Navigate to the search results page so its search request fires."""
-        page = self.parent._page
 
         # Drop anything captured for earlier operations first, so what we harvest
         # after the navigation belongs to this search.
@@ -327,9 +375,8 @@ class Search(Base):
         subpath = "user" if obj_type == "user" else "video"
         url = f"https://www.tiktok.com/search/{subpath}?q={urllib.parse.quote(self.search_term)}"
         self.parent.logger.debug(f"Loading page: {url}")
-        await page.send(cdp.page.navigate(url))
-        async with asyncio.timeout(30):
-            await page.wait_for_ready_state(until='complete', timeout=31)
+        await self.parent.navigate(url)
+        await self.parent.wait_for_load(30)
         await asyncio.sleep(3)
 
         await self.check_and_wait_for_captcha()
@@ -345,7 +392,6 @@ class Search(Base):
         so pagination continues from where the page's own requests left off. Each
         result is a (object, id) pair as produced by _yield_results.
         """
-        page = self.parent._page
         results = []
         has_more = True
         cursor = 0
@@ -389,7 +435,7 @@ class Search(Base):
             if not has_more or attempt == attempts - 1:
                 break
             await self.check_and_wait_for_captcha()
-            await page.evaluate(_SCROLL_SEARCH_GRID_JS)
+            await self.scroll_feed(container_selector=_SEARCH_GRID_SELECTOR)
             await asyncio.sleep(2.5)
 
         return results, has_more, cursor, search_id
@@ -425,6 +471,7 @@ class Search(Base):
         if res.get('type') == 'verify':
             # this is the captcha denied response
             return None
+        raise_for_search_limit(res)
         return res
 
     async def _scroll_for_results(self, obj_type, count=28) -> Iterator:
@@ -432,78 +479,52 @@ class Search(Base):
 
         `count` is how many results the caller still needs; it sizes the scroll
         budget, since the page hands back one page of results per scroll. None
-        means the caller wants the whole listing, so no budget is imposed and
-        stopping is left to has_more and the empty-round guard.
+        means the caller wants the whole listing, so stopping is left to has_more
+        and the walk's stall check.
         """
-        page = self.parent._page
+        # One scroll yields one page, so a fixed budget silently caps big requests. Allow
+        # enough scrolls for `count` with slack for rounds that come back empty, and let the
+        # walk's stall check stop us early. count=None asks for everything, so there is no
+        # budget to size -- then only the stall check ends the scroll.
+        max_rounds = (_UNBOUNDED_MAX_ROUNDS if count is None
+                      else max(30, math.ceil(count / _VIDEO_PAGE_SIZE) * 2))
+        yielded = 0
+        # The results live in an inner scroll container, not the window: scrolling the
+        # window there is a no-op that never triggers the infinite-scroll observer.
+        walk = self.scroll_walk(_endpoint_path(obj_type),
+                                container_selector=_SEARCH_GRID_SELECTOR,
+                                max_rounds=max_rounds,
+                                before_round=self.check_and_wait_for_captcha)
+        try:
+            async for rnd in walk.rounds():
+                for resp in rnd.responses:
+                    res = self._parse_response(resp)
+                    if res is None:
+                        walk.stats['unusable_responses'] += 1
+                        continue
 
-        has_more = True
-        scroll_attempts = 0
-        # One scroll yields one page, so a fixed budget silently caps big
-        # requests. Allow enough scrolls for `count` with slack for rounds that
-        # come back empty, and let the empty-round guard below stop us early.
-        # count=None asks for everything, so there is no budget to size -- the
-        # empty-round guard is what ends an unbounded scroll.
-        max_scroll_attempts = None if count is None else max(30, math.ceil(count / _VIDEO_PAGE_SIZE) * 2)
-        empty_rounds = 0
-        max_empty_rounds = 3
+                    results = list(self._yield_results(obj_type, res, with_id=True))
+                    rnd.produced += len(results)
+                    for result in results:
+                        yielded += 1
+                        yield result
 
-        while has_more and (max_scroll_attempts is None or scroll_attempts < max_scroll_attempts):
-            await self.check_and_wait_for_captcha()
-
-            # Scroll first so the lazily-loaded search request fires, then give
-            # its response body time to be captured before reading it. The
-            # results live in an inner scroll container (#grid-main), not the
-            # window — scrolling the window is a no-op and never triggers the
-            # infinite-scroll observer, so target the container.
-            yielded_this_round = 0
-            await page.evaluate(_SCROLL_SEARCH_GRID_JS)
-            await asyncio.sleep(3)
-            await self.check_and_resolve_refresh_button()
-
-            responses = await self.parent.process_pending_responses(_endpoint_path(obj_type))
-            for resp in responses:
-                res = self._parse_response(resp)
-                if res is None:
-                    continue
-
-                page_size = 0
-                for result in self._yield_results(obj_type, res, with_id=True):
-                    page_size += 1
-                    yielded_this_round += 1
-                    yield result
-
-                # Only a short page is trusted when it says the listing is over
-                # (see _note_page_size). An empty or exactly-full page saying the
-                # same is as likely to be TikTok stalling us, so leave those to
-                # the empty-round guard below, which gives the page a couple more
-                # scrolls to recover.
-                short_page = self._note_page_size(page_size)
-                if not res.get("has_more", 0) and short_page:
-                    self.parent.logger.info(
-                        f"TikTok is not sending results beyond this point "
-                        f"(last page held {page_size})."
-                    )
-                    self._exhausted_listing = True
-                    has_more = False
-
-            if not has_more:
-                break
-
-            # Give up early if scrolling stops producing new results rather than
-            # scrolling all the way to the hard limit.
-            if yielded_this_round == 0:
-                empty_rounds += 1
-                if empty_rounds >= max_empty_rounds:
-                    self.parent.logger.info(
-                        "No new search results after repeated scrolls, stopping."
-                    )
-                    return
-            else:
-                empty_rounds = 0
-
-            await self.parent.request_delay()
-            scroll_attempts += 1
+                    # has_more=0 is counted, never obeyed. A short page carrying it looks
+                    # like the end of the listing and is not: TikTok sends one well inside
+                    # a search that then keeps serving results for another two hundred, so
+                    # stopping here ends the walk at a fraction of its depth. This is the
+                    # last route, so there is nothing to fall back to and nothing gained by
+                    # believing it -- the walk's stall check spends a handful of quiet
+                    # rounds and is the only thing that can tell an exhausted listing from
+                    # a throttled one.
+                    self._note_page_size(len(results))
+                    if not res.get("has_more", 0):
+                        walk.stats['pages_saying_no_more'] += 1
+        finally:
+            self._scroll_stop = walk.reason
+            self.parent.logger.info(
+                f"{self._label(obj_type)}: walked {yielded} results, {walk.summary()}"
+            )
 
     def _yield_results(self, obj_type, res, with_id=False):
         """Build User/Video objects from a search response payload."""

@@ -3,20 +3,21 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-
 from typing import TYPE_CHECKING, Iterator, Optional
 from urllib.parse import urlparse
-
-from zendriver import cdp
 
 if TYPE_CHECKING:
     from ..tiktok import PyTok
     from .user import User
     from .video import Video
 
-from .base import Base
 from ..exceptions import *
 from ..helpers import extract_tag_contents
+from .base import Base
+
+# The sound feed's items, used both to wait for the feed and to report how far it has
+# grown during a scroll walk.
+MUSIC_ITEM_SELECTOR = '[data-e2e=music-item]'
 
 
 class Sound(Base):
@@ -89,7 +90,7 @@ class Sound(Base):
             return await self._info_full_api(**kwargs)
         except ApiFailedException as ex:
             self.parent.logger.warning(
-                f"TikTok-Api sound.info_full() failed: {ex}. Falling back to scraping method."
+                f"API sound info request failed: {ex}. Falling back to scraping method."
             )
             return await self._info_full_scrape(**kwargs)
 
@@ -108,7 +109,7 @@ class Sound(Base):
         except EmptyResponseException:
             raise ApiFailedException("TikTok API returned empty response")
         except Exception as e:
-            raise ApiFailedException(f"TikTok-Api make_request failed: {e}")
+            raise ApiFailedException(f"API request failed: {e}")
 
         if resp is None:
             raise ApiFailedException("TikTok returned None response")
@@ -123,14 +124,13 @@ class Sound(Base):
     async def _info_full_scrape(self, **kwargs) -> dict:
         await self._navigate_to_sound_page()
 
-        # Read the detail response the page fired on load straight away: Chrome
-        # garbage-collects response bodies, and the DOM waits below can easily
-        # outlast this one.
+        # Read the detail response the page fired on load straight away, before the
+        # DOM waits below.
         music_info = await self._read_music_detail_responses()
 
         if music_info is None:
             await self.wait_for_content_or_unavailable_or_captcha(
-                '[data-e2e=music-item]', 'Not available'
+                MUSIC_ITEM_SELECTOR, 'Not available'
             )
             await self.check_and_close_signin()
 
@@ -143,17 +143,17 @@ class Sound(Base):
                 await asyncio.sleep(1.5)
 
         if music_info is None:
-            # Chrome can garbage-collect a response body before we read it. The
+            # The detail response may never have been captured. The
             # music page doesn't normally ship a music-detail rehydration scope
             # the way the hashtag page does, but check anyway in case TikTok
             # server-renders it for this visitor.
             music_info = self._music_info_from_html(
-                await self.parent._page.get_content()
+                await self.parent._page.content()
             )
 
         if music_info is None:
             # The page load has now filled the param template for music/detail
-            # (PyTok._on_request_will_be_sent -> cache_api_params), so the API
+            # (PyTok._on_request -> cache_api_params), so the API
             # route can have another go — the first attempt may simply have had
             # no template to replay.
             try:
@@ -216,7 +216,7 @@ class Sound(Base):
         detail = data.get('__DEFAULT_SCOPE__', {}).get('webapp.music-detail', {})
         return detail.get('musicInfo') or None
 
-    async def videos(self, count=30, offset=0, prefer_scraping=False, **kwargs) -> Iterator[Video]:
+    async def videos(self, count=30, offset=0, prefer_scraping=False, get_media=False, **kwargs) -> Iterator[Video]:
         """Returns Video objects of videos created with this sound.
 
         - Parameters:
@@ -229,6 +229,9 @@ class Sound(Base):
               load below on the first sound of a session (see
               ZendriverTikTokApi.cache_api_params) — changing only musicID and
               cursor. Kept as an explicit escape hatch to force the scrolling path.
+            - get_media (bool | callable): Download each post's media into
+              ``video.post_media`` as it is yielded, or pass a predicate
+              ``(video) -> bool`` to choose which. See User.videos().
 
         Example Usage
         ```py
@@ -236,6 +239,11 @@ class Sound(Base):
             # do something
         ```
         """
+        videos = self._iter_videos(count=count, offset=offset, prefer_scraping=prefer_scraping)
+        async for video in self._with_media(videos, get_media):
+            yield video
+
+    async def _iter_videos(self, count, offset, prefer_scraping):
         self.__ensure_valid()
 
         seen_ids = set()
@@ -266,12 +274,12 @@ class Sound(Base):
                 )
             except ApiFailedException as ex:
                 self.parent.logger.warning(
-                    f"TikTok-Api sound.videos() failed: {ex}. Falling back to scraping method."
+                    f"API sound videos request failed: {ex}. Falling back to scraping method."
                 )
 
         # Scraping route. Loading the sound page fires the webapp's own
         # music/item_list request, which fills the param template for that
-        # endpoint (PyTok._on_request_will_be_sent -> cache_api_params). So we
+        # endpoint (PyTok._on_request -> cache_api_params). So we
         # harvest that first page off the wire and then resume paginating through
         # the API from its cursor, instead of scrolling for every page.
         await self._load_sound_page()
@@ -320,10 +328,10 @@ class Sound(Base):
                     params=params,
                 )
             except Exception as e:
-                raise ApiFailedException(f"TikTok-Api make_request failed: {e}")
+                raise ApiFailedException(f"API request failed: {e}")
 
             if res is None:
-                raise ApiFailedException("TikTok-Api returned None response")
+                raise ApiFailedException("API returned None response")
 
             if res.get('type') == 'verify':
                 raise ApiFailedException("TikTok API is asking for verification")
@@ -366,9 +374,8 @@ class Sound(Base):
 
         The page load fires the webapp's own music/detail and music/item_list
         requests, which fill the param templates for those endpoints
-        (PyTok._on_request_will_be_sent -> cache_api_params).
+        (PyTok._on_request -> cache_api_params).
         """
-        page = self.parent._page
 
         # Drop anything captured for earlier operations first, so what we harvest
         # after the navigation belongs to this sound.
@@ -376,9 +383,8 @@ class Sound(Base):
 
         url = self._page_url
         self.parent.logger.debug(f"Loading page: {url}")
-        await page.send(cdp.page.navigate(url))
-        async with asyncio.timeout(30):
-            await page.wait_for_ready_state(until='complete', timeout=31)
+        await self.parent.navigate(url)
+        await self.parent.wait_for_load(30)
         await asyncio.sleep(3)
 
     async def _load_sound_page(self):
@@ -395,7 +401,7 @@ class Sound(Base):
         await self._navigate_to_sound_page()
         await self.check_and_wait_for_captcha()
         await self.check_and_close_signin()
-        if not await self._is_selector_visible('[data-e2e=music-item]'):
+        if not await self._is_selector_visible(MUSIC_ITEM_SELECTOR):
             self.parent.logger.warning(
                 "Sound video grid not visible yet (TikTok requires login for this "
                 "feed; pass a logged-in user_data_dir if you get no results)."
@@ -410,7 +416,6 @@ class Sound(Base):
         API route can't take over. Returns (items, has_more, cursor) so pagination
         continues from where the page's own requests left off.
         """
-        page = self.parent._page
         items = []
         has_more = True
         cursor = 0
@@ -444,7 +449,7 @@ class Sound(Base):
             if not has_more or attempt == attempts - 1:
                 break
             await self.check_and_wait_for_captcha()
-            await page.evaluate('window.scrollBy(0, window.innerHeight * 4)')
+            await self.scroll_feed(MUSIC_ITEM_SELECTOR)
             await asyncio.sleep(2.5)
 
         return items, has_more, cursor
@@ -472,57 +477,29 @@ class Sound(Base):
 
     async def _scroll_for_videos(self):
         """Scroll the loaded sound page, yielding videos from each new response."""
-        page = self.parent._page
+        yielded = 0
+        walk = self.scroll_walk("api/music/item_list", MUSIC_ITEM_SELECTOR,
+                                before_round=self.check_and_wait_for_captcha)
+        try:
+            async for rnd in walk.rounds():
+                for resp in rnd.responses:
+                    res = self._parse_response(resp)
+                    if res is None:
+                        walk.stats['unusable_responses'] += 1
+                        continue
 
-        has_more = True
-        scroll_attempts = 0
-        max_scroll_attempts = 30
-        empty_rounds = 0
-        max_empty_rounds = 5
+                    videos = res.get("itemList", [])
+                    rnd.produced += len(videos)
+                    for video in videos:
+                        yielded += 1
+                        yield self.parent.video(data=video)
 
-        while has_more and scroll_attempts < max_scroll_attempts:
-            await self.check_and_wait_for_captcha()
-
-            # Scroll first so the lazily-loaded item_list request fires, then give
-            # its response body time to be captured before reading it.
-            yielded_this_round = 0
-            await page.evaluate('window.scrollBy(0, window.innerHeight * 4)')
-            await asyncio.sleep(3)
-            await self.check_and_resolve_refresh_button()
-
-            video_responses = await self.parent.process_pending_responses("api/music/item_list")
-            for resp in video_responses:
-                res = self._parse_response(resp)
-                if res is None:
-                    continue
-
-                for video in res.get("itemList", []):
-                    yielded_this_round += 1
-                    yield self.parent.video(data=video)
-
-                if not res.get("hasMore", False):
-                    self.parent.logger.info(
-                        "TikTok isn't sending more TikToks beyond this point."
-                    )
-                    has_more = False
-
-            if not has_more:
-                break
-
-            # Give up early if scrolling stops producing new videos (e.g. the
-            # feed is login-walled) rather than scrolling to the hard limit.
-            if yielded_this_round == 0:
-                empty_rounds += 1
-                if empty_rounds >= max_empty_rounds:
-                    self.parent.logger.info(
-                        "No new sound videos after repeated scrolls, stopping."
-                    )
-                    return
-            else:
-                empty_rounds = 0
-
-            await self.parent.request_delay()
-            scroll_attempts += 1
+                    if 'hasMore' in res:
+                        rnd.stop = not res['hasMore']
+        finally:
+            self.parent.logger.info(
+                f"sound {self.id}: walked {yielded} videos, {walk.summary()}"
+            )
 
     def __extract_from_data(self):
         data = self.as_dict or {}

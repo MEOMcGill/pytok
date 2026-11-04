@@ -1,6 +1,6 @@
 """Scrape concurrently across multiple accounts with a WorkerPool.
 
-Each worker owns one account and its own Chrome session (isolated by the
+Each worker owns one account and its own browser session (isolated by the
 account's profile dir), so N workers run N concurrent scraping sessions. Tasks
 are plain async callables ``async def task(api: PyTok) -> result`` submitted to a
 shared queue; the pool distributes them across workers and gathers the results.

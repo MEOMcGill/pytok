@@ -1,7 +1,7 @@
 """Scrape TikTok mobile web by driving Chrome on a physical Android phone over adb + CDP.
 
-A third data route, alongside the two in `tiktok.py` (TikTok-Api requests, and zendriver
-driving a desktop Chrome). Instead of a browser on this machine it drives **Chrome on a
+A third data route, alongside the two in `tiktok.py` (signed API requests, and camoufox
+driving a desktop Firefox). Instead of a browser on this machine it drives **Chrome on a
 real handset**:
 
     wake the phone -> start Chrome -> `adb forward` its DevTools socket -> open a tab at

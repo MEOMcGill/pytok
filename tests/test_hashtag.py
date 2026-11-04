@@ -1,9 +1,13 @@
 import asyncio
 import contextlib
 
-from pytok.tiktok import PyTok
+import pytest
+
 from pytok.accounts import AccountsPool
 from pytok.exceptions import ApiFailedException, NoContentException
+from pytok.tiktok import PyTok
+
+pytestmark = pytest.mark.live
 
 hashtag_name = 'funny'
 missing_hashtag_name = 'awndoanwoidnawoidnaw'

@@ -1,11 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 from typing import TYPE_CHECKING, Iterator, Optional
-
-from zendriver import cdp
 
 from ..exceptions import *
 from ..helpers import extract_tag_contents
@@ -15,6 +12,21 @@ if TYPE_CHECKING:
     from .video import Video
 
 from .base import Base
+
+# How much of a profile's own videoCount a walk has to reach before it counts as complete.
+# Slack is needed because videoCount is not a promise: it keeps counting posts the listing no
+# longer serves (deleted, region-locked, moderated), so a healthy walk lands a little short.
+# Only consulted when TikTok never said the listing ended -- see _iter_videos.
+LISTING_MIN_COVERAGE = 0.9
+
+# The profile grid's items, which is both what we wait for on load and how a scroll round
+# reports how far the grid has grown.
+POST_ITEM_SELECTOR = '[data-e2e="user-post-item"]'
+
+
+async def _aiter(items):
+    for item in items:
+        yield item
 
 
 class User(Base):
@@ -59,6 +71,9 @@ class User(Base):
         self.parent = parent
         self.__update_id_sec_uid_username(user_id, sec_uid, username)
         self._used_api_for_info = False
+        # the webapp's own api/user/detail response, when the page was client-rendered
+        # and left nothing embedded to parse (see _harvest_user_detail_xhr)
+        self._xhr_user_detail: Optional[dict] = None
         if data is not None:
             self.as_dict = data
             self.__extract_from_data()
@@ -96,13 +111,13 @@ class User(Base):
         try:
             return await self._info_full_api(**kwargs)
         except ApiFailedException as ex:
-            self.parent.logger.warning(f"TikTok-Api user.info_full() failed: {ex}. Falling back to scraping method.")
+            self.parent.logger.warning(f"API user info request failed: {ex}. Falling back to scraping method.")
             self._used_api_for_info = False
             return await self._info_full_scrape(**kwargs)
 
     async def _info_full_api(self, **kwargs) -> dict:
-        # Call TikTok API directly instead of using TikTok-Api's user.info()
-        # to handle empty/invalid responses ourselves
+        # Call the user detail endpoint directly so empty/invalid responses
+        # are handled here rather than raising from the client
         url_params = {
             "secUid": self.sec_uid if self.sec_uid else "",
             "uniqueId": self.username,
@@ -156,51 +171,123 @@ class User(Base):
         self._used_api_for_info = True
         return resp
 
+    @staticmethod
+    def _user_from_user_detail(data) -> Optional[dict]:
+        """Pull the user out of an api/user/detail payload.
+
+        The rehydration tag's webapp.user-detail scope carries the same shape, so both
+        delivery routes parse through here.
+        """
+        if not isinstance(data, dict) or data.get('statusCode', 0) != 0:
+            return None
+        user_info = data.get('userInfo', {})
+        user = user_info.get('user', {})
+        if not user or not user.get('id'):
+            return None
+        return {**user, **user_info.get('stats', {})}
+
+    async def _harvest_user_detail_xhr(self) -> bool:
+        """Bank the webapp's own api/user/detail response, if it made one.
+
+        A server-rendered page never requests that endpoint — its details are already
+        embedded — so this only ever finds anything on a client-rendered one, where the
+        captured response is the *only* copy of the user's details in existence.
+
+        Reading the capture drains it, hence stashing the first hit: the caller polls
+        this, and the response must survive until the parse.
+        """
+        if self._xhr_user_detail is not None:
+            return True
+        try:
+            responses = await self.parent.process_pending_responses('api/user/detail')
+        except Exception:
+            return False
+        for resp in responses or []:
+            body = resp.get('body') or ''
+            if not body:
+                continue
+            try:
+                data = json.loads(body) if isinstance(body, str) else body
+            except Exception:
+                continue
+            user = self._user_from_user_detail(data)
+            if not user:
+                continue
+            # the page may have fetched details for other users too (sidebars, suggested
+            # accounts), so don't accept one that isn't the profile we asked for
+            unique_id = user.get('uniqueId')
+            if unique_id and unique_id.lower() != self.username.lower():
+                continue
+            self._xhr_user_detail = user
+            return True
+        return False
+
     async def _info_full_scrape(self, **kwargs) -> dict:
         url = f"https://www.tiktok.com/@{self.username}"
 
         page = self.parent._page
 
         self.parent.logger.debug(f"Loading page: {url}")
-        await page.send(cdp.page.navigate(url))
-        self.parent.logger.debug(f"Navigate sent, waiting for ready state")
-        async with asyncio.timeout(10):
-            await page.wait_for_ready_state(until='complete', timeout=11)
-        await asyncio.sleep(3)  # Brief wait for dynamic content
+        await self.parent.navigate(url)
+        self.parent.logger.debug("Navigate sent, waiting for the profile's data")
+        # Wait for the data rather than for readyState 'complete': the tag is parseable
+        # long before the page finishes pulling in its media, and on a heavy profile
+        # 'complete' may never arrive. Either delivery route ends the wait -- embedded in
+        # the tag, or fetched by the page from api/user/detail.
+        self._xhr_user_detail = None
+        await self._wait_for_page_data(page, f"@{self.username}",
+                                       fallback=self._harvest_user_detail_xhr)
 
         # Wait for video items using base class method (handles refresh button, captcha, login popup)
         await self.wait_for_content_or_unavailable_or_captcha(
-            '[data-e2e="user-post-item"]',
+            POST_ITEM_SELECTOR,
             "Couldn't find this account",
             no_content_text=["No content", "This account is private", "Log in to TikTok"]
         )
-
-        # Get user info from page HTML (like the working example)
-        html_body = await page.get_content()
-        tag_contents = extract_tag_contents(html_body)
-
-        if not tag_contents:
-            raise InvalidJSONException("Could not find data script tag in page")
-
-        self.initial_json = json.loads(tag_contents)
+        # The grid's own listing response has landed by now, and nothing reads it until the
+        # caller asks for videos -- which may be a captcha solve and a page of work away.
+        # Bank it here so it is in hand for that whole gap.
+        await self.parent.collect_pending_response_bodies()
 
         user = None
-        sec_uid = None
 
-        # Try different JSON structures TikTok uses (matching the working example)
-        if '__DEFAULT_SCOPE__' in self.initial_json:
-            user_detail = self.initial_json['__DEFAULT_SCOPE__'].get('webapp.user-detail', {})
-            if user_detail.get('statusCode') == 0:
-                user_info = user_detail.get('userInfo', {})
-                user = {**user_info.get('user', {}), **user_info.get('stats', {})}
-                sec_uid = user_info.get('user', {}).get('secUid')
+        # Get user info from page HTML (like the working example)
+        html_body = await page.content()
+        try:
+            tag_contents = extract_tag_contents(html_body)
+        except NotAvailableException:
+            # No embedded payload at all, which is a client-rendered page rather than a
+            # missing account -- the XHR route below is where its details are. Letting
+            # this out would report the profile as unavailable, which the accounts pool
+            # treats as data-level and skips the handle for good.
+            tag_contents = None
 
-        if 'UserModule' in self.initial_json and user is None:
-            users = self.initial_json['UserModule'].get('users', {})
-            stats = self.initial_json['UserModule'].get('stats', {})
-            if self.username in users:
-                user = {**users[self.username], **stats.get(self.username, {})}
-                sec_uid = user.get('secUid')
+        if tag_contents:
+            self.initial_json = json.loads(tag_contents)
+
+            # Try different JSON structures TikTok uses (matching the working example)
+            if '__DEFAULT_SCOPE__' in self.initial_json:
+                user = self._user_from_user_detail(
+                    self.initial_json['__DEFAULT_SCOPE__'].get('webapp.user-detail', {})
+                )
+
+            if 'UserModule' in self.initial_json and user is None:
+                users = self.initial_json['UserModule'].get('users', {})
+                stats = self.initial_json['UserModule'].get('stats', {})
+                if self.username in users:
+                    user = {**users[self.username], **stats.get(self.username, {})}
+
+        if user is None:
+            # Client-rendered: nothing embedded to parse, so use what the page fetched
+            # for itself. Re-harvest first — the response may only have landed while we
+            # were waiting on the video grid above.
+            await self._harvest_user_detail_xhr()
+            user = self._xhr_user_detail
+            if user is not None:
+                self.parent.logger.debug(
+                    f"@{self.username}: page carried no embedded data, took the user's "
+                    f"details from its own api/user/detail response"
+                )
 
         if user is None:
             raise InvalidJSONException("Failed to find user data in HTML")
@@ -209,57 +296,41 @@ class User(Base):
         self.__extract_from_data()
         return user
 
-    async def videos(self, get_bytes=False, count=None, batch_size=100, prefer_scraping=False, **kwargs) -> Iterator[Video]:
+    async def videos(self, get_media=False, count=None, batch_size=100, prefer_scraping=False, **kwargs) -> Iterator[Video]:
         """
         Returns an iterator yielding Video objects.
 
         - Parameters:
             - count (int): The amount of videos you want returned.
-            - get_bytes (bool | callable): If True, download each video's MP4 as it is yielded
-              and store it on the yielded Video as ``video.video_bytes`` (None if the download
-              failed). May instead be a predicate ``(video) -> bool`` (sync or async, and given
-              the video before its bytes are fetched, so ``video.id``/``video.as_dict`` are
-              available), consulted per video: when it returns False no download is attempted
-              and ``video.video_bytes`` stays None. Use it to skip videos you already hold
+            - get_media (bool | callable): If True, download each post's media as it is yielded
+              and store it on the yielded Video as ``video.post_media``, a PostMedia (None if
+              the download failed; see Video.media()). May instead be a predicate
+              ``(video) -> bool`` (sync or async, and given the video before its media is
+              fetched, so ``video.id``/``video.as_dict`` are available), consulted per video:
+              when it returns False no download is attempted and ``video.post_media`` stays None. Use it to skip videos you already hold
               somewhere, since the download happens in here rather than in the caller's loop.
             - prefer_scraping (bool): If True, get videos by scraping the browser page rather
               than the make_request API. Normally unnecessary: API requests reuse a per-endpoint
               param template captured from the webapp's own requests (lazily filled by the
               scraping route on the first request of each endpoint type — see
               ZendriverTikTokApi.cache_api_params), so their playAddr URLs download cleanly in
-              ``video.bytes()``. Kept as an explicit escape hatch to force the scraping path.
+              ``video.media()``. Kept as an explicit escape hatch to force the scraping path.
             - cursor (int): The unix epoch to get uploaded videos since.
 
         Example Usage
         ```py
         user = api.user(username='therock')
-        async for video in user.videos(count=100, get_bytes=True):
-            with open(f"{video.id}.mp4", "wb") as f:
-                f.write(video.video_bytes)
+        async for video in user.videos(count=100, get_media=True):
+            if video.post_media is not None:
+                video.post_media.save("media/")
         ```
         """
-        async for video in self._iter_videos(count=count, batch_size=batch_size, prefer_scraping=prefer_scraping, **kwargs):
-            video.video_bytes = None
-            if get_bytes:
-                wanted = True
-                if callable(get_bytes):
-                    try:
-                        wanted = get_bytes(video)
-                        if inspect.isawaitable(wanted):
-                            wanted = await wanted
-                    except Exception as ex:
-                        # a broken predicate shouldn't silently turn into "download everything"
-                        self.parent.logger.warning(f"get_bytes: predicate failed for video {video.id}, skipping bytes: {ex}")
-                        wanted = False
-                if wanted:
-                    try:
-                        video.video_bytes = await video.bytes()
-                    except Exception as ex:
-                        self.parent.logger.warning(f"get_bytes: failed to download bytes for video {video.id}: {ex}")
-                        video.video_bytes = None
+        videos = self._iter_videos(count=count, batch_size=batch_size, prefer_scraping=prefer_scraping, **kwargs)
+        async for video in self._with_media(videos, get_media):
             yield video
 
-    async def _iter_videos(self, count=None, batch_size=100, prefer_scraping=False, **kwargs) -> Iterator[Video]:
+    async def _iter_videos(self, count=None, batch_size=100, prefer_scraping=False,
+                           min_coverage=None, **kwargs) -> Iterator[Video]:
         """Yield this user's videos, refusing to pass off a blocked listing as an empty one.
 
         Every route in here (initial page harvest, API, scraping) falls back to the next on
@@ -274,12 +345,29 @@ class User(Base):
         not what the caller kept, so a caller filtering everything out (a date window, say) is
         not mistaken for a failure. Raised as ApiFailedException because a block is
         session-level -- the accounts WorkerPool rotates and retries on a fresh session.
+
+        A walk cut short *after* yielding something was equally silent, and is the common
+        case: a bot-flagged session still gets the first page, which comes from the profile
+        HTML rather than from the item_list endpoint, so the listing dies after a page or two
+        while the guard above sees 16 videos and reports success.
+
+        `_listing_exhausted` separates the two. It is set only where TikTok itself said
+        nothing followed this page, so without it a walk far short of videoCount was cut off
+        rather than finished.
         """
+        # Every listing route filters or requests by secUid, which only info() looks up.
+        if not self.sec_uid and self.username:
+            await self.info()
+
         # None when info() was never called: no expectation to check against, so the guard
         # below stays off rather than guessing.
         expected_videos = self.as_dict.get('videoCount') if self.as_dict else None
         if expected_videos == 0:
             return
+
+        # "did TikTok tell us the listing ended?" -- reset per walk, since a True left by an
+        # earlier walk on this object would suppress the truncation check below
+        self._listing_exhausted = False
 
         amount_yielded = 0
         async for video in self._iter_videos_inner(count=count, batch_size=batch_size,
@@ -287,6 +375,9 @@ class User(Base):
             amount_yielded += 1
             yield video
 
+        # Note both checks are reached only when the iterator above ran to exhaustion: a
+        # caller that breaks out (the crawler stopping at a date window) leaves this
+        # generator suspended at its yield, so neither guard can fire on a deliberate stop.
         if amount_yielded == 0 and expected_videos:
             raise ApiFailedException(
                 f"no videos returned for @{self.username} though the profile reports "
@@ -294,10 +385,45 @@ class User(Base):
                 f"(TikTok commonly answers a blocked session with an empty response)"
             )
 
+        if count and amount_yielded >= count:
+            return  # the caller's own cap, not a truncation
+        if self._listing_exhausted or not expected_videos:
+            # TikTok said the listing ended, so a shortfall is a stale videoCount, not a block
+            return
+
+        floor = expected_videos * (LISTING_MIN_COVERAGE if min_coverage is None else min_coverage)
+        if amount_yielded < floor:
+            raise FewerVideosThanExpectedException(
+                f"listing for @{self.username} stopped after {amount_yielded} videos though "
+                f"the profile reports {expected_videos}, and TikTok never said the listing "
+                f"ended -- the walk was cut short rather than finished; retry on a fresh "
+                f"session"
+            )
+
     async def _iter_videos_inner(self, count=None, batch_size=100, prefer_scraping=False, **kwargs) -> Iterator[Video]:
-        # If user info was obtained via TikTok-Api, use API for videos directly
+        # If user info came from the API, use the API for videos directly
         # If user info was scraped (page already loaded), get initial videos from page first
+        seen_ids = set()
         amount_yielded = 0
+
+        def enough():
+            return count is not None and amount_yielded >= count
+
+        async def emit(source):
+            """Yield videos from a source, skipping ones already yielded and honouring `count`."""
+            nonlocal amount_yielded
+            async for video in source:
+                video_id = getattr(video, 'id', None)
+                if video_id is not None:
+                    if video_id in seen_ids:
+                        continue
+                    seen_ids.add(video_id)
+                amount_yielded += 1
+                yield video
+                if enough():
+                    return
+
+        cursor = 0
         if not self._used_api_for_info:
             # Try to harvest the videos already on the loaded page. If that fails to find any
             # (ApiFailedException), fall through to the API/scraping path below. LoginException
@@ -308,37 +434,39 @@ class User(Base):
                 self.parent.logger.warning(f"Initial video page harvest failed: {ex}. Falling back to API/scraping method.")
             else:
                 self.parent.logger.info(f"Got {len(videos)} initial videos, finished={finished}, cursor={cursor}")
-                for video in videos:
+                async for video in emit(_aiter(videos)):
                     yield video
-                    amount_yielded += 1
-                    if count and amount_yielded >= count:
-                        self.parent.logger.info(f"Reached count limit after {amount_yielded} initial videos")
-                        return
-
-                if finished:
-                    self.parent.logger.info(f"Finished after initial videos")
+                if enough():
+                    self.parent.logger.info(f"Reached count limit after {amount_yielded} initial videos")
                     return
 
-                self.parent.logger.info(f"Continuing with _get_videos_api to get more videos")
+                if finished:
+                    self.parent.logger.info("Finished after initial videos")
+                    # the page's own item_list responses carried hasMore=false
+                    self._listing_exhausted = True
+                    return
 
-        remaining = None if count is None else count - amount_yielded
+                self.parent.logger.info(f"Continuing with _get_videos_api from cursor={cursor}")
+
+        # The sources below are uncapped (or capped at the full `count`, for scraping, which
+        # starts again from the top of the profile) so videos emit() drops as repeats don't
+        # use up the caller's count.
         if prefer_scraping:
             # Explicit opt-out of the API path: go straight to scraping for
             # browser-sourced URLs (see the prefer_scraping docstring above).
-            async for video in self._get_videos_scraping(remaining):
+            async for video in emit(self._get_videos_scraping(count)):
                 yield video
             return
         try:
-            async for video in self._get_videos_api(count=remaining, cursor=0, **kwargs):
+            async for video in emit(self._get_videos_api(cursor=cursor, **kwargs)):
                 yield video
         except ApiFailedException as ex:
             self.parent.logger.warning(f"API method failed with exception: {ex}. Falling back to scraping method.")
-            async for video in self._get_videos_scraping(remaining):
+            async for video in emit(self._get_videos_scraping(count)):
                 yield video
 
 
     async def _get_videos_api(self, count=None, cursor=0, **kwargs) -> Iterator[Video]:
-        # Use TikTok-Api's make_request method instead of manual requests
         self.parent.logger.debug(f"Starting _get_videos_api with cursor={cursor}, count={count}")
         amount_yielded = 0
 
@@ -350,8 +478,7 @@ class User(Base):
                 'coverFormat': 2,  # Browser sends this parameter
             }
 
-            self.parent.logger.debug(f"Making TikTok-Api request with cursor={cursor}")
-            # Use TikTok-Api's make_request which handles signing and headers
+            self.parent.logger.debug(f"Making API request with cursor={cursor}")
             try:
                 res = await self.parent.tiktok_api.make_request(
                     url="https://www.tiktok.com/api/post/item_list/",
@@ -361,11 +488,11 @@ class User(Base):
                 # Convert any exception from make_request to ApiFailedException
                 # to trigger fallback to scraping method
                 self.parent.logger.warning(f"make_request failed: {e}")
-                raise ApiFailedException(f"TikTok-Api make_request failed: {e}")
-            self.parent.logger.debug(f"TikTok-Api response received with {len(res.get('itemList', []))} videos")
+                raise ApiFailedException(f"API request failed: {e}")
+            self.parent.logger.debug(f"API response received with {len(res.get('itemList', []))} videos")
 
             if res is None:
-                raise ApiFailedException("TikTok-Api returned None response")
+                raise ApiFailedException("API returned None response")
 
             if res.get('type') == 'verify':
                 raise ApiFailedException("TikTok API is asking for verification")
@@ -376,7 +503,7 @@ class User(Base):
                 status_msg = res.get('statusMsg', 'Unknown error')
                 if status_code in (10101, 209002):
                     if await self.parent._is_logged_in():
-                        raise ApiFailedException("TikTok-Api cannot currently use logged in session to access this content")
+                        raise ApiFailedException("API cannot currently use logged in session to access this content")
                     else:
                         raise LoginException(
                             f"TikTok requires login to view this content: statusCode={status_code}"
@@ -398,41 +525,56 @@ class User(Base):
                 self.parent.logger.info(
                     "TikTok isn't sending more TikToks beyond this point."
                 )
+                # reached the documented end of the listing, so the walk is complete
+                self._listing_exhausted = True
                 return
 
             cursor = res.get('cursor', cursor)
             await self.parent.request_delay()
-        
+
 
     async def _get_videos_scraping(self, count):
         page = self.parent._page
 
         url = f"https://www.tiktok.com/@{self.username}"
         self.parent.logger.debug(f"Loading page: {url}")
-        await page.send(cdp.page.navigate(url))
-        self.parent.logger.debug(f"Navigate sent, waiting for ready state")
-        async with asyncio.timeout(30):
-            await page.wait_for_ready_state(until='complete', timeout=31)
+        await self.parent.navigate(url)
+        self.parent.logger.debug("Navigate sent, waiting for ready state")
+        # Not fatal if 'complete' never lands: the wait for the video grid below is the
+        # real readiness gate, and a profile heavy enough to never finish loading is
+        # still perfectly scrapeable once its grid is up.
+        await self._wait_for_page_load(page, f"@{self.username}", required=False)
         await asyncio.sleep(3)  # Brief wait for dynamic content
-        self.parent.logger.debug(f"Page loaded for scraping videos")
+        self.parent.logger.debug("Page loaded for scraping videos")
 
-        # Process any pending responses
-        await self.parent.process_pending_responses()
+        # Bank what the page has fetched so far. Draining it instead would throw away this
+        # page's own listing response, which on a profile whose grid fits in one page is
+        # the only one there will ever be -- nothing further is lazy-loaded for the scroll
+        # below to pick up.
+        await self.parent.collect_pending_response_bodies()
 
         # Wait for video items using base class method (handles refresh button, captcha, login popup)
         await self.wait_for_content_or_unavailable_or_captcha(
-            '[data-e2e="user-post-item"]',
+            POST_ITEM_SELECTOR,
             "Couldn't find this account",
             no_content_text=["No content", "This account is private", "Log in to TikTok"]
         )
+        await self.parent.collect_pending_response_bodies()
 
         # Get initial videos from page HTML (like the working example)
         videos = []
         seen_ids = set()
         has_more = True
 
-        html = await page.get_content()
-        tag_contents = extract_tag_contents(html)
+        html = await page.content()
+        try:
+            tag_contents = extract_tag_contents(html)
+        except NotAvailableException:
+            # A client-rendered page embeds nothing, so there is no first page to read
+            # here -- but the scroll below works off the item_list responses the page
+            # fetches for itself, which arrive either way. has_more stays True so we go
+            # straight there rather than reporting the profile as unavailable.
+            tag_contents = None
 
         if tag_contents:
             data = json.loads(tag_contents)
@@ -481,6 +623,8 @@ class User(Base):
                 return
 
         if not has_more:
+            # the embedded page JSON says this first page is the whole profile
+            self._listing_exhausted = True
             return
 
         # Scroll to get more videos
@@ -493,7 +637,7 @@ class User(Base):
         finished = False
 
         cursor = 0
-        # Process pending responses for video list API using CDP
+        # Process pending responses for the video list API
         video_responses = await self.parent.process_pending_responses('api/post/item_list')
         video_responses = [res for res in video_responses if f"secUid={self.sec_uid}" in res.get('url', '')]
         self.parent.logger.debug(f"Found {len(video_responses)} video responses in page")
@@ -533,8 +677,14 @@ class User(Base):
 
         if len(video_responses) == 0:
             # Check HTML data for status codes before failing
-            html = await self.parent._page.get_content()
-            tag_contents = extract_tag_contents(html)
+            html = await self.parent._page.content()
+            try:
+                tag_contents = extract_tag_contents(html)
+            except NotAvailableException:
+                # Best-effort status check only; a client-rendered page has no embedded
+                # JSON to check. Fall through to ApiFailedException, which retries and
+                # falls back, rather than letting "no tag" surface as "no such account".
+                tag_contents = None
             if tag_contents:
                 data = json.loads(tag_contents)
                 if '__DEFAULT_SCOPE__' in data:
@@ -553,61 +703,77 @@ class User(Base):
         return all_videos, finished, cursor
 
     async def _get_videos_scroll(self, count, seen_ids=None, amount_yielded=0):
-        """Scroll to load more videos using zendriver."""
-        page = self.parent._page
+        """Scroll the profile page, yielding videos out of each item_list response.
+
+        Most walks end up here, because item_list is the route TikTok blocks first, so how
+        this loop decides to stop sets how deep a walk can get. Two of its stopping
+        conditions used to be indistinguishable from reaching the end of a profile; only this
+        loop knows which one fired, so it records that in `_listing_exhausted`.
+
+        Each round is one page.evaluate and a wait for the response that scroll asked for,
+        so a round costs the same however large the grid has grown (see
+        base._SCROLL_FEED_JS). Waiting for the response rather than sleeping a flat
+        interval is what makes a round cost what the network costs, and it also says
+        whether the page asked for a page at all -- a feed that stopped asking needs
+        nudging, not more patience.
+        """
         if seen_ids is None:
             seen_ids = set()
 
-        has_more = True
-        scroll_attempts = 0
-        max_scroll_attempts = 30
-        no_new_videos_count = 0
-        last_video_count = amount_yielded
+        # A bounded walk stops at `count` anyway; an unbounded one wants the whole profile,
+        # which 30 scrolls caps at a few hundred videos. The walk's own stall check is the
+        # real terminator, so this is only a backstop against a page that never ends.
+        walk = self.scroll_walk('api/post/item_list', POST_ITEM_SELECTOR,
+                                max_rounds=30 if count else 400)
+        try:
+            async for rnd in walk.rounds():
+                fresh = []
+                for resp in rnd.responses:
+                    body = resp.get('body') or ''
+                    if not body:
+                        # A bot-blocked listing is a 200 with nothing in it. Tallied rather
+                        # than passed over in silence, because it is the signal that tells a
+                        # short walk that was blocked from one that was finished.
+                        walk.stats['empty_listing_responses'] += 1
+                        continue
+                    try:
+                        data = json.loads(body) if isinstance(body, str) else body
+                    except Exception as ex:
+                        walk.stats['unparseable_responses'] += 1
+                        self.parent.logger.debug(f"Error processing video response: {ex}")
+                        continue
 
-        while scroll_attempts < max_scroll_attempts and has_more:
-            # Scroll down
-            await page.evaluate('window.scrollBy(0, window.innerHeight * 3)')
-            await asyncio.sleep(2)
-
-            # Check for refresh button that may appear during scrolling
-            await self.check_and_resolve_refresh_button()
-
-            # Process any pending responses
-            video_responses = await self.parent.process_pending_responses('api/post/item_list')
-
-            for resp in video_responses:
-                body = resp.get('body', '')
-                if not body:
-                    continue
-
-                try:
-                    data = json.loads(body) if isinstance(body, str) else body
-                    item_list = data.get('itemList', [])
-                    for item in item_list:
+                    for item in data.get('itemList', []):
                         video_id = item.get('id')
                         if video_id and video_id not in seen_ids:
                             seen_ids.add(video_id)
-                            amount_yielded += 1
-                            yield self.parent.video(data=item)
+                            fresh.append(item)
 
-                            if count and amount_yielded >= count:
-                                return
+                    # Only believe hasMore when TikTok actually sent it. Defaulting to False
+                    # ended the walk on any response arriving without it -- which is what an
+                    # empty bot-blocked body looks like.
+                    if 'hasMore' in data:
+                        rnd.stop = not data['hasMore']
 
-                    has_more = data.get('hasMore', False)
-                except Exception as e:
-                    self.parent.logger.debug(f"Error processing video response: {e}")
+                rnd.produced = len(fresh)
+                for item in fresh:
+                    amount_yielded += 1
+                    yield self.parent.video(data=item)
+                    if count and amount_yielded >= count:
+                        walk.reason = 'reached the requested count'
+                        return
 
-            current_count = amount_yielded
-            if current_count == last_video_count:
-                no_new_videos_count += 1
-                if no_new_videos_count >= 5:
-                    self.parent.logger.info("No new videos found after multiple scrolls, stopping")
-                    break
-            else:
-                no_new_videos_count = 0
-
-            last_video_count = current_count
-            scroll_attempts += 1
+            # Only a hasMore=false answer means the profile ran out. Giving up because the
+            # page stopped producing new videos, or because the backstop above ran out of
+            # scrolls, is a walk that was cut off -- _iter_videos raises on that so the pool
+            # retries the handle on a fresh session instead of recording a partial profile as
+            # fully collected.
+            if walk.listing_ended:
+                self._listing_exhausted = True
+        finally:
+            self.parent.logger.info(
+                f"@{self.username}: walked {amount_yielded} videos, {walk.summary()}"
+            )
 
     def liked(self, count: int = 30, cursor: int = 0, **kwargs) -> Iterator[Video]:
         """
@@ -679,7 +845,7 @@ class User(Base):
 
         if "userInfo" in keys:
             user_info = data["userInfo"]
-            # TikTok-Api returns data in userInfo.user structure
+            # The API returns data in the userInfo.user structure
             if "user" in user_info:
                 user = user_info["user"]
                 self.__update_id_sec_uid_username(

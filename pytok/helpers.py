@@ -27,7 +27,7 @@ def extract_tag_contents(html):
             )[1].split("</script>")[0]
             return j_raw
         else:
-            sigi_json = re.search('<script id="SIGI_STATE" type="application\/json">(.*?)<\/script>', html)
+            sigi_json = re.search(r'<script id="SIGI_STATE" type="application\/json">(.*?)<\/script>', html)
             #sigi_json = re.search(
                 #r'>\s*window\[[\'"]SIGI_STATE[\'"]\]\s*=\s*(?P<sigi_state>{.+});', html
             #)
@@ -67,7 +67,7 @@ def add_if_not_replace(text, pat, replace, add):
     else:
         text += add
         return text
-    
+
 def edit_url(url, new_params):
     url_parsed = url_parsers.urlparse(url)
     params = url_parsers.parse_qs(url_parsed.query, keep_blank_values=True)

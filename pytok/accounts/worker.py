@@ -1,8 +1,8 @@
-"""Worker: owns one account + its PyTok/Chrome session, runs tasks on it.
+"""Worker: owns one account + its PyTok/browser session, runs tasks on it.
 
 A *task* is a user callable ``async def task(api: PyTok) -> result``. The worker
 acquires an account from the pool, lazily builds and enters a PyTok bound to it
-(persistent Chrome profile), and reuses that session across tasks until a
+(persistent Firefox profile), and reuses that session across tasks until a
 rotation/rest, a crash, or shutdown. Failures are routed by a pytok-flavoured
 taxonomy — data-level errors propagate to the caller, account/session-level
 errors trigger a cooldown + rotation, logouts trigger a session rebuild.
@@ -12,22 +12,24 @@ import asyncio
 import logging
 from typing import Any, Awaitable, Callable, Optional
 
-from .account import Account
-from .pool import AccountsPool, NoAccountError
 from ..exceptions import (
     AccountPrivateException,
     ApiFailedException,
     CaptchaException,
+    ConnectionDroppedException,
     EmptyResponseException,
     FewerVideosThanExpectedException,
     InvalidJSONException,
     LoginException,
     NoContentException,
     NotAvailableException,
+    NoTemplateException,
     NotFoundException,
     SoundRemovedException,
     TimeoutException,
 )
+from .account import Account
+from .pool import AccountsPool, NoAccountError
 
 logger = logging.getLogger("PyTok")
 
@@ -44,7 +46,6 @@ DATA_LEVEL_EXCEPTIONS = (
     NoContentException,
     SoundRemovedException,
     InvalidJSONException,
-    FewerVideosThanExpectedException,
 )
 # Account/session-level & transient: cooldown the current account and rotate,
 # then retry the task on the next available account.
@@ -52,12 +53,27 @@ ROTATE_EXCEPTIONS = (
     CaptchaException,
     ApiFailedException,
     TimeoutException,
+    # The profile does have the videos; this session could not page through them, so a fresh
+    # one is worth trying. Data-level would mean giving up on the handle after one attempt.
+    FewerVideosThanExpectedException,
+    ConnectionDroppedException,
 )
 
 # Rotation / rest policy.
 DEFAULT_TASKS_PER_REST = None  # None => never force a rest on task count
 REST_MINUTES = 5
 RATE_LIMIT_MINUTES = 15
+# Consecutive in-place session rebuilds (counted across tasks, not within one) before
+# the generic handler gives up on rebuilding and rotates instead. Rebuilding in place
+# is the right first move for a dead tab, but a fault that outlives the rebuild -- a
+# page that will not finish loading for this session -- otherwise repeats it on every
+# handle forever, pinning the worker to one account.
+MAX_INPLACE_REBUILDS = 3
+# How long a session teardown may take before it is abandoned. A browser that dies
+# mid-teardown can hang shutdown for good -- and with it the worker, which then never reaches the release in rotate_account and
+# leaves its account marked in_use with nothing able to reclaim it. Abandoning the teardown
+# may orphan the browser process, which is the lesser loss.
+SESSION_CLOSE_TIMEOUT = 30
 
 
 class Worker:
@@ -89,6 +105,9 @@ class Worker:
         self.tasks_done: int = 0
         self.api = None  # PyTok, built lazily and reused across tasks
         self._initialized = False
+        # Spans tasks: a session whose fault survives the rebuild fails the next handle
+        # the same way, so counting only within one task would never reach the limit.
+        self._inplace_rebuilds: int = 0
 
     def _acct_name(self) -> str:
         return self.current_account.username if self.current_account else "<none>"
@@ -205,6 +224,7 @@ class Worker:
                 result = await task(api)
                 await self.pool.increment_scrape_count(self.current_account.username)
                 self.tasks_done += 1
+                self._inplace_rebuilds = 0
                 return result
 
             except NoAccountError:
@@ -218,7 +238,17 @@ class Worker:
 
             except ROTATE_EXCEPTIONS as e:
                 last_exc = e
-                minutes = RATE_LIMIT_MINUTES if isinstance(e, ApiFailedException) else REST_MINUTES
+                # A bare ApiFailedException means TikTok refused the API route outright, which is
+                # rate-limit shaped and earns the long cooldown. NoTemplateException is not: it
+                # is the param cache filling itself on the first request per endpoint, a routine
+                # condition that says nothing about the account, so charging it the long cooldown
+                # idles a healthy account for nothing.
+                # A dropped connection is TikTok throttling this account, so the same.
+                if isinstance(e, ConnectionDroppedException) or (
+                        isinstance(e, ApiFailedException) and not isinstance(e, NoTemplateException)):
+                    minutes = RATE_LIMIT_MINUTES
+                else:
+                    minutes = REST_MINUTES
                 logger.warning(f"Worker {self.id}: {type(e).__name__} on "
                                f"{self._acct_name()} (attempt {attempt + 1}"
                                f"/{self.max_retries}); cooldown {minutes}m + rotate")
@@ -237,16 +267,32 @@ class Worker:
                 # Unknown error / browser crash / transient session failure.
                 # Drop the (probably dead) session and rebuild IN PLACE on the
                 # same account — these recover on a fresh session in seconds.
-                # We deliberately do NOT rotate+cooldown here: with a small pool
-                # (e.g. 2 accounts) rotating just locks this account for minutes
-                # and waits on the other busy one, turning a transient blip into
-                # a multi-minute stall. Genuine rate-limit/captcha/timeout still
-                # rotate via ROTATE_EXCEPTIONS above; a persistently unbuildable
-                # account is caught by _ensure_session's max_build_attempts.
+                # Rotating on the first one instead would, with a small pool (e.g. 2
+                # accounts), lock this account for minutes and wait on the other busy
+                # one, turning a transient blip into a multi-minute stall.
+                #
+                # But only up to MAX_INPLACE_REBUILDS: a fault that survives the
+                # rebuild is not the tab, and repeating the rebuild then fails every
+                # subsequent handle on this worker. _ensure_session's
+                # max_build_attempts does not cover that case — the session builds
+                # fine, it is the page that never loads.
                 last_exc = e
-                logger.error(f"Worker {self.id}: unexpected error on "
-                             f"{self._acct_name()}: {e!r}; rebuilding session in place")
-                await self._close_session()
+                self._inplace_rebuilds += 1
+                if self._inplace_rebuilds >= MAX_INPLACE_REBUILDS:
+                    # Rebuilding has stopped helping, so the fault is not the tab.
+                    # Rotate: a different account (and a cooldown for this one) is the
+                    # only lever left, and it stops this worker burning every handle.
+                    logger.error(f"Worker {self.id}: unexpected error on "
+                                 f"{self._acct_name()}: {e!r}; "
+                                 f"{self._inplace_rebuilds} in-place rebuilds did not "
+                                 f"help, cooldown {REST_MINUTES}m + rotate")
+                    self._inplace_rebuilds = 0
+                    await self.rotate_account(REST_MINUTES)
+                else:
+                    logger.error(f"Worker {self.id}: unexpected error on "
+                                 f"{self._acct_name()}: {e!r}; rebuilding session in "
+                                 f"place ({self._inplace_rebuilds}/{MAX_INPLACE_REBUILDS})")
+                    await self._close_session()
 
         raise RuntimeError(
             f"Worker {self.id}: task failed after {self.max_retries} attempts"
@@ -259,29 +305,42 @@ class Worker:
         cooldown expires (via get_available_or_wait), giving the periodic-rest
         behaviour rather than crashing.
         """
-        await self._close_session()
-        if self.current_account:
-            await self.pool.lock_until(
-                self.current_account.username,
-                f"datetime('now', '+{cooldown_minutes} minutes')",
-            )
-            await self.pool.release_account(self.current_account.username)
-            logger.info(f"Worker {self.id} rested {self.current_account.username} "
-                        f"({cooldown_minutes}m)")
-            self.current_account = None
-        self.tasks_done = 0
-        self._initialized = False
+        # The cooldown and release run whatever the teardown did: a worker that cannot
+        # close its browser must still give the account back, or the account stays in_use
+        # and no worker -- this one included -- can ever be handed it again.
+        try:
+            await self._close_session()
+        finally:
+            if self.current_account:
+                await self.pool.lock_until(
+                    self.current_account.username,
+                    f"datetime('now', '+{cooldown_minutes} minutes')",
+                )
+                await self.pool.release_account(self.current_account.username)
+                logger.info(f"Worker {self.id} rested {self.current_account.username} "
+                            f"({cooldown_minutes}m)")
+                self.current_account = None
+            self.tasks_done = 0
+            self._initialized = False
 
         if not await self._acquire(wait=True):
             raise NoAccountError(f"Worker {self.id}: no account for rotation")
 
     async def _close_session(self):
-        if self.api is not None:
-            try:
-                await self.api.shutdown()  # release_on_shutdown=False: keeps account
-            except Exception:
-                pass
-            self.api = None
+        if self.api is None:
+            return
+        # Drop the reference first, so an abandoned teardown can't be re-entered by the
+        # rebuild that follows.
+        api, self.api = self.api, None
+        try:
+            # release_on_shutdown=False: keeps the account
+            await asyncio.wait_for(api.shutdown(), timeout=SESSION_CLOSE_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.error(f"Worker {self.id}: session teardown for {self._acct_name()} did "
+                         f"not finish in {SESSION_CLOSE_TIMEOUT}s; abandoning it (the "
+                         f"browser process may be left running)")
+        except Exception:
+            pass
 
     async def _release_current(self):
         if self.current_account:

@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 def get_pytok_home() -> str:
-    """Base directory for PyTok state (accounts DB + Chrome profiles).
+    """Base directory for PyTok state (accounts DB + browser profiles).
 
     Override with the PYTOK_HOME env var; defaults to ~/.pytok.
     """
@@ -20,12 +20,12 @@ def default_db_path() -> str:
 
 
 def default_profile_dir(username: str) -> str:
-    """Per-account persistent Chrome user_data_dir.
+    """Per-account persistent Firefox profile dir.
 
-    Filesystem-safe slug of the login identifier under <home>/profiles/.
+    Filesystem-safe slug of the login identifier under <home>/firefox-profiles/.
     """
     safe = "".join(c if c.isalnum() or c in "-._@" else "_" for c in username)
-    return os.path.join(get_pytok_home(), "profiles", safe)
+    return os.path.join(get_pytok_home(), "firefox-profiles", safe)
 
 
 def get_env_bool(key: str, default_val: bool = False) -> bool:
@@ -50,7 +50,7 @@ class utc:
 
 
 def parse_cookies(val) -> list[dict]:
-    """Normalise cookies from various inputs into a CDP-style cookie list.
+    """Normalise cookies from various inputs into a list of cookie dicts.
 
     Accepts: a Python list of cookie dicts, a JSON string (list, or dict with a
     "cookies" key, or a flat {name: value} map), a base64-wrapped JSON blob, or

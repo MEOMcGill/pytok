@@ -1,7 +1,7 @@
-from datetime import datetime
 import json
 import os
 import re
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -107,7 +107,7 @@ def get_comment_df(comments):
     return comment_df
 
 
-def try_load_comment_df_from_file(file_path, file_paths=[]):
+def try_load_comment_df_from_file(file_path, file_paths=None):
     assert file_path.endswith('.parquet.gzip') or file_path.endswith('.csv'), "File path must be a parquet or csv file"
 
     if os.path.exists(file_path):
@@ -143,7 +143,7 @@ def _str_to_list(stri):
     return [word.strip()[1:-1] for word in stri[1:-1].split(',')]
 
 
-def try_load_video_df_from_file(file_path, file_paths=[]):
+def try_load_video_df_from_file(file_path, file_paths=None):
     assert file_path.endswith('.parquet.gzip') or file_path.endswith('.csv'), "File path must be a parquet or csv file"
     if os.path.exists(file_path):
         if file_path.endswith('.csv'):
@@ -169,9 +169,9 @@ def try_load_video_df_from_file(file_path, file_paths=[]):
             with open(file_path, 'r') as f:
                 file_data = json.load(f)
 
-            if type(file_data) == list:
+            if isinstance(file_data, list):
                 videos += file_data
-            elif type(file_data) == dict:
+            elif isinstance(file_data, dict):
                 videos.append(file_data)
             else:
                 raise ValueError()
@@ -287,7 +287,7 @@ def get_video_df(videos) -> pl.DataFrame:
     return video_df
 
 
-def try_load_user_df_from_file(file_path, file_paths=[]):
+def try_load_user_df_from_file(file_path, file_paths=None):
     assert file_path.endswith('.parquet.gzip') or file_path.endswith('.csv'), "File path must be a parquet or csv file"
 
     if os.path.exists(file_path):

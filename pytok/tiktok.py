@@ -1,33 +1,27 @@
 import asyncio
-import base64
 import contextlib
 import json
 import logging
 import os
+import random
 import re
 import time
-from typing import Optional
-
+from typing import Optional, Union
 from urllib.parse import parse_qs, urlparse
 
-import zendriver as zd
-from zendriver import cdp
-import random
+import httpx
+from camoufox.async_api import AsyncCamoufox
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from ._cdp_patches import apply_cdp_patches
-from .tiktok_api import ZendriverTikTokApi
-
-# Patch zendriver's CDP bindings for Chrome 149+ before any browser is started.
-apply_cdp_patches()
-
-from .api.sound import Sound
-from .api.user import User
-from .api.search import Search
 from .api.hashtag import Hashtag
-from .api.video import Video
+from .api.search import Search
+from .api.sound import Sound
 from .api.trending import Trending
-
+from .api.user import User
+from .api.video import Video
 from .exceptions import *
+from .tiktok_api import TikTokApiClient
 from .utils import LOGGER_NAME
 
 os.environ["no_proxy"] = "127.0.0.1,localhost"
@@ -38,56 +32,34 @@ DESKTOP_BASE_URL = "https://www.tiktok.com/"
 
 class PyTok:
     _is_context_manager = False
-    logger = logging.getLogger(LOGGER_NAME)
+    # Numbers the loggers of sessions that have no account to name them by.
+    _anonymous_sessions = 0
 
-    # Default browser args for stealth
-    _DEFAULT_BROWSER_ARGS = [
-        '--disable-blink-features=AutomationControlled',
-        '--disable-infobars',
-        '--disable-dev-shm-usage',
-        '--no-first-run',
-        '--disable-background-networking',
-        '--disable-backgrounding-occluded-windows',
-        '--disable-renderer-backgrounding',
-        '--mute-audio',
-    ]
+    # Firefox throttles timers in background and occluded windows, which stalls a feed
+    # being scrolled in a window that isn't in front (every worker but one, in a pool).
+    _FIREFOX_PREFS = {
+        "dom.timeout.enable_budget_timer_throttling": False,
+        "dom.min_background_timeout_value": 4,
+        "widget.windows.window_occlusion_tracking.enabled": False,
+        "browser.sessionstore.resume_from_crash": False,
+    }
 
-    # JavaScript to override Page Visibility API and focus detection.
-    # TikTok checks these to detect backgrounded/unfocused browser tabs.
-    _VISIBILITY_OVERRIDE_JS = """
-    // Override document.hidden to always return false
-    Object.defineProperty(document, 'hidden', {
-        get: function() { return false; },
-        configurable: true
-    });
+    # Headers of the captured request that belong to it alone. Replayed on a download
+    # from the video CDN, the tiktok.com host header gets it a 403.
+    _UNREPLAYABLE_HEADERS = frozenset({'host', 'cookie', 'connection', 'content-length'})
 
-    // Override document.visibilityState to always return 'visible'
-    Object.defineProperty(document, 'visibilityState', {
-        get: function() { return 'visible'; },
-        configurable: true
-    });
+    # Firefox's error when TikTok closes the connection without a response, which it does
+    # to every page for a session it is throttling.
+    _DROPPED_CONNECTION_ERROR = "NS_ERROR_NET_EMPTY_RESPONSE"
 
-    // Override document.hasFocus to always return true
-    Document.prototype.hasFocus = function() { return true; };
-
-    // Suppress visibilitychange events so TikTok never sees a state transition
-    document.addEventListener('visibilitychange', function(e) {
-        e.stopImmediatePropagation();
-    }, true);
-
-    // Override the onvisibilitychange handler setter to be a no-op
-    Object.defineProperty(document, 'onvisibilitychange', {
-        get: function() { return null; },
-        set: function(v) {},
-        configurable: true
-    });
-    """
+    # Where a persistent profile keeps the fingerprint it was first given.
+    _FINGERPRINT_FILE = "pytok-fingerprint.json"
 
     def __init__(
             self,
-            logging_level: int = logging.WARNING,
+            logging_level: Optional[int] = None,
             request_delay: Optional[int] = 0,
-            headless: Optional[bool] = False,
+            headless: Union[bool, str] = False,
             manual_captcha_solves: Optional[bool] = False,
             log_captcha_solves: Optional[bool] = False,
             num_sessions: int = 1,
@@ -98,35 +70,42 @@ class PyTok:
             accounts_pool=None,
             release_on_shutdown: bool = True,
             force_relogin: bool = False,
+            manual_login: bool = False,
+            login_timeout: int = 300,
             startup_lock: Optional[asyncio.Lock] = None,
     ):
         """The PyTok class. Used to interact with TikTok.
 
         ##### Parameters
-        * logging_level: The logging level you want the program to run at, optional
-            These are the standard python logging module's levels.
+        * logging_level: The logging level for this session's logger, optional
+            These are the standard python logging module's levels. Each session logs
+            to its own child of the "PyTok" logger, named after its account, so this
+            never changes the level of other sessions or of "PyTok" itself. None
+            (default) inherits the level from "PyTok".
 
         * request_delay: The amount of time in seconds to wait before making a request, optional
             This is used to throttle your own requests as you may end up making too
             many requests to TikTok for your IP.
 
-        * num_sessions: Number of browser sessions to create (used by TikTok-Api), optional
+        * num_sessions: Number of browser sessions to create (used by the API client), optional
 
-        * user_data_dir: Path to Chrome user data directory for profile persistence, optional
-            If not provided, uses a fresh profile each session. Set to your Chrome
-            profile path (e.g., ~/.config/google-chrome) to reuse cookies/history.
-            Note: Don't use a profile that's open in another Chrome instance.
+        * headless: Run without a visible window, optional. On Linux pass "virtual" to
+            run headful inside Xvfb instead, which TikTok treats better than true headless.
 
-        * browser_args: Additional Chrome command-line arguments, optional
-            Merged with default stealth args. Pass empty list [] to disable defaults.
+        * user_data_dir: Path to a persistent Firefox profile directory, optional
+            If not provided, uses a fresh profile each session. A persistent profile also
+            keeps the browser fingerprint it was first given, so the account keeps
+            appearing from the same device.
+            Note: Don't use a profile that's open in another browser.
 
-        * page_load_timeout: Seconds to wait for the initial tiktok.com navigation to
-            reach readyState 'complete', optional. Cold Chrome starts against a large
-            persistent profile plus a slow TikTok homepage can exceed the old 10s; raise
-            this if setup keeps timing out.
+        * browser_args: Additional Firefox command-line arguments, optional
+
+        * page_load_timeout: Seconds to wait for a navigation to finish loading, optional.
+            A cold start against a large persistent profile plus a slow TikTok homepage
+            can take a while; raise this if setup keeps timing out.
 
         * account: An accounts.Account to run this session as, optional. When set,
-            its persistent Chrome profile dir is used (unless user_data_dir is given
+            its persistent browser profile dir is used (unless user_data_dir is given
             explicitly) and __aenter__ verifies the profile is logged into that
             account (repairing from the cookie backup or a login flow if not).
 
@@ -142,16 +121,11 @@ class PyTok:
 
         * startup_lock: An asyncio.Lock shared across PyTok instances that launch
             browsers concurrently (e.g. a WorkerPool's workers). Held only around
-            the browser-launch phase (zendriver start + session bind), where
-            zendriver's free_port() is TOCTOU: two Chromes starting at the same
-            instant can pick the same debug port. Serializing that phase makes
-            startup deterministic; it is released before account verification so
-            a slow login/captcha on one worker doesn't block the others'
-            startup. None (default) = no serialization (standalone use).
-            (Historical note: most concurrent-startup failures — e.g. "No
-            sessions created" — were actually caused by API classes sharing a
-            class-level `parent`, so every new PyTok hijacked all workers'
-            objects; parent is now bound per instance via the api factories.)
+            the browser-launch phase (browser start + first TikTok page load), so
+            N browsers don't all cold-start against TikTok at the same instant. It
+            is released before account verification so a slow login/captcha on one
+            worker doesn't block the others' startup. None (default) = no
+            serialization (standalone use).
         """
         # assert headless is False, "Running in headless currently does not work reliably."
 
@@ -165,6 +139,13 @@ class PyTok:
         # fresh credentialed login — used to recover an account whose cookies look
         # valid but whose session TikTok has invalidated server-side.
         self._force_relogin = force_relogin
+        # When True, verification hands the login to whoever is at the browser instead of
+        # driving it from the stored credentials. The automatic flow cannot get past a
+        # captcha the solver fails to read, which is a dead end for an account that needs
+        # one; a person can type the credentials and solve it.
+        # not _manual_login: that is the method this flag ends up calling
+        self._use_manual_login = manual_login
+        self._login_timeout = login_timeout
         # Set True only once the live logged-in uid is confirmed to match the
         # account. Gates cookie snapshots so a stale/unverified session can never
         # overwrite a good cookie backup.
@@ -183,22 +164,33 @@ class PyTok:
         self._num_sessions = num_sessions
         self._user_data_dir = user_data_dir
         self._page_load_timeout = page_load_timeout
-        # Merge browser args: use defaults unless explicitly disabled with empty list
-        if browser_args is None:
-            self._browser_args = self._DEFAULT_BROWSER_ARGS.copy()
-        elif browser_args == []:
-            self._browser_args = []
-        else:
-            self._browser_args = self._DEFAULT_BROWSER_ARGS + browser_args
+        self._browser_args = list(browser_args or [])
+        # CDN media downloads share one client, and one browser cookie read per
+        # MEDIA_COOKIE_TTL, rather than paying a handshake and a browser round trip per video.
+        self._media_http_client = None
+        self._media_cookies_read_at = None
 
-        self.logger.setLevel(logging_level)
+        self.logger = self._session_logger(account)
+        if logging_level is not None:
+            self.logger.setLevel(logging_level)
 
         self.request_cache = {}
 
-        # Create zendriver-based TikTokApi instance for API requests
-        self.tiktok_api = ZendriverTikTokApi(
+        self.tiktok_api = TikTokApiClient(
             logging_level=logging_level
         )
+
+    @classmethod
+    def _session_logger(cls, account) -> logging.Logger:
+        """A child of the "PyTok" logger named after this session's account, so
+        concurrent sessions' lines can be told apart."""
+        if account is not None:
+            # Dots would split an email username into further logger levels.
+            name = account.display_name.replace(".", "_")
+        else:
+            cls._anonymous_sessions += 1
+            name = f"session{cls._anonymous_sessions}"
+        return logging.getLogger(LOGGER_NAME).getChild(name)
 
     # ------------------------------------------------------------------
     # API object factories
@@ -249,57 +241,73 @@ class PyTok:
         """Check if URL matches patterns we want to track."""
         return any(pattern in url for pattern in self._TRACKED_URL_PATTERNS)
 
-    def _on_response(self, event: cdp.network.ResponseReceived, connection=None):
-        """Handle network response events from CDP."""
-        if not isinstance(event, cdp.network.ResponseReceived):
-            return
-        url = event.response.url
-        # Early filter - only track URLs we care about
-        if not self._should_track_url(url):
-            return
-        request_id = event.request_id
-        self._pending_requests[request_id] = {
-            'url': url,
-            'ready': False,
-            'response': event.response
-        }
+    def _on_request(self, request):
+        """Record tracked requests, and capture headers and per-endpoint API params.
 
-    def _on_loading_finished(self, event: cdp.network.LoadingFinished, connection=None):
-        """Mark request as ready for body fetch - no async work in callbacks."""
-        if not isinstance(event, cdp.network.LoadingFinished):
-            return
-        request_id = event.request_id
-        if request_id not in self._pending_requests:
-            return
-        self._pending_requests[request_id]['ready'] = True
-
-    def _on_request_will_be_sent(self, event: cdp.network.RequestWillBeSent, connection=None):
-        """Capture the browser's real request headers and per-endpoint API params.
-
-        Headers: taken from the first outgoing request (user-agent, sec-ch-ua,
-        accept-language, ...). The API client reuses them for signed fetches and
-        the httpx/requests byte-download paths.
+        Headers: taken from the first outgoing request (user-agent, accept-language,
+        ...). The httpx/requests byte-download paths reuse them.
 
         API params: every API request the webapp's own JS issues updates the
         param-template cache for that endpoint type (e.g. 'api/post/item_list'
         vs 'api/user/detail' — each endpoint has its own param shape, and
         TikTok binds response trust to the requesting fingerprint). The cache
         is lazily filled by the scraping route and always keeps the freshest
-        observation, including its msToken. The API client's own in-page
-        fetches are excluded via its _inflight_fetch_urls registry (they are
-        template-derived, so recycling them would compound any staleness).
+        observation. The API client's own in-page fetches are excluded via its
+        _inflight_fetch_urls registry (they are template-derived, so recycling
+        them would compound any staleness).
         """
-        if not isinstance(event, cdp.network.RequestWillBeSent):
-            return
         if self._captured_request_headers is None:
-            raw = event.request.headers
-            self._captured_request_headers = dict(raw) if raw else {}
-        url = event.request.url
+            self._captured_request_headers = {
+                k: v for k, v in request.headers.items()
+                if k.lower() not in self._UNREPLAYABLE_HEADERS
+            }
+        url = request.url
+        if self._should_track_url(url):
+            self._pending_requests[request] = {'url': url, 'ready': False}
         if (url.startswith('https://www.tiktok.com/api/')
                 and 'device_id=' in url
                 and not self.tiktok_api.is_self_issued(url)):
             params = {k: v[0] for k, v in parse_qs(urlparse(url).query).items()}
             self.tiktok_api.cache_api_params(url, params)
+
+    def _on_request_finished(self, request):
+        info = self._pending_requests.get(request)
+        if info is None:
+            return
+        info['ready'] = True
+        task = asyncio.ensure_future(self._bank_response(request, info))
+        self._body_reads.add(task)
+        task.add_done_callback(self._body_reads.discard)
+
+    def _on_request_failed(self, request):
+        self._pending_requests.pop(request, None)
+
+    async def _bank_response(self, request, info):
+        """Read a finished tracked response's body into _collected_responses."""
+        try:
+            response = await request.response()
+            if response is None:
+                return
+            body = await response.body()
+            server_addr = await response.server_addr()
+        except Exception:
+            return
+        finally:
+            self._pending_requests.pop(request, None)
+        if not body:
+            return
+        headers = response.headers
+        content_type = headers.get('content-type', '')
+        # Callers parse text bodies (JSON API responses) as str and treat media as bytes.
+        if any(t in content_type for t in ('json', 'text', 'javascript')):
+            body = body.decode('utf-8', errors='replace')
+        self._collected_responses.append({
+            'url': info['url'],
+            'body': body,
+            'status': response.status,
+            'headers': headers,
+            'server_addr': server_addr.get('ipAddress') if server_addr else None,
+        })
 
     def seen_request_urls(self, url_pattern):
         """URLs of tracked requests seen since the last clear, matching url_pattern.
@@ -312,43 +320,20 @@ class PyTok:
         urls += [resp['url'] for resp in self._collected_responses]
         return [url for url in urls if url_pattern in url]
 
-    async def collect_pending_response_bodies(self):
-        """Fetch and store the bodies of every finished request.
+    async def collect_pending_response_bodies(self, timeout: float = 10):
+        """Wait for the body reads of every request that has already finished.
 
-        Bodies are pulled out of Chrome lazily, and a request id only stays valid
-        while its page lives: navigate away and get_response_body fails, silently
-        losing the response. Call this before any navigation that isn't meant to
-        discard what the current page fetched (see the recovery navigations in
-        api.base). Unlike process_pending_responses this consumes nothing, so
-        later filtered reads still find everything.
+        Bodies are read as each request finishes, so this only waits for reads
+        still in flight. Call it before reading _collected_responses when the
+        responses a page just fetched matter. Unlike process_pending_responses
+        this consumes nothing, so later filtered reads still find everything.
         """
-        ready_ids = [
-            rid for rid, info in self._pending_requests.items()
-            if info['ready']
-        ]
-        for request_id in ready_ids:
-            info = self._pending_requests.pop(request_id)
-            try:
-                result = await self._page.send(cdp.network.get_response_body(request_id))
-                if isinstance(result, tuple):
-                    body, base64_encoded = result[0], result[1]
-                else:
-                    body, base64_encoded = result.body, getattr(result, 'base64_encoded', False)
-                # CDP base64-encodes binary bodies (e.g. video MP4 bytes); decode to raw bytes
-                # so callers get usable data. Text bodies (JSON API responses) stay as str.
-                if body and base64_encoded:
-                    body = base64.b64decode(body)
-                if body:
-                    self._collected_responses.append({
-                        'url': info['url'],
-                        'body': body,
-                        'response': info['response']
-                    })
-            except Exception:
-                pass
+        if not self._body_reads:
+            return
+        await asyncio.wait(list(self._body_reads), timeout=timeout)
 
     async def process_pending_responses(self, url_pattern=None):
-        """Fetch bodies for ready requests and return those matching the URL pattern."""
+        """Return (and consume) the collected responses matching the URL pattern."""
         await self.collect_pending_response_bodies()
 
         results = []
@@ -362,15 +347,51 @@ class PyTok:
         self._collected_responses = remaining
         return results
 
+    async def navigate(self, url: str, wait_until: str = "commit"):
+        """Point the page at url, waiting only as far as wait_until.
+
+        A navigation cut short by another one (TikTok's own script redirecting, say)
+        is not an error here: the page is wherever the site sent it.
+        """
+        try:
+            await self._page.goto(url, wait_until=wait_until,
+                                  timeout=self._page_load_timeout * 1000)
+        except PlaywrightTimeoutError as ex:
+            raise TimeoutError(
+                f"{url} did not reach '{wait_until}' within {self._page_load_timeout}s"
+            ) from ex
+        except PlaywrightError as ex:
+            if "NS_BINDING_ABORTED" in str(ex) or "interrupted by another navigation" in str(ex):
+                self.logger.debug(f"Navigation to {url} was superseded: {ex}")
+            elif self._DROPPED_CONNECTION_ERROR in str(ex):
+                raise ConnectionDroppedException(
+                    f"TikTok dropped the connection loading {url}"
+                ) from ex
+            else:
+                raise
+
+    async def wait_for_load(self, timeout: Optional[float] = None):
+        """Wait for the current page's load event, raising TimeoutError past timeout."""
+        timeout = self._page_load_timeout if timeout is None else timeout
+        try:
+            await self._page.wait_for_load_state("load", timeout=timeout * 1000)
+        except PlaywrightTimeoutError as ex:
+            raise TimeoutError(f"{self._page.url} did not finish loading within {timeout}s") from ex
+
     async def __aenter__(self):
-        # The browser-launch phase (zendriver start through session bind) is not
-        # safe to run concurrently with other PyTok launches — see startup_lock.
-        # Serialize it under the shared lock when one was supplied; release it
+        # The browser-launch phase (browser start through session bind) is
+        # serialized under the shared lock when one was supplied; release it
         # before account verification so a slow login/captcha doesn't block other
         # workers' startup.
         startup_lock = self._startup_lock or contextlib.nullcontext()
-        async with startup_lock:
-            await self._launch_browser_and_bind_session()
+        try:
+            async with startup_lock:
+                await self._launch_browser_and_bind_session()
+        except Exception:
+            # Tear down the half-started browser and release the account.
+            self._is_context_manager = True
+            await self.shutdown()
+            raise
 
         # If running as a pool account, verify the profile is logged into the
         # expected identity (repairing from the cookie backup / login if needed)
@@ -378,9 +399,6 @@ class PyTok:
         if self._account is not None:
             try:
                 await self._verify_account()
-                # Re-derive API session tokens now that we may have injected
-                # cookies or logged in.
-                await self._refresh_api_tokens()
             except Exception:
                 # Entry failed: __aexit__ won't run, so tear down here (which
                 # also releases the account back to the pool) before re-raising.
@@ -391,93 +409,92 @@ class PyTok:
         self._is_context_manager = True
         return self
 
-    async def _launch_browser_and_bind_session(self):
-        """Start the zendriver browser, load tiktok.com and bind the API session.
+    def _fingerprint_preset(self):
+        """The fingerprint preset for this profile, pinned on first use.
 
-        This is the concurrency-sensitive part of startup (zendriver's
-        free_port() is TOCTOU and the initial page-load JS context races under
-        concurrent launches), so callers serialize it via the shared
-        startup_lock. Kept as a discrete step so both the first build and any
-        mid-run rebuild go through the same serialized path.
+        A logged-in account that turns up on a new device every session is a bot
+        signal, so a persistent profile keeps the preset it was first given.
+        Without a profile there is nothing to keep, so each session draws a new one.
         """
-        # Initialize zendriver state for network response tracking
+        from camoufox.fingerprints import get_random_preset
+
+        if not self._user_data_dir:
+            return get_random_preset()
+        path = os.path.join(self._user_data_dir, self._FINGERPRINT_FILE)
+        if os.path.exists(path):
+            with open(path) as f:
+                return json.load(f)
+        preset = get_random_preset()
+        os.makedirs(self._user_data_dir, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(preset, f)
+        return preset
+
+    async def _launch_browser_and_bind_session(self):
+        """Start camoufox, load tiktok.com and bind the API session.
+
+        Kept as a discrete step so both the first build and any mid-run rebuild
+        go through the same (optionally serialized) path.
+        """
         self._pending_requests = {}
         self._collected_responses = []
+        self._body_reads = set()
 
-        # Create zendriver browser instance for PyTok's scraping
-        self._zendriver_browser = await zd.start(
-            headless=self._headless,
-            user_data_dir=self._user_data_dir,
-            browser_args=self._browser_args if self._browser_args else None,
+        # main_world_eval lets the API client reach the webapp's signer; everything
+        # else evaluates in Playwright's isolated world, which the page cannot see.
+        profile = (
+            {'persistent_context': True, 'user_data_dir': self._user_data_dir}
+            if self._user_data_dir else {}
         )
-
-        # Get a page and set up network tracking
-        self._page = await self._zendriver_browser.get('about:blank')
-
-        # Simulate focused/active page to prevent throttling when window loses focus
-        await self._page.send(cdp.emulation.set_focus_emulation_enabled(True))
-        await self._page.send(cdp.page.set_web_lifecycle_state("active"))
-
-        # TODO: test whether injecting visibility overrides into zendriver helps
-        # await self._page.evaluate(self._VISIBILITY_OVERRIDE_JS)
-        # await self._page.send(cdp.page.add_script_to_evaluate_on_new_document(self._VISIBILITY_OVERRIDE_JS))
-
-        # Enable network tracking via CDP
-        await self._page.send(cdp.network.enable())
-
-        # Set up network event handlers
-        self._page.add_handler(cdp.network.ResponseReceived, self._on_response)
-        self._page.add_handler(cdp.network.LoadingFinished, self._on_loading_finished)
+        self._camoufox = AsyncCamoufox(
+            headless=self._headless,
+            main_world_eval=True,
+            fingerprint_preset=self._fingerprint_preset(),
+            firefox_user_prefs=self._FIREFOX_PREFS,
+            args=self._browser_args or None,
+            **profile,
+        )
+        browser_or_context = await self._camoufox.__aenter__()
+        if self._user_data_dir:
+            self._context = browser_or_context
+            self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
+        else:
+            self._context = await browser_or_context.new_context()
+            self._page = await self._context.new_page()
 
         # Capture the real request headers and per-endpoint API params off the
-        # main tab's traffic (see _on_request_will_be_sent). The API client
-        # reuses them for its signed fetches and the httpx/requests
-        # byte-download paths. Reset on (re)launch so a rebuilt browser can't
-        # serve stale templates.
+        # page's traffic (see _on_request). Reset on (re)launch so a rebuilt
+        # browser can't serve stale templates.
         self._captured_request_headers = None
         self.tiktok_api.clear_api_param_cache()
-        self._page.add_handler(cdp.network.RequestWillBeSent, self._on_request_will_be_sent)
+        self._page.on("request", self._on_request)
+        self._page.on("requestfinished", self._on_request_finished)
+        self._page.on("requestfailed", self._on_request_failed)
 
-        # Navigate to TikTok (use CDP navigate + wait_for_ready_state to avoid hanging on slow resources)
-        await self._page.send(cdp.page.navigate('https://www.tiktok.com'))
         try:
-            async with asyncio.timeout(self._page_load_timeout):
-                await self._page.wait_for_ready_state(until='complete', timeout=self._page_load_timeout + 1)
-        except (asyncio.TimeoutError, TimeoutError) as ex:
-            # bare TimeoutError stringifies to '', which is useless in logs — re-raise with context
+            await self.navigate('https://www.tiktok.com', wait_until='load')
+        except TimeoutError as ex:
             raise TimeoutError(
-                f"tiktok.com did not reach readyState 'complete' within {self._page_load_timeout}s "
+                f"tiktok.com did not finish loading within {self._page_load_timeout}s "
                 f"(pass a larger page_load_timeout if the site is just loading slowly)"
             ) from ex
         await asyncio.sleep(3)
 
-        # The handler stays attached: headers are captured off the first
-        # request, but the API param template needs a navigation that fires a
-        # webapp API request, which may only happen later (account
-        # verification, first profile load). Both captures are one-shot, so
-        # the steady-state per-request cost is two None-checks.
-
-        # Get user agent from zendriver page
         self._user_agent = await self._page.evaluate("navigator.userAgent")
 
         if self._num_sessions and self._num_sessions > 1:
             self.logger.warning(
                 "num_sessions > 1 is no longer supported: the API client now shares "
-                "PyTok's single main tab. Using one session."
+                "PyTok's single page. Using one session."
             )
 
-        # Bind the API client to this same main tab. Signing, fetches, network
-        # capture and DOM scraping all run in this one foreground tab — no
-        # background session tabs to keep alive.
+        # Signing, fetches, network capture and DOM scraping all run in this one page.
         await self.tiktok_api.create_sessions(
-            zendriver_browser=self._zendriver_browser,
-            existing_tab=self._page,
+            context=self._context,
+            existing_page=self._page,
             headers=self._captured_request_headers,
             starting_url='https://www.tiktok.com',
         )
-
-        # TODO: test whether injecting visibility overrides into sessions helps
-        # await self._inject_visibility_into_sessions()
 
     @classmethod
     async def from_pool(cls, accounts_pool, username: Optional[str] = None, **kwargs):
@@ -505,25 +522,10 @@ class PyTok:
             account = await accounts_pool.get_available()
         if account is None:
             raise NoAccountError(
-                f"No account available"
+                "No account available"
                 + (f" for username {username}" if username else "")
             )
         return cls(account=account, accounts_pool=accounts_pool, **kwargs)
-
-    async def _inject_visibility_into_sessions(self):
-        """Inject visibility API overrides into all TikTok-Api sessions.
-
-        Uses CDP add_script_to_evaluate_on_new_document so overrides apply on
-        future navigations. Does NOT call evaluate() on the current page to
-        avoid disrupting already-loaded TikTok scripts like byted_acrawler.
-        """
-        for session in self.tiktok_api.sessions:
-            try:
-                await session.tab.send(
-                    cdp.page.add_script_to_evaluate_on_new_document(self._VISIBILITY_OVERRIDE_JS)
-                )
-            except Exception as e:
-                self.logger.debug(f"Failed to inject visibility overrides into session: {e}")
 
     async def request_delay(self):
         if self._request_delay is not None:
@@ -564,89 +566,95 @@ class PyTok:
                         await self._accounts_pool.release_account(self._account.username)
                 except Exception:
                     pass
-        # When a persistent profile is in use, force Chrome to write cookies to
-        # disk before teardown (must happen after _sync_cookies_to_pool, which
-        # needs the live tab). Otherwise the profile never persists a session
-        # injected/refreshed this run and re-injects from the DB backup on every
-        # launch instead of coming up "from profile".
-        if getattr(self, "_user_data_dir", None):
-            await self._flush_cookies_to_disk()
+        if self._media_http_client is not None:
+            try:
+                await self._media_http_client.aclose()
+            except Exception:
+                pass
+            self._media_http_client = None
         try:
-            # Drop the API client's session reference (does not touch the main tab)
+            # Drop the API client's session reference (does not touch the page)
             await self.tiktok_api.close_sessions()
         except Exception:
             pass
         try:
-            # Stop the zendriver browser, which owns and closes the main tab
-            zendriver_browser = getattr(self, "_zendriver_browser", None)
-            if zendriver_browser:
-                await zendriver_browser.stop()
+            # Closing a persistent context is what writes its cookies to the profile.
+            camoufox = getattr(self, "_camoufox", None)
+            if camoufox is not None:
+                await camoufox.__aexit__(None, None, None)
         except Exception:
             pass
 
-    async def _flush_cookies_to_disk(self, grace: float = 1.5) -> None:
-        """Force Chrome to persist cookies to the profile's on-disk store.
+    # Long enough to spare the browser a cookie read per video, short enough to pick up
+    # rotated cookies without waiting for a rejection.
+    MEDIA_COOKIE_TTL = 300
 
-        Chrome's SQLite cookie store commits on a lazy (~30s) timer; a graceful
-        Browser.close triggers an immediate flush, but the write needs a brief
-        grace period to land before zendriver terminates the process (its stop()
-        sends Browser.close then kills the process too fast for the flush).
+    async def _media_client(self, timeout: float) -> httpx.AsyncClient:
+        """The session's shared client for CDN media, carrying the browser's cookies.
+
+        The CDN authorizes by session cookie. The cookie read is the only browser round
+        trip in a download, so it is bounded by `timeout`: a page that no longer answers
+        fails here rather than hanging the caller.
         """
-        browser = getattr(self, "_zendriver_browser", None)
-        conn = getattr(browser, "connection", None) if browser else None
-        if not conn or getattr(conn, "closed", True):
-            return
-        try:
-            await conn.send(cdp.browser.close())
-            await asyncio.sleep(grace)
-        except Exception:
-            pass
+        if self._media_http_client is None:
+            self._media_http_client = httpx.AsyncClient(follow_redirects=True)
+            self._media_cookies_read_at = None
+        read_at = self._media_cookies_read_at
+        if read_at is None or time.monotonic() - read_at > self.MEDIA_COOKIE_TTL:
+            browser_cookies = await asyncio.wait_for(self._context.cookies(), timeout=timeout)
+            # set on the client's jar rather than per request: httpx rebuilds a redirect's
+            # Cookie header from the jar, dropping anything passed with the request
+            jar = httpx.Cookies()
+            for c in browser_cookies:
+                jar.set(c['name'], c['value'], domain=c.get('domain', ''), path=c.get('path') or '/')
+            self._media_http_client.cookies = jar
+            self._media_cookies_read_at = time.monotonic()
+        return self._media_http_client
+
+    def _expire_media_cookies(self) -> None:
+        """Make the next media download re-read the browser's cookies."""
+        self._media_cookies_read_at = None
 
     async def __aexit__(self, type, value, traceback):
         await self.shutdown()
 
-    async def refresh_sessions(self, refresh_zendriver: bool = True):
-        """Refresh the API session's tokens/cookies and params in place.
+    async def refresh_sessions(self, navigate: bool = True):
+        """Refresh the API session's cookies and state in place.
 
         Call this when you notice API requests starting to fail consistently.
-        Since the API client shares PyTok's main tab, this re-navigates the tab
-        to refresh cookies and then re-derives the session's msToken and params.
-        No tabs are opened or closed.
+        Since the API client shares PyTok's page, this re-navigates the page to
+        refresh cookies and the signer. No pages are opened or closed.
 
         Args:
-            refresh_zendriver: If True, navigate the main page back to
-                TikTok.com to refresh cookies. Defaults to True.
+            navigate: If True, navigate the page back to TikTok.com to refresh
+                cookies. Defaults to True.
         """
-        self.logger.info("Refreshing TikTok-Api session...")
+        self.logger.info("Refreshing API session...")
 
-        # Optionally refresh cookies by navigating the main page
-        if refresh_zendriver:
+        if navigate:
             self.logger.debug("Refreshing cookies...")
-            await self._page.send(cdp.page.navigate('https://www.tiktok.com'))
-            async with asyncio.timeout(15):
-                await self._page.wait_for_ready_state(until='complete', timeout=16)
+            await self.navigate('https://www.tiktok.com')
+            await self.wait_for_load(15)
             await asyncio.sleep(3)
+
+        self._expire_media_cookies()
 
         # Clear accumulated state
         self.request_cache = {}
         self._collected_responses = []
         self._pending_requests = {}
 
-        # Re-derive msToken and params on the shared session (no tab churn)
         await self.tiktok_api.refresh_session_params()
 
         self.logger.info("Session refreshed successfully")
 
     async def get_ms_tokens(self, retries=3, delay=2):
-        # Use CDP to get cookies from zendriver, with retry logic
         cookie_name = 'msToken'
         for attempt in range(retries):
-            result = await self._page.send(cdp.network.get_cookies())
-            all_cookies = result
-            cookies = []
-            for cookie in all_cookies:
-                if cookie.name == cookie_name and cookie.secure:
-                    cookies.append(cookie.value)
+            cookies = [
+                c['value'] for c in await self._context.cookies()
+                if c['name'] == cookie_name and c['secure']
+            ]
             if cookies:
                 return cookies
             if attempt < retries - 1:
@@ -681,8 +689,9 @@ class PyTok:
         timeout : int, optional
             Maximum time in seconds to wait for login completion (default: 300)
         wait_for_input : bool, optional
-            If True (default), waits for you to press Enter after logging in
-            manually. If False, polls for login cookies until timeout.
+            If True, waits for you to press Enter after logging in manually.
+            If False (default), polls for login cookies until timeout — which is
+            what a caller with no console attached needs.
 
         Returns
         -------
@@ -698,15 +707,12 @@ class PyTok:
         """
         if await self._is_logged_in():
             self.logger.info("Already logged in.")
-            await self._refresh_api_tokens()
             return True
 
         login_url = 'https://www.tiktok.com/login/phone-or-email/email'
 
-        # Navigate to login page
-        await self._page.send(cdp.page.navigate(login_url))
-        async with asyncio.timeout(30):
-            await self._page.wait_for_ready_state(until='complete', timeout=31)
+        await self.navigate(login_url)
+        await self.wait_for_load(30)
         await asyncio.sleep(2)
 
         if username and password:
@@ -722,7 +728,6 @@ class PyTok:
             input("Press Enter after you've logged in...")
             if not await self._is_logged_in():
                 raise LoginException("Login failed - no session cookies found")
-            await self._refresh_api_tokens()
             self.logger.info("Login complete.")
             return True
 
@@ -730,7 +735,6 @@ class PyTok:
         while time.time() - start_time < timeout:
             if await self._is_logged_in():
                 self.logger.info("Login successful!")
-                await self._refresh_api_tokens()
                 return True
             await asyncio.sleep(2)
 
@@ -740,7 +744,6 @@ class PyTok:
         """Perform automatic login with credentials."""
         self.logger.info("Attempting automatic login...")
 
-        # Find and click username field
         username_input = await self._find_login_element(
             'input[name="username"]',
             'input[placeholder*="Email" i]',
@@ -751,14 +754,11 @@ class PyTok:
             raise LoginException("Could not find username input field")
 
         self.logger.info("Found username field, entering username...")
-        await username_input.mouse_click()
+        await username_input.click()
+        await asyncio.sleep(0.5)
+        await self._page.keyboard.type(username, delay=random.uniform(60, 140))
         await asyncio.sleep(0.5)
 
-        # Use element's send_keys method
-        await username_input.send_keys(username)
-        await asyncio.sleep(0.5)
-
-        # Find and click password field
         password_input = await self._find_login_element(
             'input[name="password"]',
             'input[type="password"]'
@@ -767,14 +767,11 @@ class PyTok:
             raise LoginException("Could not find password input field")
 
         self.logger.info("Found password field, entering password...")
-        await password_input.mouse_click()
+        await password_input.click()
         await asyncio.sleep(0.5)
-
-        # Use element's send_keys method
-        await password_input.send_keys(password)
+        await self._page.keyboard.type(password, delay=random.uniform(60, 140))
         await asyncio.sleep(1)
 
-        # Find and click login button using CDP mouse events (most reliable)
         self.logger.info("Clicking login button...")
         box = await self._page.evaluate("""
             (() => {
@@ -788,24 +785,10 @@ class PyTok:
             })()
         """)
         if box:
-            await self._page.send(cdp.input_.dispatch_mouse_event(
-                type_='mousePressed',
-                x=box['x'],
-                y=box['y'],
-                button=cdp.input_.MouseButton.LEFT,
-                click_count=1
-            ))
-            await self._page.send(cdp.input_.dispatch_mouse_event(
-                type_='mouseReleased',
-                x=box['x'],
-                y=box['y'],
-                button=cdp.input_.MouseButton.LEFT,
-                click_count=1
-            ))
+            await self._page.mouse.click(box['x'], box['y'])
         else:
-            # Fallback: press Enter in password field
             self.logger.info("Login button not found, pressing Enter...")
-            await password_input.send_keys('\n')
+            await self._page.keyboard.press("Enter")
 
         await asyncio.sleep(3)
 
@@ -824,8 +807,6 @@ class PyTok:
 
             if await self._is_logged_in():
                 self.logger.info("Login successful!")
-                # Refresh ms_tokens after login
-                await self._refresh_api_tokens()
                 return True
 
             # Check for captcha again (may appear after initial attempt)
@@ -843,92 +824,63 @@ class PyTok:
     async def _find_login_element(self, *selectors):
         """Try multiple selectors to find a login form element."""
         for selector in selectors:
+            element = self._page.locator(selector).first
             try:
-                element = await self._page.select(selector, timeout=2)
-                if element:
-                    return element
+                await element.wait_for(state="visible", timeout=2000)
+                return element
             except Exception:
                 continue
         return None
 
     async def _handle_login_captcha(self):
         """Check for and solve captcha during login."""
-        from .api.base import CAPTCHA_TEXTS
+        from .api.base import Base
 
-        for text in CAPTCHA_TEXTS:
-            try:
-                element = await self._page.find(text, timeout=1)
-                if element:
-                    self.logger.info(f"Captcha detected during login: '{text}'")
-                    if self._manual_captcha_solves:
-                        input("Press Enter after solving the captcha manually...")
-                        await asyncio.sleep(1)
-                        return
-                    # Use the Base class captcha solver
-                    from .api.base import Base
-                    base = Base()
-                    base.parent = self
-                    try:
-                        await base.solve_captcha()
-                        self.logger.info("Captcha solve attempt completed")
-                    except Exception as e:
-                        self.logger.warning(f"Captcha solve failed: {e}")
-                    await asyncio.sleep(2)
-                    return
-            except Exception as e:
-                self.logger.debug(f"Error checking for captcha text '{text}': {e}")
-                continue
+        base = Base()
+        base.parent = self
+        if not await base._is_captcha_visible():
+            return
+        self.logger.info("Captcha detected during login")
+        if self._manual_captcha_solves:
+            input("Press Enter after solving the captcha manually...")
+            await asyncio.sleep(1)
+            return
+        try:
+            await base.solve_captcha()
+            self.logger.info("Captcha solve attempt completed")
+        except Exception as e:
+            self.logger.warning(f"Captcha solve failed: {e}")
+        await asyncio.sleep(2)
+
+    _LOGIN_ERROR_JS = """
+    (() => {
+      const errorTexts = %s;
+      const sel = '[class*="error" i], [class*="alert" i], [data-e2e*="error" i]';
+      for (const el of document.querySelectorAll(sel)) {
+        const text = (el.innerText || '').trim();
+        if (text && errorTexts.some(e => text.toLowerCase().includes(e))) return text;
+      }
+      return null;
+    })()
+    """ % json.dumps([
+        "incorrect password",
+        "invalid username",
+        "account doesn't exist",
+        "too many attempts",
+        "something went wrong",
+        "please check your password",
+    ])
 
     async def _check_login_error(self) -> Optional[str]:
         """Check for login error messages on the page."""
-        # Look for error messages in specific error containers
-        error_selectors = [
-            '[class*="error" i]',
-            '[class*="alert" i]',
-            '[data-e2e*="error" i]',
-        ]
-        error_texts = [
-            "incorrect password",
-            "invalid username",
-            "account doesn't exist",
-            "too many attempts",
-            "something went wrong",
-            "please check your password",
-        ]
-
-        for selector in error_selectors:
-            try:
-                elements = await self._page.select_all(selector, timeout=0.5)
-                for element in elements:
-                    if hasattr(element, 'text') and element.text:
-                        text_lower = element.text.lower()
-                        for error_text in error_texts:
-                            if error_text in text_lower:
-                                return element.text
-            except Exception:
-                continue
-        return None
-
-    async def _refresh_api_tokens(self):
-        """Refresh msToken on TikTok-Api sessions after login.
-
-        Since the browser is shared, cookies are already shared across all tabs.
-        We just need to update each session's ms_token field.
-        """
         try:
-            for session in self.tiktok_api.sessions:
-                cookies = await self.tiktok_api.get_session_cookies(session)
-                ms_token = cookies.get("msToken")
-                if ms_token:
-                    session.ms_token = ms_token
-            self.logger.debug("Refreshed msToken on API sessions")
-        except Exception as e:
-            self.logger.warning(f"Failed to refresh API tokens: {e}")
+            return await self._page.evaluate(self._LOGIN_ERROR_JS)
+        except Exception:
+            return None
 
     async def _is_logged_in(self) -> bool:
         """Check if user is logged in by looking for session cookies."""
-        result = await self._page.send(cdp.network.get_cookies())
-        cookie_names = {cookie.name for cookie in result}
+        cookie_names = {c['name'] for c in await self._context.cookies()}
         # TikTok sets these cookies when logged in
         login_cookies = {'sessionid', 'sid_tt', 'sessionid_ss'}
         return bool(cookie_names & login_cookies)
@@ -968,15 +920,12 @@ class PyTok:
         from .helpers import extract_tag_contents
 
         if navigate:
-            await self._page.send(cdp.page.navigate('https://www.tiktok.com'))
-            async with asyncio.timeout(self._page_load_timeout):
-                await self._page.wait_for_ready_state(
-                    until='complete', timeout=self._page_load_timeout + 1
-                )
+            await self.navigate('https://www.tiktok.com')
+            await self.wait_for_load()
             await asyncio.sleep(2)
 
         try:
-            html = await self._page.get_content()
+            html = await self._page.content()
             data = json.loads(extract_tag_contents(html))
         except Exception as e:
             self.logger.debug(f"Identity check: could not parse rehydration JSON: {e}")
@@ -997,64 +946,54 @@ class PyTok:
 
     async def _snapshot_cookies(self) -> list:
         """Read all cookies from the browser as plain dicts for DB backup."""
-        result = await self._page.send(cdp.network.get_cookies())
-        cookies = []
-        for c in result:
-            cookies.append({
-                'name': c.name,
-                'value': c.value,
-                'domain': c.domain,
-                'path': c.path,
-                'secure': bool(c.secure),
-                'httpOnly': bool(c.http_only),
-                'sameSite': c.same_site.value if getattr(c, 'same_site', None) else None,
-                'expires': c.expires if getattr(c, 'expires', None) else None,
-            })
-        return cookies
+        return [
+            {
+                'name': c['name'],
+                'value': c['value'],
+                'domain': c['domain'],
+                'path': c['path'],
+                'secure': bool(c['secure']),
+                'httpOnly': bool(c['httpOnly']),
+                'sameSite': c.get('sameSite'),
+                # Playwright reports a session cookie as expiring at -1.
+                'expires': c['expires'] if c.get('expires', -1) > 0 else None,
+            }
+            for c in await self._context.cookies()
+        ]
 
     async def _inject_cookies(self, cookies: list) -> None:
-        """Inject stored cookie dicts into the browser via CDP."""
-        if not cookies:
-            return
-        same_site_map = {
-            'strict': cdp.network.CookieSameSite.STRICT,
-            'lax': cdp.network.CookieSameSite.LAX,
-            'none': cdp.network.CookieSameSite.NONE,
-            'no_restriction': cdp.network.CookieSameSite.NONE,
-        }
+        """Inject stored cookie dicts into the browser."""
+        same_site_map = {'strict': 'Strict', 'lax': 'Lax', 'none': 'None', 'no_restriction': 'None'}
         params = []
-        for c in cookies:
+        for c in cookies or []:
             name, value = c.get('name'), c.get('value')
             if name is None or value is None:
                 continue
-            # A stored `None`/'' sameSite means the cookie had NO SameSite
-            # attribute — that must be re-injected as *unset*, not as an explicit
-            # SameSite=None. Forcing SameSite=None breaks TikTok's session cookies:
-            # the injected sessionid then isn't honoured and app-context stays
-            # anonymous (verified against gmail's own known-good cookies).
-            raw_same_site = c.get('sameSite')
-            same_site = same_site_map.get(str(raw_same_site).lower()) if raw_same_site else None
+            param = {'name': name, 'value': value}
             domain = c.get('domain')
-            # CDP's expires is a TimeSinceEpoch (a float subclass with .to_json());
-            # a raw float would blow up serialization ('float' has no to_json).
-            raw_expires = c.get('expires')
-            expires = None
-            if isinstance(raw_expires, (int, float)) and raw_expires > 0:
-                expires = cdp.network.TimeSinceEpoch(raw_expires)
-            params.append(cdp.network.CookieParam(
-                name=name,
-                value=value,
-                # A domainless cookie needs a url to anchor to; supply one.
-                url=None if domain else 'https://www.tiktok.com',
-                domain=domain,
-                path=c.get('path', '/'),
-                secure=c.get('secure'),
-                http_only=c.get('httpOnly'),
-                same_site=same_site,
-                expires=expires,
-            ))
+            if domain:
+                param['domain'] = domain
+                param['path'] = c.get('path') or '/'
+            else:
+                # A domainless cookie needs a url to anchor to.
+                param['url'] = 'https://www.tiktok.com'
+            if c.get('secure') is not None:
+                param['secure'] = bool(c['secure'])
+            if c.get('httpOnly') is not None:
+                param['httpOnly'] = bool(c['httpOnly'])
+            # A stored `None`/'' sameSite means the cookie had NO SameSite
+            # attribute, and it must be re-injected as unset rather than as an
+            # explicit SameSite=None: TikTok doesn't honour a session cookie
+            # whose SameSite was forced.
+            same_site = same_site_map.get(str(c.get('sameSite')).lower()) if c.get('sameSite') else None
+            if same_site:
+                param['sameSite'] = same_site
+            expires = c.get('expires')
+            if isinstance(expires, (int, float)) and expires > 0:
+                param['expires'] = float(expires)
+            params.append(param)
         if params:
-            await self._page.send(cdp.network.set_cookies(params))
+            await self._context.add_cookies(params)
 
     async def _verify_account(self) -> None:
         """Verify the attached profile is logged into the expected account, and
@@ -1097,9 +1036,9 @@ class PyTok:
             # on invalid cookies, then go straight to a fresh credentialed login.
             self.logger.info(f"force_relogin: clearing session for {account.username}")
             try:
-                await self._page.send(cdp.network.clear_browser_cookies())
+                await self._context.clear_cookies()
             except Exception as e:
-                self.logger.debug(f"clear_browser_cookies failed: {e}")
+                self.logger.debug(f"clear_cookies failed: {e}")
         else:
             # 1) Profile as-is — is the right account already logged in?
             if await self._is_logged_in():
@@ -1122,9 +1061,18 @@ class PyTok:
                     await _confirm(ident)
                     return
 
-        # 3) Fall back to an interactive/credentialed login.
+        # 3) Fall back to an interactive/credentialed login. Withholding the credentials is
+        # what selects login()'s manual path, so a person drives the whole flow.
         self.logger.info(f"No valid session for {account.username}; running login flow")
-        ok = await self.login(username=account.username, password=account.password)
+        if self._use_manual_login:
+            self.logger.info(
+                f"Manual login: complete the sign-in for {account.username} in the browser "
+                f"window (waiting up to {self._login_timeout}s)"
+            )
+            ok = await self.login(timeout=self._login_timeout)
+        else:
+            ok = await self.login(username=account.username, password=account.password,
+                                  timeout=self._login_timeout)
         if not ok:
             if pool:
                 await pool.set_active(account.username, False, "Login failed during verification")
@@ -1133,8 +1081,28 @@ class PyTok:
         # login() short-circuits on the presence of session cookies, which can be
         # stale server-side (logged in per cookies, but app-context has no user).
         # Require a real, matching identity read before trusting the session.
-        ident = await self._get_logged_in_identity(navigate=True)
+        #
+        # Retried, because a just-completed login is still settling: TikTok redirects to the
+        # home page after sign-in and the app context carries no user until that lands. A
+        # single read here fails on a login that in fact succeeded, and the account is then
+        # marked inactive with a session that works -- which no later run can repair, since
+        # the cookies it left behind make login() short-circuit on every retry.
+        ident = await self._identity_with_retries(
+            lambda: self._get_logged_in_identity(navigate=True)
+        )
         if not ident:
+            # Drop the cookies we just judged unusable. Leaving them made the account
+            # unrecoverable: they are enough for login() to short-circuit on the next run, so
+            # every later attempt reported success without ever showing a login form, failed
+            # this same check, and disabled the account again.
+            try:
+                await self._context.clear_cookies()
+                self.logger.info(
+                    f"Cleared the unusable session for {account.username} so the next login "
+                    f"starts from a real sign-in rather than short-circuiting on these cookies"
+                )
+            except Exception as e:
+                self.logger.debug(f"clear_cookies failed: {e}")
             if pool:
                 await pool.set_active(
                     account.username, False,
@@ -1142,7 +1110,8 @@ class PyTok:
                 )
             raise LoginException(
                 f"Account {account.username} appears logged in by cookies but TikTok "
-                f"shows no user (session expired/invalid); clear its profile and re-login"
+                f"shows no user (session expired/invalid); the stale cookies have been "
+                f"cleared, so re-running the login will present a sign-in form"
             )
         if account.user_id and ident.get('user_id') and ident['user_id'] != account.user_id:
             raise LoginException(
@@ -1151,15 +1120,33 @@ class PyTok:
             )
         await _confirm(ident)
 
+    async def _identity_with_retries(self, read, attempts: int = 5, delay: int = 3) -> Optional[dict]:
+        """Read the logged-in identity, retrying while a fresh session settles.
+
+        Returns the first non-empty read, or None once the attempts run out. The wait is
+        short and only paid on the failing path, where the alternative is disabling an
+        account whose session is fine.
+        """
+        for attempt in range(1, attempts + 1):
+            ident = await read()
+            if ident:
+                if attempt > 1:
+                    self.logger.info(f"Identity readable on attempt {attempt}")
+                return ident
+            if attempt < attempts:
+                self.logger.info(
+                    f"No identity yet (attempt {attempt}/{attempts}); the session may still "
+                    f"be settling, retrying in {delay}s"
+                )
+                await asyncio.sleep(delay)
+        return None
+
     async def _identity_after_reload(self, matcher) -> Optional[dict]:
         """Reload tiktok.com (so injected cookies take effect) then run matcher."""
-        await self._page.send(cdp.page.navigate('https://www.tiktok.com'))
         try:
-            async with asyncio.timeout(self._page_load_timeout):
-                await self._page.wait_for_ready_state(
-                    until='complete', timeout=self._page_load_timeout + 1
-                )
-        except (asyncio.TimeoutError, TimeoutError):
+            await self.navigate('https://www.tiktok.com')
+            await self.wait_for_load()
+        except TimeoutError:
             pass
         await asyncio.sleep(2)
         return await matcher()
