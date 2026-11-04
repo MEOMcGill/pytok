@@ -37,6 +37,7 @@ dependencies = [
     "camoufox>=0.5.6",
     "requests",
     "httpx",
+    "websockets",
     "brotli",
     "opencv-python",
     "numpy",
