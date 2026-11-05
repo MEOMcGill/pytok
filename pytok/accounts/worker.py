@@ -15,10 +15,12 @@ from typing import Any, Awaitable, Callable, Optional
 from ..exceptions import (
     AccountPrivateException,
     ApiFailedException,
+    BrowserLaunchException,
     CaptchaException,
     ConnectionDroppedException,
     EmptyResponseException,
     FewerVideosThanExpectedException,
+    HostBrowserLaunchException,
     InvalidJSONException,
     LoginException,
     NoContentException,
@@ -76,6 +78,34 @@ MAX_INPLACE_REBUILDS = 3
 SESSION_CLOSE_TIMEOUT = 30
 
 
+class LaunchFaultTracker:
+    """Notices when the browser fails to launch on every active account.
+
+    One account's profile failing is that account's fault, and rotating gets past it.
+    Every account failing, with no launch succeeding in between, is the host's, and
+    cycling through the accounts again only burns the remaining tasks.
+    """
+
+    def __init__(self):
+        self.failed: set = set()
+        self.fault: Optional[HostBrowserLaunchException] = None
+
+    def record_success(self):
+        self.failed.clear()
+
+    async def record_failure(self, pool: AccountsPool, username: str,
+                             exc: BrowserLaunchException) -> Optional[HostBrowserLaunchException]:
+        self.failed.add(username)
+        active = {a.username for a in await pool.get_active_accounts()}
+        if self.fault is None and active and active <= self.failed:
+            self.fault = HostBrowserLaunchException(
+                f"the browser failed to launch on every active account "
+                f"({', '.join(sorted(active))}), so the host is at fault rather than an "
+                f"account; last error: {exc}")
+            self.fault.__cause__ = exc
+        return self.fault
+
+
 class Worker:
     """Runs tasks for one acquired account, rotating/rebuilding as needed."""
 
@@ -87,8 +117,11 @@ class Worker:
         max_retries: int = 3,
         pytok_kwargs: Optional[dict] = None,
         startup_delay: float = 0.0,
+        launch_faults: Optional[LaunchFaultTracker] = None,
     ):
         self.id = id
+        # Shared across a WorkerPool's workers, so a host-wide launch failure is seen as one.
+        self.launch_faults = launch_faults or LaunchFaultTracker()
         self.pool = pool
         self.tasks_per_rest = tasks_per_rest
         self.max_retries = max_retries
@@ -153,8 +186,15 @@ class Worker:
 
         last_exc: Optional[Exception] = None
         attempts = 0
+        launch_failures = 0
         while self.api is None:
             if attempts >= max_build_attempts:
+                if launch_failures == attempts:
+                    # The profile itself will not start, so rebuilding on it again is
+                    # pointless: hand the caller the launch error so it rotates.
+                    fault = await self.launch_faults.record_failure(
+                        self.pool, self._acct_name(), last_exc)
+                    raise fault or last_exc
                 raise RuntimeError(
                     f"Worker {self.id}: could not build a session for "
                     f"{self._acct_name()} after {attempts} attempts"
@@ -171,6 +211,7 @@ class Worker:
             try:
                 await api.__aenter__()
                 self.api = api
+                self.launch_faults.record_success()
             except LoginException as e:
                 # Bad/expired credentials for this account: PyTok already tore
                 # itself down (but did not release, since release_on_shutdown is
@@ -196,6 +237,8 @@ class Worker:
                 # before the next launch. A persistently-unbuildable account is
                 # still bounded by max_build_attempts above.
                 last_exc = e
+                if isinstance(e, BrowserLaunchException):
+                    launch_failures += 1
                 logger.error(f"Worker {self.id}: session build failed for "
                              f"{self._acct_name()}: {e!r}; rebuilding on same account "
                              f"(attempt {attempts}/{max_build_attempts})")
@@ -227,9 +270,9 @@ class Worker:
                 self._inplace_rebuilds = 0
                 return result
 
-            except NoAccountError:
-                # Pool is exhausted (all accounts in_use / inactive / locked).
-                # Retrying won't conjure one — surface it to the caller.
+            except (NoAccountError, HostBrowserLaunchException):
+                # Pool is exhausted (all accounts in_use / inactive / locked), or no
+                # account's browser will start. Retrying won't help — surface it.
                 raise
 
             except DATA_LEVEL_EXCEPTIONS:
@@ -253,6 +296,13 @@ class Worker:
                                f"{self._acct_name()} (attempt {attempt + 1}"
                                f"/{self.max_retries}); cooldown {minutes}m + rotate")
                 await self.rotate_account(minutes)
+
+            except BrowserLaunchException as e:
+                # This account's profile will not start after several tries; another
+                # account's might.
+                last_exc = e
+                logger.error(f"Worker {self.id}: {e}; cooldown {REST_MINUTES}m + rotate")
+                await self.rotate_account(REST_MINUTES)
 
             except LoginException as e:
                 # Session logged out mid-task. Rebuild once (repairs from cookie
