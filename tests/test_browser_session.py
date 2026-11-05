@@ -138,3 +138,23 @@ def test_a_failed_launch_shuts_down_and_releases_the_account():
     with pytest.raises(RuntimeError):
         asyncio.run(api.__aenter__())
     assert released == ["acct-a"]
+
+
+def test_banked_responses_are_capped_oldest_first():
+    api = PyTok()
+    api.MAX_COLLECTED_RESPONSE_BYTES = 10
+    api._collected_responses = [{'url': f'u{i}', 'body': b'xxxx'} for i in range(5)]
+
+    api._trim_collected_responses()
+
+    assert [resp['url'] for resp in api._collected_responses] == ['u3', 'u4']
+
+
+def test_an_oversized_newest_response_is_still_kept():
+    api = PyTok()
+    api.MAX_COLLECTED_RESPONSE_BYTES = 10
+    api._collected_responses = [{'url': 'old', 'body': 'abc'}, {'url': 'big', 'body': b'x' * 50}]
+
+    api._trim_collected_responses()
+
+    assert [resp['url'] for resp in api._collected_responses] == ['big']

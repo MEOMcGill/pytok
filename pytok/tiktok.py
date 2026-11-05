@@ -243,6 +243,10 @@ class PyTok:
         'v19-webapp',      # TikTok video CDN paths
     ]
 
+    # Banked bodies are kept until a caller consumes them, and most never are
+    # (unrequested API calls, CDN video bytes), so cap the total and drop the oldest.
+    MAX_COLLECTED_RESPONSE_BYTES = 256 * 1024 * 1024
+
     def _should_track_url(self, url: str) -> bool:
         """Check if URL matches patterns we want to track."""
         return any(pattern in url for pattern in self._TRACKED_URL_PATTERNS)
@@ -314,6 +318,18 @@ class PyTok:
             'headers': headers,
             'server_addr': server_addr.get('ipAddress') if server_addr else None,
         })
+        self._trim_collected_responses()
+
+    def _trim_collected_responses(self):
+        """Drop the oldest banked responses until their bodies fit the byte cap."""
+        sizes = [len(resp['body']) for resp in self._collected_responses]
+        total, drop = sum(sizes), 0
+        # Always keep the newest response, even if it alone is over the cap.
+        while total > self.MAX_COLLECTED_RESPONSE_BYTES and drop < len(sizes) - 1:
+            total -= sizes[drop]
+            drop += 1
+        if drop:
+            del self._collected_responses[:drop]
 
     def seen_request_urls(self, url_pattern):
         """URLs of tracked requests seen since the last clear, matching url_pattern.
