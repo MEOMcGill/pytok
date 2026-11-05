@@ -90,7 +90,8 @@ except ApiFailedException:
 
 PyTok tracks network responses via Playwright's request events:
 - Captures responses matching `/api/`, `video/tos`, `v16-webapp`, `v19-webapp` URL patterns
-- Reads each body as its request finishes, into `_collected_responses`
+- Reads each body as its request finishes, into `_collected_responses`, capped at
+  `MAX_COLLECTED_RESPONSE_BYTES` (oldest dropped first)
 - Used to extract video bytes and API data from page loads
 
 TikTok's webmssdk wraps the page's `fetch`/XHR and signs every API request made through
