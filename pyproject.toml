@@ -46,6 +46,7 @@ dependencies = [
     "polars",
     "aiosqlite",
     "click",
+    "psutil",
     "tabulate",
 ]
 

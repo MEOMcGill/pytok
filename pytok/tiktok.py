@@ -14,6 +14,7 @@ from camoufox.async_api import AsyncCamoufox
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
+from ._profile import describe_profile, kill_profile_processes
 from .api.for_you import ForYou
 from .api.hashtag import Hashtag
 from .api.search import Search
@@ -459,7 +460,19 @@ class PyTok:
             args=self._browser_args or None,
             **profile,
         )
-        browser_or_context = await self._camoufox.__aenter__()
+        if self._user_data_dir and self._account is not None:
+            # The pool hands an account to one session at a time, so any browser still on
+            # its profile was orphaned by an earlier session and would block this launch.
+            killed = await asyncio.to_thread(kill_profile_processes, self._user_data_dir)
+            if killed:
+                self.logger.warning(f"Killed browser processes {killed} left running on "
+                                    f"{self._user_data_dir}")
+        try:
+            browser_or_context = await self._camoufox.__aenter__()
+        except Exception as e:
+            where = (await asyncio.to_thread(describe_profile, self._user_data_dir)
+                     if self._user_data_dir else "no persistent profile")
+            raise BrowserLaunchException(f"browser launch failed ({where}): {e}") from e
         if self._user_data_dir:
             self._context = browser_or_context
             self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()

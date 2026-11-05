@@ -26,7 +26,7 @@ import logging
 from typing import Any, List, Optional
 
 from .pool import AccountsPool, NoAccountError
-from .worker import PyTokTask, Worker
+from .worker import LaunchFaultTracker, PyTokTask, Worker
 
 logger = logging.getLogger("PyTok")
 
@@ -74,6 +74,7 @@ class WorkerPool:
         # (browser start + first page load). Created lazily in initialize() so it
         # binds to the running loop.
         self._startup_lock: Optional[asyncio.Lock] = None
+        self.launch_faults = LaunchFaultTracker()
 
     async def initialize(self) -> int:
         if self._initialized:
@@ -101,6 +102,7 @@ class WorkerPool:
                     max_retries=self.max_retries,
                     pytok_kwargs=self.pytok_kwargs,
                     startup_delay=i * self.startup_stagger,
+                    launch_faults=self.launch_faults,
                 )
             except NoAccountError:
                 logger.warning(f"WorkerPool: only created {len(self.workers)}/{num} workers")
@@ -123,6 +125,10 @@ class WorkerPool:
                 continue
             try:
                 if future.cancelled():
+                    continue
+                if self.launch_faults.fault is not None:
+                    # No browser will start on this host; fail what is left at once.
+                    future.set_exception(self.launch_faults.fault)
                     continue
                 result = await worker.execute_task(task)
                 if not future.cancelled():

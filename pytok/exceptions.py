@@ -95,3 +95,10 @@ class AccountPrivateException(TikTokException):
 
 class LoginException(TikTokException):
     """TikTok requires login to view this content"""
+
+class BrowserLaunchException(TikTokException):
+    """The browser process could not be started for this session's profile."""
+
+class HostBrowserLaunchException(BrowserLaunchException):
+    """The browser could not be started on any account's profile, so the fault is the
+    host rather than an account. Retrying on other accounts cannot help."""

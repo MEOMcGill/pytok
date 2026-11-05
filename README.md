@@ -193,7 +193,9 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-`max_workers` is capped to the number of active accounts. Workers rotate/rest accounts and rebuild crashed sessions automatically. See [`examples/worker_pool_example.py`](https://github.com/MEOMcGill/pytok/tree/master/examples/worker_pool_example.py).
+`max_workers` is capped to the number of active accounts. Workers rotate/rest accounts and rebuild crashed sessions automatically.
+
+Before launching an account's browser, a worker kills any browser still running on that account's profile, since one left behind by an abandoned teardown keeps the profile locked. If the browser still won't start, the error (`BrowserLaunchException`) names the profile's lock files, any processes on it and the free disk space, and the worker rotates to another account. If the browser fails to launch on every active account with no success in between, the host is at fault. The pool then fails every remaining task with `HostBrowserLaunchException` rather than cycling through the accounts again. See [`examples/worker_pool_example.py`](https://github.com/MEOMcGill/pytok/tree/master/examples/worker_pool_example.py).
 
 Please do not hesitate to make an issue in this repo to get our help with this!
 
