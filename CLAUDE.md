@@ -68,7 +68,7 @@ PyTok (tiktok.py)
 └── Request cache - stores recent API responses
 
 API Classes (api/*.py) - all inherit from Base
-├── User - user info, videos
+├── User - user info, videos, followers, following
 ├── Video - metadata, bytes, comments, related videos
 ├── Hashtag - hashtag info and videos
 ├── Sound - sound info and videos by music ID

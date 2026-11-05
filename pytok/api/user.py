@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import TYPE_CHECKING, Iterator, Optional
+from typing import TYPE_CHECKING, AsyncIterator, Iterator, Optional
 
 from ..exceptions import *
 from ..helpers import extract_tag_contents
@@ -22,6 +22,12 @@ LISTING_MIN_COVERAGE = 0.9
 # The profile grid's items, which is both what we wait for on load and how a scroll round
 # reports how far the grid has grown.
 POST_ITEM_SELECTOR = '[data-e2e="user-post-item"]'
+
+USER_LIST_URL = "https://www.tiktok.com/api/user/list/"
+# api/user/list serves both lists; `scene` picks which one.
+FOLLOWERS_SCENE = 67
+FOLLOWING_SCENE = 21
+USER_LIST_PAGE_SIZE = 30
 
 
 async def _aiter(items):
@@ -774,6 +780,113 @@ class User(Base):
             self.parent.logger.info(
                 f"@{self.username}: walked {amount_yielded} videos, {walk.summary()}"
             )
+
+    def followers(self, count=None) -> AsyncIterator[User]:
+        """Yield the accounts following this user, most recent follow first.
+
+        Each is a User built from the list entry, with its stats merged in, so
+        ``follower.as_dict`` holds the profile fields and counts without another request.
+
+        Example Usage
+        ```py
+        async for follower in api.user(username='therock').followers(count=500):
+            print(follower.username)
+        ```
+        """
+        return self._iter_user_list(FOLLOWERS_SCENE, 'followerCount', count)
+
+    def following(self, count=None) -> AsyncIterator[User]:
+        """Yield the accounts this user follows. See followers()."""
+        return self._iter_user_list(FOLLOWING_SCENE, 'followingCount', count)
+
+    def _stat(self, key):
+        """A stat from as_dict, which is flat when scraped and nested when from the API."""
+        data = self.as_dict or {}
+        if key in data:
+            return data[key]
+        return (data.get('userInfo') or {}).get('stats', {}).get(key)
+
+    async def _iter_user_list(self, scene, count_key, count=None):
+        if not self.sec_uid:
+            await self.info()
+
+        expected = self._stat(count_key)
+        if expected == 0:
+            return
+
+        seen = set()
+        yielded = 0
+        min_cursor = max_cursor = 0
+        while True:
+            res = await self._user_list_page(scene, min_cursor, max_cursor)
+            entries = res.get('userList') or []
+            for entry in entries:
+                user = entry.get('user') or {}
+                # the list can carry a placeholder for an account it won't name
+                if not user.get('uniqueId') or user['id'] in seen:
+                    continue
+                seen.add(user['id'])
+                yield self.parent.user(data={**user, **(entry.get('stats') or {})})
+                yielded += 1
+                if count is not None and yielded >= count:
+                    return
+
+            if not res.get('hasMore'):
+                return
+            if not entries:
+                # A blocked session gets an empty page that still claims more follow,
+                # so stopping quietly here would pass a cut-off list off as a whole one.
+                raise ApiFailedException(
+                    f"api/user/list for @{self.username} returned an empty page after "
+                    f"{yielded} users though it says more follow"
+                )
+            min_cursor = res.get('minCursor', 0)
+            max_cursor = res.get('maxCursor', 0)
+            await self.parent.request_delay()
+
+    async def _user_list_page(self, scene, min_cursor, max_cursor):
+        params = {
+            'secUid': self.sec_uid,
+            'scene': scene,
+            'count': USER_LIST_PAGE_SIZE,
+            'minCursor': min_cursor,
+            'maxCursor': max_cursor,
+        }
+        try:
+            try:
+                res = await self.parent.tiktok_api.make_request(url=USER_LIST_URL, params=params)
+            except NoTemplateException:
+                await self._capture_user_list_template(scene)
+                res = await self.parent.tiktok_api.make_request(url=USER_LIST_URL, params=params)
+        except EmptyResponseException as ex:
+            raise ApiFailedException(f"api/user/list returned an empty response: {ex}")
+
+        if not isinstance(res, dict) or res.get('type') == 'verify':
+            raise ApiFailedException("api/user/list was refused")
+        status_code = max(res.get('statusCode', 0), res.get('status_code', 0))
+        if status_code in (10101, 209002):
+            if await self.parent._is_logged_in():
+                raise ApiFailedException(f"api/user/list refused the session: statusCode={status_code}")
+            raise LoginException(f"TikTok requires login to view this list: statusCode={status_code}")
+        if status_code != 0:
+            raise NoContentException(
+                f"TikTok returned an error for @{self.username}'s user list: "
+                f"statusCode={status_code}, statusMsg={res.get('status_msg') or res.get('statusMsg')}"
+            )
+        return res
+
+    async def _capture_user_list_template(self, scene):
+        """Open the profile's follower/following panel so the webapp issues api/user/list."""
+        selector = ('[data-e2e="followers-count"]' if scene == FOLLOWERS_SCENE
+                    else '[data-e2e="following-count"]')
+        await self.parent.navigate(f"https://www.tiktok.com/@{self.username}")
+        await self.wait_for_content_or_unavailable_or_captcha(
+            selector, "Couldn't find this account",
+            no_content_text=["This account is private"],
+        )
+        await self.parent._page.locator(selector).first.click()
+        await self.await_api_responses('api/user/list')
+        await self.parent._page.keyboard.press("Escape")
 
     def liked(self, count: int = 30, cursor: int = 0, **kwargs) -> Iterator[Video]:
         """

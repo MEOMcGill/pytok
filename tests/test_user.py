@@ -28,5 +28,16 @@ async def test_user_videos():
         assert count >= COUNT
 
 
+async def test_user_follow_lists():
+    pool = AccountsPool()
+    async with await PyTok.from_pool(pool) as api:
+        user = api.user(username=username)
+        followers = [f async for f in user.followers(count=COUNT)]
+        following = [f async for f in user.following(count=COUNT)]
+
+        assert len({f.user_id for f in followers}) == len(followers) > 0
+        assert all(f.username and f.sec_uid for f in followers + following)
+
+
 if __name__ == '__main__':
     asyncio.run(test_user_videos())
