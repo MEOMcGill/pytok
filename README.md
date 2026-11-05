@@ -141,6 +141,21 @@ Earlier versions kept a Chrome profile per account, which Firefox cannot open. T
 
 `PyTok(headless=True)` runs Firefox without a window, but TikTok treats true headless browsers with more suspicion. On Linux, prefer `headless="virtual"`, which runs a normal browser inside a virtual display (needs `Xvfb` installed).
 
+## Followers and following
+
+`user.followers()` and `user.following()` page through a profile's follower and following
+lists, yielding a `User` for each account with its profile fields and stats in `as_dict`.
+Followers come most recent first. Both lists are read through `api/user/list`, the same
+request the profile's own follower panel makes.
+
+```py
+async with await PyTok.from_pool(pool) as api:
+    user = api.user(username="therock")
+    async for follower in user.followers(count=500):
+        print(follower.username, follower.as_dict["followerCount"])
+    following = [u.username async for u in user.following()]
+```
+
 ## The For You feed
 
 `api.for_you().videos()` reads the home feed of the logged-in pool account, so the videos
