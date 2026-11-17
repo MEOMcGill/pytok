@@ -33,6 +33,14 @@ from .base import Base
 
 logger = logging.getLogger("pytok.api.video")
 
+COMMENT_LIST_URL = "https://www.tiktok.com/api/comment/list/"
+# TikTok serves at most about 50 comments a page but moves the cursor on by the full count asked
+# for, so a larger page silently skips comments
+COMMENT_PAGE_SIZE = 50
+# seconds a video page gets to request its own comments: a logged-out page does by itself, though
+# sometimes only after most of a minute
+COMMENT_TEMPLATE_WAIT = 90
+
 
 class _CdnRejected(Exception):
     """The CDN answered a direct media download with an error status."""
@@ -834,7 +842,7 @@ class Video(Base):
         while count is None or amount_yielded < count:
             params = {
                 'aweme_id': self.id,
-                'count': 20,
+                'count': COMMENT_PAGE_SIZE,
                 'cursor': cursor,
                 'from_page': 'video',
                 'root_referer': 'https://www.tiktok.com/',
@@ -842,10 +850,12 @@ class Video(Base):
 
             self.parent.logger.debug(f"Making API request for comments with cursor={cursor}")
             try:
-                res = await self.parent.tiktok_api.make_request(
-                    url="https://www.tiktok.com/api/comment/list/",
-                    params=params,
-                )
+                try:
+                    res = await self.parent.tiktok_api.make_request(url=COMMENT_LIST_URL, params=params)
+                except exceptions.NoTemplateException:
+                    # the template also expires, so this can come mid-walk as well as on the first page
+                    await self._fill_comment_template()
+                    res = await self.parent.tiktok_api.make_request(url=COMMENT_LIST_URL, params=params)
             except Exception as e:
                 self.parent.logger.warning(f"make_request failed for comments: {e}")
                 raise exceptions.ApiFailedException(f"API request failed: {e}")
@@ -890,6 +900,30 @@ class Video(Base):
 
             cursor = res.get('cursor', cursor)
             await self.parent.request_delay()
+
+    async def _fill_comment_template(self):
+        """Open this video's page so that the web app's own comment request fills the param
+        template make_request needs for api/comment/list.
+
+        A logged-out video page asks for its comments by itself. The comment icon is clicked from
+        inside the page halfway through the wait, for a page that does not.
+        """
+        api = self.parent.tiktok_api
+        await self.parent.navigate(self._get_url(), wait_until="domcontentloaded")
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        clicked = False
+        while api.get_cached_api_params(COMMENT_LIST_URL) is None:
+            waited = loop.time() - started
+            if waited > COMMENT_TEMPLATE_WAIT:
+                raise exceptions.ApiFailedException("The video page never requested its comments")
+            if not clicked and waited > COMMENT_TEMPLATE_WAIT / 2:
+                # dispatched in the page: a Playwright click lands on the player overlay instead
+                await self.parent._page.evaluate(
+                    "() => { const e = document.querySelector('[data-e2e=\"comment-icon\"]'); if (e) e.click(); }"
+                )
+                clicked = True
+            await asyncio.sleep(1)
 
     async def _get_comment_replies_api(self, comment, batch_size):
         """Get comment replies using TikTok API directly via make_request."""
